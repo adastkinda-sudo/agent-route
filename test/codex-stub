@@ -18,11 +18,11 @@ catch { die('缺少隔离环境'); }
 if (process.env.HOME !== isolation.home ||
   (process.env.CODEX_HOME ?? path.join(process.env.HOME, '.codex')) !== isolation.codexHome ||
   !fs.realpathSync(process.cwd()).startsWith(isolation.root + path.sep)) die('selftest 目录未隔离');
-fs.appendFileSync(path.join(isolation.home, 'stub-invocations.jsonl'), JSON.stringify({ command: args[0], args }) + '\n');
+fs.appendFileSync(path.join(isolation.home, 'stub-invocations.jsonl'), JSON.stringify({ command: args[0], args, agentRouteDepth: process.env.AGENT_ROUTE_DEPTH ?? null }) + '\n');
 if (args[0] === '-p' || args[0] === 'auth') {
   const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(isolation.home, '.claude');
   if (!path.resolve(configDir).startsWith(isolation.home + path.sep) ||
-    Object.keys(process.env).some((key) => /^(ANTHROPIC_|CLAUDE_CODE_|CODEX_|AGENT_ROUTE_)/.test(key))) die('Claude 环境未隔离');
+    Object.keys(process.env).some((key) => /^(ANTHROPIC_|CLAUDE_CODE_|CODEX_|AGENT_ROUTE_)/.test(key) && key !== 'AGENT_ROUTE_DEPTH')) die('Claude 环境未隔离');
   if (args[0] === 'auth') {
     if (args.join(' ') !== 'auth status') die('只支持 auth status');
     let status = { loggedIn: false, authMethod: 'none' };
@@ -41,7 +41,7 @@ if (args[0] === '-p' || args[0] === 'auth') {
   if (!agent || agent.model !== 'inherit') die('agent model 未继承本次解析模型');
   fs.appendFileSync(path.join(isolation.home, 'stub-claude-invocations.jsonl'), JSON.stringify({ model,
     effectiveModel: settings.env?.[modelEnv] ?? model, effort: option('--effort'), configDir,
-    customConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null, envKeys: Object.keys(process.env), agent,
+    customConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null, envKeys: Object.keys(process.env), agentRouteDepth: process.env.AGENT_ROUTE_DEPTH ?? null, agent,
     session: args.includes('--resume') ? option('--resume') : null }) + '\n');
 }
 if (args[0] === 'app-server') {
@@ -98,7 +98,7 @@ if (claude) {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--disallowedTools') { i = args.length; continue; }
-    if (!['--agents', '--agent', '--model', '--effort', '--output-format', '--permission-mode', '--resume'].includes(arg)) die(`未知 Claude 参数: ${arg}`);
+    if (!['--agents', '--agent', '--model', '--effort', '--output-format', '--permission-mode', '--settings', '--resume'].includes(arg)) die(`未知 Claude 参数: ${arg}`);
     const value = args[++i];
     if (!value || value.startsWith('-')) die(`${arg} 缺少参数值`);
     if (arg === '--resume') session = value;

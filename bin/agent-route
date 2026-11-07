@@ -1006,6 +1006,7 @@ function stats(args) {
 
 // ---------- selftest：所有派发和写入都隔离在临时目录 ----------
 async function selftest() {
+  delete process.env.AGENT_ROUTE_DEPTH;
   let tmpDir;
   let failed = false;
   try {
@@ -2676,7 +2677,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           exitIs(result, 0);
           const call = claudeCalls().at(-1);
           check(call.configDir === custom && call.customConfigDir === custom && call.effectiveModel === 'fixture-sonnet', '自定义目录没有加载 family 映射');
-          check(!call.envKeys.some((key) => /^(ANTHROPIC_|CLAUDE_CODE_|CODEX_|AGENT_ROUTE_)/.test(key)), '父环境控制变量泄漏');
+          check(!call.envKeys.some((key) => /^(ANTHROPIC_|CLAUDE_CODE_|CODEX_|AGENT_ROUTE_)/.test(key) && key !== 'AGENT_ROUTE_DEPTH'), '父环境控制变量泄漏');
         } finally {
           delete env.ANTHROPIC_API_KEY; delete env.ANTHROPIC_BASE_URL;
           env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
@@ -2937,6 +2938,40 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(result.codex.billingType === 'unknown' && result.codex.diagnostics.includes('codex-chatgpt-backend-unverified'),
           '缺少官方后端证据时未报告具体诊断');
       }],
+      [85, 'AGENT_ROUTE_DEPTH：执行方环境带该变量，递归派发被拦截', () => {
+        const depthEnv = { ...env, AGENT_ROUTE_DEPTH: '1' };
+        const before = invocations();
+        const rows = history().length;
+        const cooldownPath = path.join(home, 'state', 'cooldown.json');
+        const cooldownBefore = fs.existsSync(cooldownPath) ? fs.readFileSync(cooldownPath, 'utf8') : null;
+        for (const args of [['tier1', '--cwd', repo], ['tier2', '--cwd', repo, '--monitor'],
+          ['tier1', '--cwd', repo, '--resume', '00000000-0000-0000-0000-000000000000']]) {
+          const blocked = spawnSync(process.execPath, [SCRIPT_PATH, ...args],
+            { env: depthEnv, input: 'AGENT_ROUTE_SELFTEST:complete\n', encoding: 'utf8', timeout: 5000 });
+          exitIs(blocked, 12);
+          check(blocked.stdout.startsWith('ERROR\n') && blocked.stdout.includes('执行方内部不能再调用 agent-route'), `未输出拦截 ERROR: ${blocked.stdout}`);
+        }
+        check(invocations() === before, '被拦截的派发调用了 codex-stub');
+        check(history().length === rows, '被拦截的派发写了 history');
+        check((fs.existsSync(cooldownPath) ? fs.readFileSync(cooldownPath, 'utf8') : null) === cooldownBefore, '被拦截的派发改动了冷却');
+        for (const command of ['status', 'stats']) {
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, command], { env: depthEnv, cwd: repo, encoding: 'utf8', timeout: 5000 });
+          exitIs(result, 0);
+          check(!result.stdout.includes('执行方内部'), `${command} 被误拦`);
+        }
+        for (const claude of [false, true]) {
+          const normal = run('complete', claude ? ['--claude'] : [], true);
+          exitIs(normal, 0);
+          const call = (claude ? claudeCalls() : invocationRows()).at(-1);
+          if (claude) {
+            const args = invocationRows().filter((row) => row.command === '-p').at(-1).args;
+            const at = args.indexOf('--settings');
+            check(at >= 0 && args[at + 1] === JSON.stringify({ permissions: { deny: ['Skill(agent-route)'] } }), 'Claude 参数缺少 --settings deny Skill(agent-route)');
+          }
+          check(claude ? call.envKeys.includes('AGENT_ROUTE_DEPTH') && call.agentRouteDepth === '1'
+            : call.agentRouteDepth === '1', `${claude ? 'Claude' : 'Codex'} 执行方环境缺少 AGENT_ROUTE_DEPTH=1`);
+        }
+      }],
     );
     for (const [id, name, test] of scenarios) {
       try {
@@ -3058,6 +3093,11 @@ if (cmd === 'clear-cooldown') {
 // ---------- 路由 ----------
 if (cmd !== 'tier1' && cmd !== 'tier2') die(cmd ? `未知命令或 tier: ${cmd}` : '缺少命令');
 const tier = cmd;
+// 执行方内部不能再调用 agent-route：启动执行方时会设置 AGENT_ROUTE_DEPTH=1。
+if (process.env.AGENT_ROUTE_DEPTH) {
+  process.stdout.write('ERROR\nreason: 执行方内部不能再调用 agent-route（检测到 AGENT_ROUTE_DEPTH）\n', () => process.exit(12));
+  await new Promise(() => {});
+}
 let write = false;
 let noClaude = false;
 let forceClaude = false;
@@ -3805,11 +3845,13 @@ function runClaude(codexReason, resume = false, spawnRetried = false) {
   const claudeBin = config.claudeBin ?? 'claude';
   const args = ['-p', `执行 ${fullPromptPath}`, '--agents', path.join(ROOT, 'agents.json'), '--agent', tier,
     '--model', claudeModel, '--effort', claudeEffort, '--output-format', 'json',
-    '--permission-mode', config.claudePermissionMode ?? 'auto'];
+    '--permission-mode', config.claudePermissionMode ?? 'auto',
+    // 只拦截 agent-route skill，不影响其他 skill；与 AGENT_ROUTE_DEPTH 共同防止递归派发。
+    '--settings', JSON.stringify({ permissions: { deny: ['Skill(agent-route)'] } })];
   if (resume) args.push('--resume', session);
   if (!write) args.push('--disallowedTools', 'Edit', 'Write', 'NotebookEdit');
   // 仅传入运行命令需要的环境，隔离主会话和路由控制变量。
-  const env = claudeEnvironment(dispatchContext.claude);
+  const env = { ...claudeEnvironment(dispatchContext.claude), AGENT_ROUTE_DEPTH: '1' };
 
   const failClaude = (reason) => {
     const oneLine = String(reason).replace(/\s+/g, ' ').trim();
@@ -3947,7 +3989,7 @@ function runCodex(spawnRetried = false) {
 
   let child;
   try {
-    child = spawn(codexBin, args, { cwd, env: { ...process.env, CODEX_HOME }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    child = spawn(codexBin, args, { cwd, env: { ...process.env, CODEX_HOME, AGENT_ROUTE_DEPTH: '1' }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
   } catch (e) { cleanup(); return failCodex(`spawn 失败: ${e.message}`); }
   child.stdin.on('error', () => {});
   child.stdin.end(fullPrompt);
