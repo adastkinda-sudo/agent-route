@@ -1,31 +1,44 @@
 #!/bin/zsh
 # 把本仓库的稳定版同步到 ~/.claude：先备份线上文件，再覆盖。
-# 只同步代码和配置；线上的 logs/、state/、backup/ 不动。
+# 只同步代码和配置；线上的 logs/、state/、backup/、config.local.json 不动。
 # 用法：scripts/promote [--dry-run]
 set -euo pipefail
 
 repo=${0:A:h:h}
 dest=${AGENT_ROUTE_DEST:-$HOME/.claude/agent-route}
 agents_dest=${CLAUDE_AGENTS_DEST:-$HOME/.claude/agents}
+skills_dest=${CLAUDE_SKILLS_DEST:-$HOME/.claude/skills}
 dry=0
 [[ ${1:-} == --dry-run ]] && dry=1
 
 items=(bin test config.json agents.json)
+# 仓库内路径 -> 线上路径
+typeset -A extras=(
+  claude-agents/tier3.md "$agents_dest/tier3.md"
+  claude-skills/agent-route/SKILL.md "$skills_dest/agent-route/SKILL.md"
+)
 
 print "差异（线上 -> 仓库）："
 for item in $items; do diff -rq "$dest/$item" "$repo/$item" 2>/dev/null || true; done
-diff -q "$agents_dest/tier3.md" "$repo/claude-agents/tier3.md" 2>/dev/null || true
+for src target in ${(kv)extras}; do diff -q "$target" "$repo/$src" 2>/dev/null || true; done
 (( dry )) && exit 0
 
 backup="$dest/backup/promote-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 for item in $items; do [[ -e $dest/$item ]] && cp -Rp "$dest/$item" "$backup/"; done
-[[ -e $agents_dest/tier3.md ]] && cp -p "$agents_dest/tier3.md" "$backup/"
-
-for item in $items; do
-  rm -rf "$dest/$item"
-  cp -Rp "$repo/$item" "$dest/$item"
+for src target in ${(kv)extras}; do
+  [[ -e $target ]] && mkdir -p "$backup/${src:h}" && cp -p "$target" "$backup/$src"
 done
-mkdir -p "$agents_dest"
-cp -p "$repo/claude-agents/tier3.md" "$agents_dest/tier3.md"
+
+# 先复制到临时名再替换，缩短线上文件缺失的窗口
+for item in $items; do
+  cp -Rp "$repo/$item" "$dest/.$item.new"
+  [[ -e $dest/$item ]] && mv "$dest/$item" "$dest/.$item.old"
+  mv "$dest/.$item.new" "$dest/$item"
+  rm -rf "$dest/.$item.old"
+done
+for src target in ${(kv)extras}; do
+  mkdir -p "${target:h}"
+  cp -p "$repo/$src" "$target.new" && mv "$target.new" "$target"
+done
 print "已同步到 $dest，备份在 $backup"
