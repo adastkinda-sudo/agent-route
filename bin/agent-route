@@ -31,6 +31,7 @@ function configuredStateDir() {
 }
 const STATE_DIR = configuredStateDir();
 const LOG_DIR = path.join(ROOT, 'logs');
+const VERSION_FILE = path.join(ROOT, 'VERSION');
 const SELFTEST_STATE_ROOT = (() => {
   const relative = path.relative(STATE_DIR, DEFAULT_STATE_DIR);
   const defaultInsideShared = !relative || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
@@ -156,6 +157,15 @@ function fmtLocal(d) {
   const off = -d.getTimezoneOffset();
   const zone = `UTC${off >= 0 ? '+' : '-'}${Math.floor(Math.abs(off) / 60)}${Math.abs(off) % 60 ? ':' + p2(Math.abs(off) % 60) : ''}`;
   return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())} (${zone})`;
+}
+
+function readVersion() {
+  try {
+    const value = JSON.parse(fs.readFileSync(VERSION_FILE, 'utf8'));
+    if (value && typeof value.commit === 'string' && value.commit &&
+        typeof value.time === 'string' && value.time) return value;
+  } catch {}
+  return null;
 }
 
 function activeUntil(data, model) {
@@ -3100,6 +3110,8 @@ if (cmd === 'setup') {
 
 if (cmd === 'status') {
   const config = readConfig();
+  const version = readVersion();
+  console.log(version ? `version: ${version.commit.slice(0, 7)} ${version.time}` : 'version: dev');
   console.log(`state dir: ${STATE_DIR}; log dir: ${LOG_DIR}`);
   const context = await resolveDispatchContext(config);
   if (context.enabled && context.codex.billingType !== 'unknown') CODEX_HOME = context.codex.configDir;
