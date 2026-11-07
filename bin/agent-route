@@ -14,8 +14,28 @@ const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(process.env.AGENT_ROUTE_HOME || path.join(path.dirname(SCRIPT_PATH), '..'));
 const CONFIG_FILE = path.join(ROOT, 'config.json');
 const CONFIG_LOCAL_FILE = path.join(ROOT, 'config.local.json');
-const STATE_DIR = path.join(ROOT, 'state');
+const DEFAULT_STATE_DIR = path.join(ROOT, 'state');
+function configuredStateDir() {
+  // selftest 通过 AGENT_ROUTE_HOME 使用完全隔离的 ROOT，不继承线上共享状态目录。
+  if (process.env.AGENT_ROUTE_HOME) return DEFAULT_STATE_DIR;
+  try {
+    const local = JSON.parse(fs.readFileSync(CONFIG_LOCAL_FILE, 'utf8'));
+    const value = local?.stateDir;
+    if (typeof value !== 'string' || !value.trim()) return DEFAULT_STATE_DIR;
+    const trimmed = value.trim();
+    const expanded = trimmed.startsWith('~') ? `${os.homedir()}${trimmed.slice(1)}` : trimmed;
+    return path.resolve(ROOT, expanded);
+  } catch {
+    return DEFAULT_STATE_DIR;
+  }
+}
+const STATE_DIR = configuredStateDir();
 const LOG_DIR = path.join(ROOT, 'logs');
+const SELFTEST_STATE_ROOT = (() => {
+  const relative = path.relative(STATE_DIR, DEFAULT_STATE_DIR);
+  const defaultInsideShared = !relative || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  return defaultInsideShared ? os.tmpdir() : DEFAULT_STATE_DIR;
+})();
 const COOLDOWN_FILE = path.join(STATE_DIR, 'cooldown.json');
 const HISTORY_FILE = path.join(STATE_DIR, 'history.jsonl');
 const CODEX_LIMIT_FILE = path.join(STATE_DIR, 'codex-limit.json');
@@ -60,6 +80,7 @@ const USAGE = `usage:
   agent-route stats [--days N]
 
 AGENT_ROUTE_HOME 覆盖 config、agents、state 和 logs 的根目录，只供 selftest 使用。
+config.local.json 可选 stateDir（支持 ~ 开头）以共享额度和冷却状态；日志仍写入 <ROOT>/logs。
 日志是 <ROOT>/logs/<id>.log，报告是 <ROOT>/logs/<id>.report.md；<ROOT> 为 ${ROOT}。
 默认在 Codex 失败或冷却时调用 Claude；--no-claude 时只输出 FALLBACK 块。
 Codex 订阅账号受限时自动交给 Claude；每 5 分钟查询额度，接口不可用时每 15 分钟用真实任务重试 Codex。API 服务商只被动检测限速或余额错误。--no-claude 保持 LIMIT、退出码 15。
@@ -1010,8 +1031,8 @@ async function selftest() {
   let tmpDir;
   let failed = false;
   try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(STATE_DIR, 'selftest-')));
+    fs.mkdirSync(SELFTEST_STATE_ROOT, { recursive: true });
+    tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(SELFTEST_STATE_ROOT, 'agent-route-selftest-')));
     const home = path.join(tmpDir, 'home');
     const repo = path.join(tmpDir, 'repo');
     fs.mkdirSync(home);
@@ -1257,6 +1278,34 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     const probeRun = (args, options = {}) => spawnSync(process.execPath, [SCRIPT_PATH, ...args], {
       env: options.env ?? probeEnv, cwd: options.cwd ?? probeHome, input: options.input,
       encoding: 'utf8', timeout: options.timeout ?? 5000 });
+    const configuredRoot = path.join(tmpDir, 'configured-root');
+    const configuredState = path.join(tmpDir, 'configured-state');
+    const configuredHome = path.join(tmpDir, 'configured-home');
+    fs.mkdirSync(path.join(configuredRoot, 'bin'), { recursive: true });
+    fs.mkdirSync(configuredHome, { recursive: true });
+    fs.copyFileSync(SCRIPT_PATH, path.join(configuredRoot, 'bin', 'agent-route'));
+    fs.copyFileSync(CONFIG_FILE, path.join(configuredRoot, 'config.json'));
+    fs.copyFileSync(path.join(ROOT, 'agents.json'), path.join(configuredRoot, 'agents.json'));
+    const configuredConfig = JSON.parse(fs.readFileSync(path.join(configuredRoot, 'config.json'), 'utf8'));
+    configuredConfig.codexBin = probeCodex;
+    configuredConfig.claudeBin = probeCodex;
+    configuredConfig.ccSwitch = { enabled: false };
+    fs.writeFileSync(path.join(configuredRoot, 'config.json'), JSON.stringify(configuredConfig, null, 2) + '\n');
+    fs.writeFileSync(path.join(configuredRoot, 'config.local.json'), JSON.stringify({
+      codexBin: probeCodex, claudeBin: probeCodex, stateDir: configuredState,
+    }) + '\n');
+    const configuredEnv = { ...env, HOME: configuredHome, CODEX_HOME: path.join(configuredHome, '.codex'),
+      CLAUDE_CONFIG_DIR: path.join(configuredHome, '.claude'), XDG_CONFIG_HOME: path.join(configuredHome, '.config'),
+      TMPDIR: path.join(configuredHome, 'tmp'), AGENT_ROUTE_HOME: undefined };
+    for (const key of Object.keys(configuredEnv)) if (key.startsWith('AGENT_ROUTE_')) delete configuredEnv[key];
+    fs.mkdirSync(path.join(configuredHome, '.codex'), { recursive: true });
+    fs.mkdirSync(configuredEnv.TMPDIR, { recursive: true });
+    fs.writeFileSync(path.join(configuredHome, '.codex', 'auth.json'), JSON.stringify({ tokens: { account_id: 'configured-account' } }));
+    fs.writeFileSync(path.join(configuredHome, 'selftest-isolation.json'), JSON.stringify({
+      home: configuredHome, codexHome: path.join(configuredHome, '.codex'), root: tmpDir,
+    }));
+    const configuredRun = (args, input = '') => spawnSync(process.execPath, [path.join(configuredRoot, 'bin', 'agent-route'), ...args], {
+      env: configuredEnv, cwd: configuredRoot, input, encoding: 'utf8', timeout: dispatchTimeout });
     const scenarios = [
       [0, '缺 config.local.json 时自动生成', () => {
         fs.rmSync(path.join(probeHome, 'config.local.json'), { force: true });
@@ -1270,11 +1319,17 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const overrideCodex = path.join(tmpDir, 'override-codex');
         fs.writeFileSync(overrideClaude, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         fs.writeFileSync(overrideCodex, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-        fs.writeFileSync(path.join(probeHome, 'config.local.json'), JSON.stringify({ claudeBin: overrideClaude, codexBin: overrideCodex }) + '\n');
+        fs.writeFileSync(path.join(probeHome, 'config.local.json'), JSON.stringify({
+          claudeBin: overrideClaude, codexBin: overrideCodex, stateDir: configuredState,
+        }) + '\n');
         const result = probeRun(['status']);
         check(!result.error && result.status === 0, `local override 失败: ${result.stderr}`);
         const local = JSON.parse(fs.readFileSync(path.join(probeHome, 'config.local.json'), 'utf8'));
         check(local.claudeBin === overrideClaude && local.codexBin === overrideCodex, 'local 未覆盖 config.json');
+        const clear = probeRun(['clear-cooldown']);
+        check(clear.status === 0 && result.stdout.includes(`state dir: ${path.join(probeHome, 'state')}`) &&
+          fs.existsSync(path.join(probeHome, 'state', 'cooldown.json')) &&
+          !fs.existsSync(path.join(configuredState, 'cooldown.json')), 'AGENT_ROUTE_HOME 未忽略 stateDir');
       }],
       [0.2, '两种方式都找不到时输出 ERROR', () => {
         const missingEnv = { ...probeEnv, AGENT_ROUTE_HOME: probeHome,
@@ -1295,6 +1350,14 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(!result.error && result.status === 0, `失效路径重试失败: ${result.stdout} ${retryDetail}`);
         const local = JSON.parse(fs.readFileSync(path.join(retryHome, 'config.local.json'), 'utf8'));
         check(local.codexBin === probeCodex, '失效路径重试后未更新 codexBin');
+        const status = configuredRun(['status']);
+        check(status.status === 0 && status.stdout.includes(`state dir: ${configuredState}`) &&
+          status.stdout.includes(`log dir: ${path.join(configuredRoot, 'logs')}`), 'stateDir 或日志目录状态输出不符');
+        const dispatch = configuredRun(['tier1', '--no-claude', '--cwd', configuredRoot], 'AGENT_ROUTE_SELFTEST:complete\n');
+        check(dispatch.status === 0 && fs.existsSync(path.join(configuredState, 'history.jsonl')) &&
+          fs.readdirSync(path.join(configuredRoot, 'logs')).some((name) => name.endsWith('.log')) &&
+          !fs.existsSync(path.join(configuredRoot, 'state', 'history.jsonl')),
+          `stateDir 未共享状态或日志跟随 stateDir: status=${dispatch.status} stderr=${dispatch.stderr.trim()} stdout=${dispatch.stdout.trim()}`);
       }],
       [1, '汇报完成', () => {
         complete = run('complete');
@@ -1322,6 +1385,17 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(warning.stdout.startsWith('状态: 完成\n'), '有 WARNING 时未保留完整汇报');
         check(/^WARNING:.*git 状态.*tracked\.txt/m.test(warning.footer), 'WARNING 未包含 git 状态变化');
         check(fs.readFileSync(path.join(repo, 'tracked.txt'), 'utf8').includes('stub write'), 'stub 未修改已跟踪文件');
+        const rootCwdHome = path.join(tmpDir, 'root-cwd-home');
+        fs.mkdirSync(path.join(rootCwdHome, '.codex'), { recursive: true });
+        fs.writeFileSync(path.join(rootCwdHome, '.codex', 'auth.json'), JSON.stringify({ tokens: { account_id: 'root-cwd' } }));
+        fs.writeFileSync(path.join(rootCwdHome, 'selftest-isolation.json'), JSON.stringify({
+          home: rootCwdHome, codexHome: path.join(rootCwdHome, '.codex'), root: tmpDir,
+        }));
+        const rootCwdEnv = { ...env, HOME: rootCwdHome, CODEX_HOME: path.join(rootCwdHome, '.codex'),
+          CLAUDE_CONFIG_DIR: path.join(rootCwdHome, '.claude'), AGENT_ROUTE_HOME: home };
+        const rootCwd = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--no-claude', '--cwd', home], {
+          env: rootCwdEnv, cwd: home, input: 'AGENT_ROUTE_SELFTEST:complete\n', encoding: 'utf8', timeout: dispatchTimeout });
+        check(rootCwd.status === 0 && !rootCwd.stdout.includes('WARNING'), 'ROOT 位于 --cwd 内时误报 WARNING');
       }],
       [5, '忽略目录写入与 exclude', () => {
         const result = run('ignored-write', ['--exclude', 'excluded']);
@@ -3026,6 +3100,7 @@ if (cmd === 'setup') {
 
 if (cmd === 'status') {
   const config = readConfig();
+  console.log(`state dir: ${STATE_DIR}; log dir: ${LOG_DIR}`);
   const context = await resolveDispatchContext(config);
   if (context.enabled && context.codex.billingType !== 'unknown') CODEX_HOME = context.codex.configDir;
   const data = readCooldown();
@@ -3289,7 +3364,12 @@ beginRound();
 
 // ---------- 只读核对：git 状态前后对比 + 执行期间新写入的文件（含 git 忽略的路径） ----------
 const readOnlyCheck = !write && !monitor;
-const excludes = [...(config.readOnlyExclude ?? []), ...excludeArgs]
+const relativeChild = (child, parent) => {
+  const relative = path.relative(parent, child);
+  return relative && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative) ? relative : null;
+};
+const automaticExcludes = [STATE_DIR, LOG_DIR].map((directory) => relativeChild(directory, cwd)).filter(Boolean);
+const excludes = [...(config.readOnlyExclude ?? []), ...excludeArgs, ...automaticExcludes]
   .map((p) => p.replace(/^\.\/+/, '').replace(/\/+$/, '')).filter(Boolean);
 const isExcluded = (rel) => excludes.some((e) => rel === e || rel.startsWith(`${e}/`));
 if (readOnlyCheck && excludes.length) log(`read-only exclude: ${excludes.join(', ')}`);
