@@ -1,0 +1,10 @@
+#!/bin/zsh
+# 用法: watch-alert.sh <日志> <进程匹配串> [已处理的 ALERT 数]
+log=$1; pat=$2; seen=${3:-0}
+sleep 5
+while true; do
+  n=$(grep -c '^ALERT' "$log" 2>/dev/null); n=${n:-0}
+  if (( n > seen )); then grep '^ALERT' "$log" | tail -n $((n - seen)); echo "alerts_total=$n"; exit 0; fi
+  if ! pgrep -f "$pat" >/dev/null; then echo "process exited without new ALERT"; tail -3 "$log"; exit 0; fi
+  sleep 15
+done

@@ -1,0 +1,288 @@
+#!/usr/bin/env node
+// selftest 专用：模拟 codex、Claude 及其续跑，不调用模型。
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { createInterface } from 'node:readline';
+
+function die(message) {
+  process.stderr.write(`codex-stub: ${message}\n`);
+  process.exit(2);
+}
+
+const args = process.argv.slice(2);
+// 夹具必须由隔离的 selftest 启动；在所有模拟调用前检查，绝不回退到真实目录。
+let isolation;
+try { isolation = JSON.parse(fs.readFileSync(path.join(process.env.HOME, 'selftest-isolation.json'), 'utf8')); }
+catch { die('缺少隔离环境'); }
+if (process.env.HOME !== isolation.home ||
+  (process.env.CODEX_HOME ?? path.join(process.env.HOME, '.codex')) !== isolation.codexHome ||
+  !fs.realpathSync(process.cwd()).startsWith(isolation.root + path.sep)) die('selftest 目录未隔离');
+fs.appendFileSync(path.join(isolation.home, 'stub-invocations.jsonl'), JSON.stringify({ command: args[0], args }) + '\n');
+if (args[0] === '-p' || args[0] === 'auth') {
+  const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(isolation.home, '.claude');
+  if (!path.resolve(configDir).startsWith(isolation.home + path.sep) ||
+    Object.keys(process.env).some((key) => /^(ANTHROPIC_|CLAUDE_CODE_|CODEX_|AGENT_ROUTE_)/.test(key))) die('Claude 环境未隔离');
+  if (args[0] === 'auth') {
+    if (args.join(' ') !== 'auth status') die('只支持 auth status');
+    let status = { loggedIn: false, authMethod: 'none' };
+    try { status = JSON.parse(fs.readFileSync(path.join(isolation.home, 'stub-claude-auth.json'), 'utf8')); } catch {}
+    if (status.delayMs) await new Promise((resolve) => setTimeout(resolve, status.delayMs));
+    process.stdout.write(JSON.stringify({ apiProvider: 'firstParty', configDirectory: configDir, ...status }));
+    process.exit(status.loggedIn ? 0 : 1);
+  }
+  const option = (key) => args[args.indexOf(key) + 1];
+  const agents = JSON.parse(fs.readFileSync(option('--agents'), 'utf8'));
+  let settings = {};
+  try { settings = JSON.parse(fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8')); } catch {}
+  const model = option('--model');
+  const modelEnv = `ANTHROPIC_DEFAULT_${model.toUpperCase()}_MODEL`;
+  const agent = agents[option('--agent')];
+  if (!agent || agent.model !== 'inherit') die('agent model 未继承本次解析模型');
+  fs.appendFileSync(path.join(isolation.home, 'stub-claude-invocations.jsonl'), JSON.stringify({ model,
+    effectiveModel: settings.env?.[modelEnv] ?? model, effort: option('--effort'), configDir,
+    customConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null, envKeys: Object.keys(process.env), agent,
+    session: args.includes('--resume') ? option('--resume') : null }) + '\n');
+}
+if (args[0] === 'app-server') {
+  const settingsPath = path.join(process.env.HOME, 'stub-rate-limits.json');
+  let settings = { mode: 'limited' };
+  try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch {}
+  fs.appendFileSync(path.join(process.env.HOME, 'stub-app-server.jsonl'), JSON.stringify({ event: 'start', pid: process.pid }) + '\n');
+  const reply = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+  let initialized = false;
+  let acknowledged = false;
+  process.on('SIGTERM', () => {
+    if (settings.mode === 'hang-stubborn') return;
+    fs.appendFileSync(path.join(process.env.HOME, 'stub-app-server.jsonl'), JSON.stringify({ event: 'stop', pid: process.pid }) + '\n');
+    process.exit(0);
+  });
+  const lines = createInterface({ input: process.stdin });
+  lines.on('line', (line) => {
+    const request = JSON.parse(line);
+    if (request.method === 'initialize') {
+      if (!request.params?.clientInfo?.name || initialized) die('initialize 字段或顺序错误');
+      initialized = true;
+      reply({ id: request.id, result: { userAgent: 'stub' } });
+    } else if (request.method === 'initialized') acknowledged = initialized;
+    else if (request.method === 'account/rateLimits/read') {
+      if (!acknowledged) die('未完成初始化');
+      if (settings.mode === 'hang' || settings.mode === 'hang-stubborn') return;
+      if (settings.mode === 'unavailable') return reply({ id: request.id, error: { code: -32601, message: 'Method not found' } });
+      const rateLimits = { limitId: settings.mode === 'malformed' ? 'premium' : 'codex',
+        primary: { usedPercent: settings.mode === 'recovered' ? 20 : 100, windowDurationMins: 300,
+          resetsAt: settings.resets_at ?? Math.floor(Date.now() / 1000) + 7200 },
+        secondary: { usedPercent: 3, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 604800 },
+        rateLimitReachedType: null };
+      reply({ id: request.id, result: { rateLimits: { limitId: 'premium' }, rateLimitsByLimitId: { codex: rateLimits } } });
+    } else die(`未知方法 ${request.method}`);
+  });
+  await new Promise((resolve) => lines.on('close', () => {
+    if (settings.mode === 'hang-stubborn') setInterval(() => {}, 1000);
+    else resolve();
+  }));
+  process.exit(0);
+}
+const claude = args[0] === '-p';
+const processCwd = fs.realpathSync(process.cwd());
+let session;
+let cwd;
+let output;
+let prompt;
+if (claude) {
+  args.shift();
+  const request = args.shift();
+  if (!request?.startsWith('执行 ')) die('Claude 需要 prompt 文件');
+  prompt = fs.readFileSync(request.slice(3), 'utf8');
+  cwd = processCwd;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--disallowedTools') { i = args.length; continue; }
+    if (!['--agents', '--agent', '--model', '--effort', '--output-format', '--permission-mode', '--resume'].includes(arg)) die(`未知 Claude 参数: ${arg}`);
+    const value = args[++i];
+    if (!value || value.startsWith('-')) die(`${arg} 缺少参数值`);
+    if (arg === '--resume') session = value;
+  }
+} else {
+  if (args.shift() !== 'exec') die('只支持 exec 或 Claude -p');
+  if (args[0] === 'resume') {
+    args.shift();
+    session = args.shift();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session ?? '')) die('resume 需要 session UUID');
+  }
+  cwd = session ? processCwd : null;
+  let stdin = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--dangerously-bypass-approvals-and-sandbox' || arg === '--skip-git-repo-check') continue;
+    if (arg === '-') { stdin = true; continue; }
+    if (!['-C', '-o', '-m', '-c'].includes(arg)) die(`未知参数: ${arg}`);
+    const value = args[++i];
+    if (!value || value.startsWith('-')) die(`${arg} 缺少参数值`);
+    if (arg === '-C') {
+      if (session) die('exec resume 不支持 -C');
+      cwd = fs.realpathSync(path.resolve(value));
+    }
+    if (arg === '-o') output = value;
+  }
+  if (!cwd || !output || !stdin) die('需要 cwd、-o 和 stdin 参数 -');
+  prompt = fs.readFileSync(0, 'utf8');
+}
+process.chdir(cwd);
+const stateDir = path.join(process.env.HOME, 'stub-sessions');
+fs.mkdirSync(stateDir, { recursive: true });
+const previous = session && fs.existsSync(path.join(stateDir, `${session}.json`))
+  ? JSON.parse(fs.readFileSync(path.join(stateDir, `${session}.json`), 'utf8')) : null;
+const markers = [...prompt.matchAll(/^AGENT_ROUTE_SELFTEST:(\S+)$/gm)].map((match) => match[1]);
+// 新线程重建的说明会带上原任务，新增要求里的 failure 和 codex-fail-N 标记优先。
+const scenario = markers.find((name) => name === 'failure' || /^codex-fail-\d+$/.test(name)) ?? markers[0] ?? previous?.scenario;
+const failFirst = Number(scenario?.match(/^codex-fail-(\d+)$/)?.[1] ?? 0);
+if (!['complete', 'partial', 'unknown', 'tracked-write', 'ignored-write', 'pycache', 'failure', 'monitor',
+  'paths', 'fixable', 'fix-twice', 'fix-failure', 'fix-partial', 'claude-fixable',
+  'progress-details', 'commit-mixed', 'report-warning', 'compact-details', 'deviation', 'pending', 'empty-notes',
+  'conclusions', 'missing-conclusion', 'empty-conclusion', 'limit', 'limit-notime',
+  'limit-session', 'limit-weekly', 'limit-reached', 'limit-partial', 'limit-both', 'limit-both-zero', 'limit-both-api',
+  'complete-snapshot', 'metadata-healthy-error', 'premium-only', 'api-complete-snapshot', 'api-429-snapshot',
+  'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both'].includes(scenario) && !failFirst) {
+  die(`未知场景: ${scenario ?? '(无)'}`);
+}
+const currentSession = session ?? randomUUID();
+// codex-fail-N：前 N 次 Codex 调用失败（续跑、重试和新线程都计数），之后及 Claude 调用成功。
+if (!claude && failFirst) {
+  const counter = path.join(stateDir, `${scenario}.count`);
+  const calls = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0) + 1;
+  fs.writeFileSync(counter, String(calls));
+  if (calls <= failFirst) {
+    fs.writeSync(2, `session id: ${currentSession}\nERROR: simulated codex failure ${calls}/${failFirst}\n`);
+    process.exit(1);
+  }
+}
+if (claude && (scenario.startsWith('limit-both') || scenario === 'api-limit-both')) {
+  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: true,
+    result: scenario === 'limit-both-api' ? 'API Error: Rate limit reached' : "You've hit your session limit · resets 8:20pm (UTC)",
+    session_id: currentSession }), () => process.exit(scenario === 'limit-both' ? 1 : 0));
+  await new Promise(() => {});
+}
+if (!claude && ['limit-session', 'limit-weekly', 'limit-reached', 'limit-partial', 'complete-snapshot', 'metadata-healthy-error', 'premium-only',
+  'api-complete-snapshot', 'api-429-snapshot'].includes(scenario)) {
+  const directory = path.join(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'), 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const primary = { used_percent: scenario === 'complete-snapshot' || scenario === 'metadata-healthy-error' ? 23 : 100,
+    window_minutes: 300, resets_at: Math.floor(Date.now() / 1000) + 7200 };
+  const secondary = { used_percent: scenario === 'limit-weekly' ? 100 : 3, window_minutes: 10080,
+    resets_at: Math.floor(Date.now() / 1000) + 604800 };
+  if (scenario === 'limit-reached') primary.used_percent = 99;
+  if (scenario === 'limit-weekly') primary.used_percent = 50;
+  const event = (rate_limits) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits } });
+  const snapshot = { limit_id: 'codex', primary, secondary, rate_limit_reached_type: scenario === 'limit-reached' ? 'primary' : null };
+  const records = [JSON.stringify({ type: 'response_item', payload: { content: 'SELFTEST_PRIVATE_DIALOGUE' } }),
+    ...(scenario === 'premium-only' ? [] : [event({ ...snapshot, primary: { ...primary, used_percent: 12 } }), event(snapshot)]),
+    event({ limit_id: 'premium', primary: null, secondary: null, rate_limit_reached_type: null })];
+  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), records.join('\n') + '\n{"unfinished":');
+}
+if (!claude) {
+  const apiErrors = {
+    'api-429': 'HTTP 429 Too Many Requests\nRetry-After: 120',
+    'api-429-snapshot': 'HTTP 429 Too Many Requests\nRetry-After: 120',
+    'api-429-date': `HTTP 429 Too Many Requests\nRetry-After: ${new Date(Date.now() + 180_000).toUTCString()}`,
+    'api-429-reset': JSON.stringify({ error: { code: 'rate_limit_exceeded', resets_at: Math.floor(Date.now() / 1000) + 240 } }),
+    'api-quota': 'ERROR: insufficient_quota',
+    'api-401': 'HTTP 401 Unauthorized',
+    'api-model': 'ERROR: unsupported model',
+    'api-network': 'ERROR: connect ECONNREFUSED',
+    'api-limit-both': 'HTTP 429 Too Many Requests',
+  };
+  if (apiErrors[scenario]) {
+    fs.writeSync(2, `session id: ${currentSession}\n${apiErrors[scenario]}\n`);
+    process.exit(1);
+  }
+}
+if (!claude && (scenario.startsWith('limit') || ['metadata-healthy-error', 'premium-only'].includes(scenario))) {
+  if (scenario === 'limit-partial') fs.appendFileSync(path.join(cwd, 'tracked.txt'), 'partial codex change\n');
+  const t = new Date(Date.now() + 2 * 3_600_000 + 60_000);
+  const at = `${t.getHours() % 12 || 12}:${String(t.getMinutes()).padStart(2, '0')} ${t.getHours() < 12 ? 'AM' : 'PM'}`;
+  const tail = scenario === 'limit' ? ` or try again at ${at}.` : '.';
+  fs.writeSync(2, `session id: ${currentSession}\nERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits${tail}\n`);
+  process.exit(1);
+}
+const repair = prompt.includes('自动返工：上轮 verify 失败。');
+const round = repair ? (previous?.round ?? 0) + 1 : 0;
+fs.writeFileSync(path.join(stateDir, `${currentSession}.json`), JSON.stringify({ scenario, round }));
+if (repair && ['fixable', 'fix-twice', 'claude-fixable'].includes(scenario) && (scenario !== 'fix-twice' || round >= 2)) {
+  fs.writeFileSync(path.join(cwd, `${scenario}.txt`), 'stub repair\n');
+}
+const reportPath = prompt.match(/^.*写进报告文件 (.+?)；/m)?.[1];
+if (scenario === 'paths') {
+  if (!reportPath) die('paths 需要报告文件路径');
+  fs.writeFileSync(reportPath, `详细报告 ${cwd}\n`);
+}
+
+if (scenario === 'tracked-write') fs.appendFileSync(path.join(cwd, 'tracked.txt'), 'stub write\n');
+if (scenario === 'commit-mixed') {
+  for (const name of ['existing-dirty.txt', 'fresh-clean.txt', 'changed-untracked.txt']) {
+    fs.appendFileSync(path.join(cwd, name), 'stub change\n');
+  }
+  fs.writeFileSync(path.join(cwd, 'new file 界.txt'), 'stub new\n');
+  fs.unlinkSync(path.join(cwd, 'deleted.txt'));
+  fs.renameSync(path.join(cwd, 'renamed-old.txt'), path.join(cwd, 'renamed new.txt'));
+  fs.mkdirSync(path.join(cwd, 'ignored'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, 'ignored', 'commit.txt'), 'ignored\n');
+}
+if (scenario === 'ignored-write') {
+  for (const dir of ['ignored', 'excluded']) {
+    fs.mkdirSync(path.join(cwd, dir), { recursive: true });
+    fs.writeFileSync(path.join(cwd, dir, 'written.txt'), 'stub write\n');
+  }
+}
+if (scenario === 'pycache') {
+  fs.mkdirSync(path.join(cwd, '__pycache__'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '__pycache__', 'selftest.pyc'), 'stub bytecode\n');
+}
+
+const failure = scenario === 'failure' || (scenario === 'fix-failure' && repair) || (scenario === 'claude-fixable' && !claude);
+const status = scenario === 'partial' || (scenario === 'fix-partial' && repair) ? '部分完成' : failure ? '未完成' : '完成';
+const report = scenario === 'monitor' ? 'STATUS: OK\nselftest monitor\n' : [
+  ...(scenario === 'unknown' ? [] : [`状态: ${status}`]),
+  ...(/^模式: 只读，除报告文件 /m.test(prompt) && scenario !== 'missing-conclusion'
+    ? scenario === 'empty-conclusion' ? ['结论:', '  -   ']
+      : scenario === 'conclusions' ? ['结论:', '  - 入口会校验输入；依据: src/router.js:route',
+        '    说明: 保留  两个空格与换行。', '',
+        `  - ${'调查🧪'.repeat(70)}；依据: rg entry → 2 matches`,
+        '  - 错误分支会返回失败；依据: src/router.js:catchError']
+      : ['结论:', '  - 调查入口正常；依据: codex-stub → 完成'] : []),
+  ...(scenario === 'progress-details' ? ['改动文件:',
+    ...Array.from({ length: 10 }, (_, i) => `  - ${i === 0 ? `${cwd}/` : ''}file-${i + 1}.txt`)] : scenario === 'compact-details'
+    ? ['改动文件:', `  - ${cwd}/first.txt`, `  - ${'界🧪'.repeat(110)}.txt`] : ['改动文件: 无']),
+  ...(scenario === 'compact-details' ? ['验证:', `  - ${'验🧪'.repeat(70)} → PASS`, '  - 第二项 → PASS'] : ['验证: codex-stub → 完成']),
+  ...(session ? [`  - resume session: ${session}`, `  - resume cwd: ${processCwd}`] : []),
+  ...(['fixable', 'fix-twice', 'claude-fixable'].includes(scenario) ? [`  - round: ${round}`] : []),
+  ...(scenario === 'paths' ? [`  - cwd: ${cwd}`, `  - cwd-slash: ${cwd}/`, `  - file: ${cwd}/nested/a.txt`, `  - sibling: ${cwd}-other/a.txt`,
+    `  - logs-dir: ${path.dirname(reportPath)}`, `  - logs: ${path.dirname(reportPath)}/artifact.log`, `  - report: ${reportPath}`] : []),
+  ...(scenario === 'compact-details' ? [] : [
+    ['progress-details', 'deviation'].includes(scenario) ? '偏差: 使用测试替身' : scenario === 'report-warning' ? '偏差: WARNING selftest' :
+      scenario === 'empty-notes' ? '偏差:' : '偏差: 无',
+    ...(scenario === 'progress-details' ? ['遗留问题:', '  - 等待检查', '  - 补充资料'] :
+      [scenario === 'pending' ? '遗留问题: 等待检查' : '遗留问题: 无']),
+  ]),
+  '',
+].join('\n');
+if (claude) {
+  process.stdout.write(JSON.stringify({ is_error: false, result: report, session_id: currentSession,
+    usage: { input_tokens: 1000, output_tokens: 234 }, modelUsage: { 'selftest-claude': {} }, total_cost_usd: 0 }),
+    () => process.exit(failure ? 1 : 0));
+} else {
+  fs.writeFileSync(output, report);
+  process.stdout.write([
+    'OpenAI Codex (selftest stub)',
+    '--------',
+    `workdir: ${cwd}`,
+    `session id: ${currentSession}`,
+    '--------',
+    `SELFTEST_STUB_TRACE: ${scenario}`,
+    'codex',
+    report.trimEnd(),
+    'tokens used',
+    '1,234',
+    '',
+  ].join('\n'), () => process.exit(failure ? 1 : 0));
+}

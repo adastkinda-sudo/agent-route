@@ -1,0 +1,46 @@
+{
+  "tiers": {
+    "tier1": {
+      "codex": {
+        "model": "gpt-6.1-sol",
+        "effort": "xhigh"
+      },
+      "claude": {
+        "model": "claude-sonnet-5-5",
+        "effort": "high"
+      }
+    },
+    "tier2": {
+      "codex": {
+        "model": "gpt-6-luna",
+        "effort": "xhigh",
+        "apiModel": "gpt-6.1-sol"
+      },
+      "claude": {
+        "model": "claude-haiku-5-5",
+        "effort": "medium",
+        "readOnlyModel": "claude-haiku-5-5",
+        "readOnlyEffort": "xhigh"
+      }
+    }
+  },
+  "cooldownMinutes": 30,
+  "codexTimeoutMinutes": 90,
+  "claudeTimeoutMinutes": 60,
+  "claudePermissionMode": "auto",
+  "logRetentionDays": 7,
+  "monitorEffort": "xhigh",
+  "logMode": "summary",
+  "readOnlyExclude": [
+    ".claude/worktrees"
+  ],
+  "monitorClaude": {
+    "model": "claude-haiku-5-5",
+    "effort": "medium"
+  },
+  "ccSwitch": {
+    "enabled": true,
+    "onReadError": "live-config"
+  },
+  "claudeWeeklyThreshold": 80
+}

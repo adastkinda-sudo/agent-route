@@ -1,0 +1,181 @@
+#!/bin/bash
+# monitor-loop: 周期性运行监控命令，默认由路由模型判断状态；--direct 直接使用命令的告警。
+# 用法: monitor-loop [--direct] --name NAME --interval MIN --cwd DIR --log FILE [--max-iterations N] [--cmd-timeout MIN] -- <command...>
+# --direct 不调用模型：以 ALERT 开头的行原样转发并通知，非零退出告警，其余输出仅写日志。
+# 默认模式的模型解析或调用故障使用 MONITOR_ERROR 前缀，与运行告警分开。
+
+AGENT_ROUTE="$HOME/.claude/agent-route/bin/agent-route"
+STATE_DIR="$HOME/.claude/agent-route/state"
+
+usage() {
+  echo "用法: monitor-loop [--direct] --name NAME --interval MIN --cwd DIR --log FILE [--max-iterations N] [--cmd-timeout MIN] -- <command...>" >&2
+  exit 2
+}
+
+NAME=""; INTERVAL=""; CWD=""; LOG=""; MAX_ITER=0; CMD_TIMEOUT=10; DIRECT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --direct) DIRECT=1; shift ;;
+    --name) NAME="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --cwd) CWD="$2"; shift 2 ;;
+    --log) LOG="$2"; shift 2 ;;
+    --max-iterations) MAX_ITER="$2"; shift 2 ;;
+    --cmd-timeout) CMD_TIMEOUT="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) echo "未知参数: $1" >&2; usage ;;
+  esac
+done
+[ -n "$NAME" ] && [ -n "$INTERVAL" ] && [ -n "$CWD" ] && [ -n "$LOG" ] && [ $# -gt 0 ] || usage
+case "$INTERVAL$MAX_ITER$CMD_TIMEOUT" in *[!0-9]*) echo "interval / max-iterations / cmd-timeout 必须是非负整数" >&2; usage ;; esac
+[ -d "$CWD" ] || { echo "目录不存在: $CWD" >&2; exit 2; }
+mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
+
+PIDFILE="$STATE_DIR/monitor-$NAME.pid"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/monitor-loop.XXXXXX")"
+SLEEP_PID=""
+
+cleanup() {
+  rm -f "$PIDFILE"
+  rm -rf "$WORK"
+}
+on_signal() {
+  [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+  exit 130
+}
+trap cleanup EXIT
+trap on_signal INT TERM
+echo $$ > "$PIDFILE"
+
+notify() { # $1 = 摘要
+  local msg title
+  msg=$(printf '%s' "$1" | tr '\n' ' ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  title=$(printf '%s' "实验监控 · $NAME" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  osascript -e "display notification \"$msg\" with title \"$title\"" >/dev/null 2>&1
+}
+
+# 运行命令，带超时；输出写入 $1，退出码写入全局 CMD_RC
+run_command() {
+  local outfile="$1" pid waited=0 limit=$((CMD_TIMEOUT * 60))
+  shift
+  set -m
+  ( cd "$CWD" && exec "$@" ) >"$outfile" 2>&1 </dev/null &
+  pid=$!
+  set +m
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$limit" ]; then
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+      sleep 2
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      CMD_RC=124
+      echo "[monitor-loop] 命令超时（${CMD_TIMEOUT} 分钟），已终止" >>"$outfile"
+      return
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null
+  CMD_RC=$?
+}
+
+iter=0
+while :; do
+  iter=$((iter + 1))
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  RAW="$WORK/raw.txt"; TAIL="$WORK/tail.txt"; PROMPT="$WORK/prompt.txt"
+  AR_OUT="$WORK/ar.out"; AR_ERR="$WORK/ar.err"
+
+  CMD_RC=0
+  run_command "$RAW" "$@"
+
+  if [ "$DIRECT" -eq 1 ]; then
+    {
+      echo "===== $ts | iter $iter | cmd exit $CMD_RC | direct ====="
+      cat "$RAW"
+      echo
+    } >> "$LOG"
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        ALERT*) printf '%s\n' "$line"; notify "$line" ;;
+      esac
+    done < "$RAW"
+    if [ "$CMD_RC" -ne 0 ]; then
+      SUMMARY="ALERT [$NAME] 命令退出码 ${CMD_RC} (log: $LOG)"
+      printf '%s\n' "$SUMMARY" >> "$LOG"
+      printf '%s\n' "$SUMMARY"
+      notify "$SUMMARY"
+    fi
+  else
+    tail -n 200 "$RAW" > "$TAIL"
+
+    {
+      echo "以下是实验监控命令的输出（退出码 ${CMD_RC}）。"
+      echo "忽略后面附加的汇报格式。第一行只输出 \`STATUS: OK\` 或 \`STATUS: ALERT\`（发现错误、停滞、异常数值时用 ALERT），第二行用一句话（不超过 80 字）摘要进度。"
+      echo
+      echo "--- 命令输出（最后 200 行）---"
+      cat "$TAIL"
+    } > "$PROMPT"
+
+    "$AGENT_ROUTE" tier2 --no-claude --monitor --cwd "$CWD" --prompt-file "$PROMPT" >"$AR_OUT" 2>"$AR_ERR"
+    AR_RC=$?
+
+    ALERT=0; SUMMARY=""; MONITOR_ERROR=""
+    {
+      echo "===== $ts | iter $iter | cmd exit $CMD_RC | agent-route exit $AR_RC ====="
+      if [ "$AR_RC" -eq 0 ]; then
+        cat "$AR_OUT"
+        status_line=$(grep -n -E 'STATUS:[[:space:]]*(OK|ALERT)' "$AR_OUT" | head -n 1)
+        if [ -z "$status_line" ]; then
+          MONITOR_ERROR="无法解析模型输出"
+        else
+          lineno=${status_line%%:*}
+          status=$(printf '%s' "${status_line#*:}" | sed -E 's/.*STATUS:[[:space:]]*(OK|ALERT).*/\1/')
+          [ "$status" = "ALERT" ] && ALERT=1
+          SUMMARY=$(tail -n +"$((lineno + 1))" "$AR_OUT" | grep -v '^[[:space:]]*$' | head -n 1)
+          [ -z "$SUMMARY" ] && SUMMARY="(模型未给出摘要)"
+        fi
+      elif [ "$AR_RC" -eq 10 ]; then
+        SUMMARY="模型不可用，已记录原始输出"
+        echo "$SUMMARY"
+        echo "--- 命令输出（最后 50 行）---"
+        tail -n 50 "$RAW"
+        # nan 需要独立成词，避免 banana、finance 之类误报
+        if grep -Eiq 'Traceback|Error|Exception|FAILED|Killed|(^|[^[:alnum:]_])nan([^[:alnum:]_]|$)' "$TAIL"; then
+          ALERT=1; SUMMARY="模型不可用，已记录原始输出；关键词命中异常"
+        fi
+      else
+        MONITOR_ERROR="agent-route 异常退出（退出码 ${AR_RC}）"
+        cat "$AR_OUT"
+      fi
+      if [ -s "$AR_ERR" ]; then
+        echo "--- agent-route stderr ---"
+        cat "$AR_ERR"
+      fi
+      echo
+    } >> "$LOG"
+
+    if [ -n "$MONITOR_ERROR" ]; then
+      MONITOR_ERROR="MONITOR_ERROR [$NAME] $MONITOR_ERROR (log: $LOG)"
+      printf '%s\n' "$MONITOR_ERROR" >> "$LOG"
+      printf '%s\n' "$MONITOR_ERROR"
+      notify "$MONITOR_ERROR"
+    fi
+
+    if [ "$CMD_RC" -ne 0 ]; then
+      ALERT=1
+      SUMMARY="命令退出码 ${CMD_RC}${SUMMARY:+；$SUMMARY}"
+    fi
+
+    [ -n "$SUMMARY" ] && notify "$SUMMARY"
+    if [ "$ALERT" -eq 1 ]; then
+      echo "ALERT [$NAME] $(printf '%s' "$SUMMARY" | tr '\n' ' ') (log: $LOG)"
+    fi
+  fi
+
+  [ "$MAX_ITER" -gt 0 ] && [ "$iter" -ge "$MAX_ITER" ] && break
+  sleep $((INTERVAL * 60)) &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID"
+  SLEEP_PID=""
+done
