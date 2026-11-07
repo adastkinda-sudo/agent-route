@@ -13,6 +13,7 @@ import { createInterface } from 'node:readline';
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(process.env.AGENT_ROUTE_HOME || path.join(path.dirname(SCRIPT_PATH), '..'));
 const CONFIG_FILE = path.join(ROOT, 'config.json');
+const CONFIG_LOCAL_FILE = path.join(ROOT, 'config.local.json');
 const STATE_DIR = path.join(ROOT, 'state');
 const LOG_DIR = path.join(ROOT, 'logs');
 const COOLDOWN_FILE = path.join(STATE_DIR, 'cooldown.json');
@@ -54,6 +55,7 @@ const USAGE = `usage:
   (无 --prompt-file 时读 stdin)
   agent-route status
   agent-route clear-cooldown
+  agent-route setup
   agent-route selftest
   agent-route stats [--days N]
 
@@ -405,7 +407,7 @@ function claudeEnvironment(context, inherited = process.env, home = os.homedir()
 }
 
 function claudeSubscriptionAuth(config, context, env, home, cwd) {
-  const result = spawnSync(config.claudeBin ?? '/opt/homebrew/bin/claude', ['auth', 'status'],
+  const result = spawnSync(config.claudeBin ?? 'claude', ['auth', 'status'],
     { cwd, env: claudeEnvironment(context, env, home), encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 });
   if (result.error || result.status !== 0) return false;
   try {
@@ -488,9 +490,92 @@ function detectApiLimit(text, now = new Date(), fallbackMinutes = 60) {
     detected_at: now.toISOString(), source: 'api-text', reset_source: resetSource };
 }
 
-function readConfig() {
+function executable(file) {
+  if (typeof file !== 'string' || !file.startsWith('/')) return false;
+  try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); }
+  catch { return false; }
+}
+
+function probePrograms() {
+  const found = {};
+  const injected = process.env.AGENT_ROUTE_PROBE_JSON;
+  if (injected) {
+    try {
+      const data = JSON.parse(injected);
+      for (const name of ['claude', 'codex']) if (executable(data?.[name])) found[`${name}Bin`] = data[name];
+      return found;
+    } catch {}
+  }
+  const shell = spawnSync('/bin/zsh', ['-ilc', 'command -v claude; command -v codex'],
+    { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
+  for (const line of String(shell.stdout ?? '').split(/\r?\n/).map((item) => item.trim())) {
+    if (!line.startsWith('/') || !executable(line)) continue;
+    const name = path.basename(line);
+    if ((name === 'claude' || name === 'codex') && !found[`${name}Bin`]) found[`${name}Bin`] = line;
+  }
+  const dirs = ['/opt/homebrew/bin', '/usr/local/bin', path.join(os.homedir(), '.local', 'bin')];
+  const nvmRoot = path.join(os.homedir(), '.nvm', 'versions', 'node');
   try {
-    const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    const versions = fs.readdirSync(nvmRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const version of versions) dirs.push(path.join(nvmRoot, version, 'bin'));
+  } catch {}
+  for (const name of ['claude', 'codex']) {
+    if (found[`${name}Bin`]) continue;
+    for (const directory of dirs) {
+      const candidate = path.join(directory, name);
+      if (executable(candidate)) { found[`${name}Bin`] = candidate; break; }
+    }
+  }
+  return found;
+}
+
+function writeLocalConfig(data) {
+  fs.mkdirSync(ROOT, { recursive: true });
+  const temporary = `${CONFIG_LOCAL_FILE}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  fs.renameSync(temporary, CONFIG_LOCAL_FILE);
+}
+
+function refreshProgramConfig(config, program, force = true) {
+  const key = `${program}Bin`;
+  if (!force && typeof config[key] === 'string' && config[key].trim().length > 0) return true;
+  const local = (() => {
+    try {
+      const data = JSON.parse(fs.readFileSync(CONFIG_LOCAL_FILE, 'utf8'));
+      return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+    } catch { return {}; }
+  })();
+  const found = probePrograms();
+  if (force && found[key]) local[key] = found[key];
+  if (found[key] && (!Object.hasOwn(local, key) || !local[key])) local[key] = found[key];
+  if (force || !fs.existsSync(CONFIG_LOCAL_FILE) || !Object.hasOwn(local, key)) writeLocalConfig(local);
+  if (found[key]) config[key] = local[key] ?? found[key];
+  return typeof config[key] === 'string' && config[key].trim().length > 0;
+}
+
+function missingProgram(program) {
+  return `缺少可执行程序 ${program}；请在 config.local.json 手动填写 ${program}Bin`;
+}
+
+function readConfig({ forceProbe = false } = {}) {
+  try {
+    const base = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    const localExists = fs.existsSync(CONFIG_LOCAL_FILE);
+    let local = {};
+    if (localExists) {
+      local = JSON.parse(fs.readFileSync(CONFIG_LOCAL_FILE, 'utf8'));
+      if (!local || typeof local !== 'object' || Array.isArray(local)) throw new Error('config.local.json 必须是对象');
+    }
+    const config = { ...base, ...local };
+    const needsProbe = forceProbe || !localExists || ['claudeBin', 'codexBin'].some((key) => !Object.hasOwn(local, key));
+    if (needsProbe) {
+      const found = probePrograms();
+      const nextLocal = { ...local };
+      for (const key of ['claudeBin', 'codexBin']) if (forceProbe ? found[key] : !Object.hasOwn(nextLocal, key) && found[key]) nextLocal[key] = found[key];
+      if (forceProbe || !localExists || Object.keys(nextLocal).length !== Object.keys(local).length) writeLocalConfig(nextLocal);
+      Object.assign(config, nextLocal);
+    }
     if (config.claudeWeeklyThreshold !== undefined && (typeof config.claudeWeeklyThreshold !== 'number' ||
       !Number.isFinite(config.claudeWeeklyThreshold) || config.claudeWeeklyThreshold < 0 || config.claudeWeeklyThreshold > 100)) {
       throw new Error('claudeWeeklyThreshold 必须是 0–100 的数值');
@@ -947,6 +1032,7 @@ async function selftest() {
       XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp'), AGENT_ROUTE_HOME: home,
       GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CEILING_DIRECTORIES: tmpDir,
       AGENT_ROUTE_FORCE_CODEX_FAIL: '0',
+      AGENT_ROUTE_PROBE_JSON: JSON.stringify({ claude: config.claudeBin, codex: config.codexBin }),
       PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ''}` };
     fs.mkdirSync(env.TMPDIR, { recursive: true });
     fs.writeFileSync(path.join(home, 'selftest-isolation.json'), JSON.stringify({ home, codexHome: env.CODEX_HOME, root: tmpDir }));
@@ -1154,7 +1240,61 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     };
     const noRouteSecrets = (value) => check(!/SELFTEST_PRIVATE|SELFTEST_PROXY_KEY|https?:\/\/|upstream\.fixture/.test(value), '服务商解析泄露密钥、token 或 endpoint');
     const invocations = () => fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8').trim().split('\n').length;
+    const probeHome = path.join(tmpDir, 'probe-home');
+    const retryHome = path.join(tmpDir, 'retry-home');
+    const probeClaude = path.join(tmpDir, 'probe-claude');
+    const probeCodex = path.resolve(path.dirname(SCRIPT_PATH), '../test/codex-stub');
+    const probeConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    probeConfig.ccSwitch = { enabled: false };
+    for (const directory of [probeHome, retryHome]) fs.mkdirSync(directory);
+    for (const directory of [probeHome, retryHome]) fs.copyFileSync(path.join(ROOT, 'agents.json'), path.join(directory, 'agents.json'));
+    fs.writeFileSync(path.join(probeHome, 'config.json'), JSON.stringify(probeConfig, null, 2) + '\n');
+    fs.writeFileSync(path.join(retryHome, 'config.json'), JSON.stringify(probeConfig, null, 2) + '\n');
+    fs.writeFileSync(probeClaude, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const probeEnv = { ...env, AGENT_ROUTE_HOME: probeHome,
+      AGENT_ROUTE_PROBE_JSON: JSON.stringify({ claude: probeClaude, codex: probeCodex }) };
+    const probeRun = (args, options = {}) => spawnSync(process.execPath, [SCRIPT_PATH, ...args], {
+      env: options.env ?? probeEnv, cwd: options.cwd ?? probeHome, input: options.input,
+      encoding: 'utf8', timeout: options.timeout ?? 5000 });
     const scenarios = [
+      [0, '缺 config.local.json 时自动生成', () => {
+        fs.rmSync(path.join(probeHome, 'config.local.json'), { force: true });
+        const result = probeRun(['status']);
+        check(!result.error && result.status === 0, `setup probe 失败: ${result.stderr}`);
+        const local = JSON.parse(fs.readFileSync(path.join(probeHome, 'config.local.json'), 'utf8'));
+        check(local.claudeBin === probeClaude && local.codexBin === probeCodex, '缺少 local 配置时未生成两项路径');
+      }],
+      [0.1, 'local 覆盖 config.json 的值', () => {
+        const overrideClaude = path.join(tmpDir, 'override-claude');
+        const overrideCodex = path.join(tmpDir, 'override-codex');
+        fs.writeFileSync(overrideClaude, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        fs.writeFileSync(overrideCodex, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        fs.writeFileSync(path.join(probeHome, 'config.local.json'), JSON.stringify({ claudeBin: overrideClaude, codexBin: overrideCodex }) + '\n');
+        const result = probeRun(['status']);
+        check(!result.error && result.status === 0, `local override 失败: ${result.stderr}`);
+        const local = JSON.parse(fs.readFileSync(path.join(probeHome, 'config.local.json'), 'utf8'));
+        check(local.claudeBin === overrideClaude && local.codexBin === overrideCodex, 'local 未覆盖 config.json');
+      }],
+      [0.2, '两种方式都找不到时输出 ERROR', () => {
+        const missingEnv = { ...probeEnv, AGENT_ROUTE_HOME: probeHome,
+          AGENT_ROUTE_PROBE_JSON: JSON.stringify({ claude: path.join(tmpDir, 'missing-claude'), codex: path.join(tmpDir, 'missing-codex') }) };
+        fs.rmSync(path.join(probeHome, 'config.local.json'), { force: true });
+        const result = probeRun(['setup'], { env: missingEnv });
+        check(result.status === 12 && result.stdout.includes('ERROR') && result.stdout.includes('claude') && result.stdout.includes('codex'),
+          '探测失败时未输出 ERROR');
+      }],
+      [0.3, '路径失效时重新探测并更新', () => {
+        const stale = path.join(retryHome, 'missing-codex');
+        fs.writeFileSync(path.join(retryHome, 'config.local.json'), JSON.stringify({ claudeBin: probeClaude, codexBin: stale }) + '\n');
+        const retryEnv = { ...probeEnv, AGENT_ROUTE_HOME: retryHome };
+        const result = probeRun(['tier1', '--no-claude', '--cwd', repo], {
+          env: retryEnv, cwd: retryHome, input: 'AGENT_ROUTE_SELFTEST:complete\n任务字符计数 🧪\n', timeout: dispatchTimeout });
+        const retryLog = result.stdout.match(/^log: (.+)$/m)?.[1];
+        const retryDetail = retryLog && fs.existsSync(retryLog) ? fs.readFileSync(retryLog, 'utf8').slice(-500) : result.stderr;
+        check(!result.error && result.status === 0, `失效路径重试失败: ${result.stdout} ${retryDetail}`);
+        const local = JSON.parse(fs.readFileSync(path.join(retryHome, 'config.local.json'), 'utf8'));
+        check(local.codexBin === probeCodex, '失效路径重试后未更新 codexBin');
+      }],
       [1, '汇报完成', () => {
         complete = run('complete');
         exitIs(complete, 0);
@@ -2834,6 +2974,20 @@ if (cmd === 'stats') {
   stats(argv.slice(1));
   process.exit(0);
 }
+if (cmd === 'setup') {
+  const setupConfig = readConfig({ forceProbe: true });
+  const results = ['claude', 'codex'].map((program) => {
+    const value = setupConfig[`${program}Bin`];
+    return { program, value: executable(value) ? value : null };
+  });
+  for (const result of results) console.log(`${result.program}: ${result.value ?? 'missing'}`);
+  const missing = results.filter((result) => !result.value).map((result) => result.program);
+  if (missing.length) {
+    console.log(`ERROR\nreason: 缺少可执行程序 ${missing.join('、')}；请在 config.local.json 手动填写对应的 *Bin`);
+    process.exit(12);
+  }
+  process.exit(0);
+}
 
 if (cmd === 'status') {
   const config = readConfig();
@@ -3644,11 +3798,11 @@ function failCodex(reason) {
   return fallback(oneLine);
 }
 
-function runClaude(codexReason, resume = false) {
+function runClaude(codexReason, resume = false, spawnRetried = false) {
   executor = 'claude';
   if (dispatchContext.enabled && dispatchContext.claude.billingType === 'unknown') return stopUnknownRoute('claude');
   const { model: claudeModel, effort: claudeEffort } = resolveClaudeModel(tier, dispatchContext.claude, config, { write, monitor });
-  const claudeBin = config.claudeBin ?? '/opt/homebrew/bin/claude';
+  const claudeBin = config.claudeBin ?? 'claude';
   const args = ['-p', `执行 ${fullPromptPath}`, '--agents', path.join(ROOT, 'agents.json'), '--agent', tier,
     '--model', claudeModel, '--effort', claudeEffort, '--output-format', 'json',
     '--permission-mode', config.claudePermissionMode ?? 'auto'];
@@ -3671,6 +3825,8 @@ log: ${logPath}
     recordFinish('error', 12, output, codexTokens, claudeModel, claudeEffort);
     process.stdout.write(output, () => process.exit(12));
   };
+
+  if (!refreshProgramConfig(config, 'claude', false)) return failClaude(missingProgram('claude'));
 
   const quota = claudeQuota(config, dispatchContext.claude, true);
   if (quota.snapshot) log(`claude weekly: ${JSON.stringify(quota.snapshot)}`);
@@ -3708,7 +3864,12 @@ log: ${logPath}
     return true;
   };
   child.on('error', (e) => {
-    if (finish()) failClaude(`spawn 失败: ${e.message}`);
+    if (finish()) {
+      if (!spawnRetried && ['ENOENT', 'EACCES'].includes(e.code) && refreshProgramConfig(config, 'claude', true)) {
+        return runClaude(codexReason, resume, true);
+      }
+      failClaude(`spawn 失败: ${e.message}`);
+    }
   });
   child.on('close', (code, signal) => {
     if (!finish()) return;
@@ -3766,7 +3927,7 @@ else {
 }
 
 // Codex：codex exec 以本机环境运行（不用沙箱），只读靠 prompt 约束
-function runCodex() {
+function runCodex(spawnRetried = false) {
   executor = 'codex';
   if (dispatchContext.enabled && dispatchContext.codex.billingType === 'unknown') return stopUnknownRoute('codex');
   if (process.env.AGENT_ROUTE_FORCE_CODEX_FAIL === '1') return failCodex('forced failure (AGENT_ROUTE_FORCE_CODEX_FAIL=1)');
@@ -3774,6 +3935,7 @@ function runCodex() {
   const lastMessage = path.join(tmpDir, 'last-message.md');
   const cleanup = () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} };
 
+  if (!refreshProgramConfig(config, 'codex', false)) return failCodex(missingProgram('codex'));
   const codexBin = config.codexBin ?? 'codex';
   const args = ['exec', ...(codexResume ? ['resume', session, '-'] : []),
     '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
@@ -3825,7 +3987,12 @@ function runCodex() {
   };
 
   child.on('error', (e) => {
-    if (finish()) failCodex(`spawn 失败: ${e.message}`);
+    if (finish()) {
+      if (!spawnRetried && ['ENOENT', 'EACCES'].includes(e.code) && refreshProgramConfig(config, 'codex', true)) {
+        return runCodex(true);
+      }
+      failCodex(`spawn 失败: ${e.message}`);
+    }
   });
   child.on('close', async (code, signal) => {
     if (!finish()) return;

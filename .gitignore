@@ -2,3 +2,4 @@ logs/
 state/
 backup/
 .DS_Store
+config.local.json
