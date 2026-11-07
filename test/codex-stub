@@ -143,10 +143,35 @@ if (!['complete', 'partial', 'unknown', 'tracked-write', 'ignored-write', 'pycac
   'conclusions', 'missing-conclusion', 'empty-conclusion', 'limit', 'limit-notime',
   'limit-session', 'limit-weekly', 'limit-reached', 'limit-partial', 'limit-both', 'limit-both-zero', 'limit-both-api',
   'complete-snapshot', 'metadata-healthy-error', 'premium-only', 'api-complete-snapshot', 'api-429-snapshot',
-  'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both'].includes(scenario) && !failFirst) {
+  'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both',
+  'stream-events', 'stream-many', 'stall-events', 'stall-high', 'stall-missing'].includes(scenario) && !failFirst) {
   die(`未知场景: ${scenario ?? '(无)'}`);
 }
 const currentSession = session ?? randomUUID();
+if (!claude && scenario === 'stream-events') {
+  fs.writeSync(1, JSON.stringify({ type: 'error', message: 'Reconnecting 1/5' }) + '\n');
+  fs.writeSync(2, 'stream disconnected; Retry 1/5\nAT CAPACITY; retry later\nat capacity\nReConnec');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  fs.writeSync(2, 'ting 2/5');
+}
+if (!claude && scenario === 'stream-many') {
+  for (let i = 0; i < 25; i++) fs.writeSync(2, `Reconnecting ${i + 1}/25\n`);
+}
+if (!claude && scenario.startsWith('stall-')) {
+  const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const time = Date.now() + 50;
+  const event = (seconds, total, last) => ({ timestamp: new Date(time + seconds * 1000).toISOString(),
+    type: 'event_msg', payload: { type: 'token_count', info: total === null ? null : {
+      total_token_usage: { output_tokens: total }, last_token_usage: { output_tokens: last } } } });
+  const records = [event(-86400, 0, 0), event(-86300, 10, 10), event(0, 1000, 990),
+    event(60, scenario === 'stall-high' ? 1500 : 1499, 499),
+    event(119, 1500, 1), event(209, 1500, 499), event(269, 2000, 0),
+    { timestamp: new Date(time + 329000).toISOString(), type: 'response_item', payload: { content: 'SELFTEST_PRIVATE_DIALOGUE' } },
+    event(330, 2001, 1)];
+  if (scenario === 'stall-missing') for (const record of records) if (record.payload.type === 'token_count') record.payload.info = null;
+  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), records.map(JSON.stringify).join('\n') + '\n{"unfinished":');
+}
 // codex-fail-N：前 N 次 Codex 调用失败（续跑、重试和新线程都计数），之后及 Claude 调用成功。
 if (!claude && failFirst) {
   const counter = path.join(stateDir, `${scenario}.count`);

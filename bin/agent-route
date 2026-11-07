@@ -83,6 +83,8 @@ Codex 订阅账号受限时自动交给 Claude；每 5 分钟查询额度，接�
 --claude 跳过 Codex 和冷却，直接交给 Claude 执行（Codex 不可用时由主 agent 显式选择）；不能与 --resume、--no-claude、--monitor 同用。
 --monitor 时 Codex 的 effort 改用 config 的 monitorEffort（monitor-loop 使用），不解析汇报状态。
 --effort 覆盖本次 Codex 的 effort（${'none|minimal|low|medium|high|xhigh'}），不影响 Claude fallback。
+config 的 codexStreamIdleTimeoutMs 设置 Codex 流空闲超时（毫秒，默认 120000；0 或未设置时不覆盖）。
+provider 取 $CODEX_HOME/config.toml 顶层 model_provider，默认 openai；内置 provider 不覆盖并记入日志，不修改 Codex 配置文件。
 --resume 接受日志 id 或 session UUID；日志 id 沿用原 cwd、要求 tier 一致；UUID 必须同时指定 --cwd。
 续跑按本次 --write 执行，跟随原执行方并绕过模型失败冷却；Codex 账号受限时携带原任务和新增要求交给 Claude 新开执行。
 续跑时 Codex 执行失败：先用同一 session 再续跑 1 次；仍失败则放弃续跑，携带原任务和新增要求开新 Codex 线程，最多 2 次；
@@ -91,6 +93,8 @@ Codex 订阅账号受限时自动交给 Claude；每 5 分钟查询额度，接�
 只读模式在执行前后对比 --cwd 的 git 状态，并列出执行期间新写入或修改的文件（含 git 忽略的路径）；
 有变化时在 footer 输出 WARNING。--exclude（相对 --cwd，可多次）和 config 的 readOnlyExclude 跳过并发写入的目录。
 config 的 logMode 为 "summary" 时，汇报"完成"且没有 WARNING 的派发只保留摘要日志。
+Codex 的 Reconnecting、stream disconnected、retry 行计入 reconnect，at capacity 行计入 capacity；摘要日志最多保留 20 行。
+footer 和 history 记录 reconnect、capacity 及 rollout 停顿；相邻事件间隔 ≥60 秒且该步输出 token <500 计入 stall N/Xs，仅统计本次执行。
 汇报完成、verify 全部 PASS（或未指定）、没有 WARNING 且偏差和遗留问题均为"无"或未列出时，stdout 折叠为一行摘要并保留只读结论；只读缺少结论时保留完整汇报并告警。--full-output 保留完整汇报，日志始终保留完整汇报，--monitor 不受影响。
 --verify 可多次：汇报完成后在 --cwd 下依次用 /bin/zsh -lc 验证，每条超时 10 分钟；只读核对在验证之前完成。
 --fix-rounds 为非负整数，默认 1，仅有 --verify 时生效；验证失败后同线程返工，0 禁用，只读模式不返工。
@@ -288,8 +292,9 @@ function limitActive(state) {
   return Boolean(state?.type && (!state.resets_at || state.resets_at * 1000 > Date.now()));
 }
 
-async function sessionLimits(id) {
-  if (!SESSION_ID.test(id ?? '')) return null;
+async function sessionTelemetry(id, since, includeLimits) {
+  const result = { snapshot: null, stall: 0, stall_seconds: 0 };
+  if (!SESSION_ID.test(id ?? '')) return result;
   const files = (directory) => {
     const found = [];
     let entries;
@@ -301,24 +306,46 @@ async function sessionLimits(id) {
     }
     return found;
   };
-  let latest = null;
   for (const file of files(path.join(CODEX_HOME, 'sessions')).sort()) {
     const stream = fs.createReadStream(file, { encoding: 'utf8' });
     const lines = createInterface({ input: stream, crlfDelay: Infinity });
+    let previousTime = null;
+    let previousOutput = null;
+    let gaps = [];
     try {
       for await (const line of lines) {
-        // 不解析或保留对话记录，仅从含 rate_limits 的元数据行提取快照。
-        if (!line.includes('"rate_limits"')) continue;
+        // 对话内容不进入日志或 history；API 路由仅提取时间和 token 元数据，不读取订阅额度。
         try {
           const record = JSON.parse(line);
-          const snapshot = normalizeLimits(record.payload?.rate_limits ?? record.rate_limits);
-          if (snapshot) latest = snapshot;
+          if (includeLimits && line.includes('"rate_limits"')) {
+            const snapshot = normalizeLimits(record.payload?.rate_limits ?? record.rate_limits);
+            if (snapshot) result.snapshot = snapshot;
+          }
+          const time = Date.parse(record.timestamp);
+          if (Number.isFinite(time)) {
+            if (previousTime !== null && previousTime >= since && time - previousTime >= 60_000) {
+              gaps.push((time - previousTime) / 1000);
+            }
+            previousTime = time;
+          }
+          if (record.type !== 'event_msg' || record.payload?.type !== 'token_count') continue;
+          const info = record.payload.info;
+          const total = numeric(info?.total_token_usage?.output_tokens);
+          const output = total !== null && previousOutput !== null && total >= previousOutput
+            ? total - previousOutput : numeric(info?.last_token_usage?.output_tokens);
+          if (output !== null && output < 500) {
+            result.stall += gaps.length;
+            result.stall_seconds += gaps.reduce((sum, seconds) => sum + seconds, 0);
+          }
+          gaps = [];
+          previousOutput = total;
         } catch { /* 未写完的尾行留给文字解析退路 */ }
       }
     } catch { /* 会话文件不可读时使用文字解析 */ }
     finally { lines.close(); stream.destroy(); }
   }
-  return latest;
+  result.stall_seconds = Math.round(result.stall_seconds);
+  return result;
 }
 
 function queryRateLimits(config) {
@@ -605,6 +632,10 @@ function readConfig({ forceProbe = false } = {}) {
     if (config.claudeWeeklyThreshold !== undefined && (typeof config.claudeWeeklyThreshold !== 'number' ||
       !Number.isFinite(config.claudeWeeklyThreshold) || config.claudeWeeklyThreshold < 0 || config.claudeWeeklyThreshold > 100)) {
       throw new Error('claudeWeeklyThreshold 必须是 0–100 的数值');
+    }
+    if (config.codexStreamIdleTimeoutMs !== undefined &&
+      (!Number.isSafeInteger(config.codexStreamIdleTimeoutMs) || config.codexStreamIdleTimeoutMs < 0)) {
+      throw new Error('codexStreamIdleTimeoutMs 必须是非负整数');
     }
     return config;
   } catch (e) {
@@ -960,7 +991,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -978,6 +1009,8 @@ function backfillHistory(history) {
       fallback: bool(values.fallback) ?? (field('fallback') !== null || lines.at(-1)?.startsWith('fallback: ') ? true : null),
       status, exit_code: numeric(values.exit_code), elapsed: numeric(values.elapsed?.replace(/s$/, '')),
       tokens: numeric(values.tokens), session: session === '?' ? null : session,
+      reconnect: numeric(values.reconnect), capacity: numeric(values.capacity),
+      stall: numeric(values.stall), stall_seconds: numeric(values.stall_seconds),
       log_id: id, cwd, prompt_chars: numeric(field('prompt_chars')),
       stdout_chars: numeric(values.stdout_chars), resumed_from: field('resumed'), attempt: field('attempt'),
       verify: verifyText ? JSON.parse(verifyText) : null,
@@ -1304,6 +1337,10 @@ function beginRound() {
   startedAt = Date.now();
   verifyResult = null;
   codexTokens = null;
+  reconnectCount = 0;
+  capacityCount = 0;
+  reconnectLines = [];
+  codexStall = { count: 0, seconds: 0 };
   progressRecord = null;
   // 监控总结只要两行，不需要报告文件和执行规则
   const modeLine = write
@@ -1327,6 +1364,42 @@ function beginRound() {
   if (providerChange) log(`provider-change: ${JSON.stringify(providerChange)}`);
   if (resumeArg !== null) log(`resumed: ${resumeArg}`);
   if (attemptPhase !== null) log(`attempt: ${attemptPhase}`);
+}
+
+let reconnectCount = 0;
+let capacityCount = 0;
+let reconnectLines = [];
+let codexStall = { count: 0, seconds: 0 };
+
+function observeCodexOutput(chunk) {
+  for (const line of String(chunk).split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+    const reconnect = /reconnecting|stream disconnected|retry/i.test(line);
+    const capacity = /at capacity/i.test(line);
+    if (reconnect) reconnectCount++;
+    if (capacity) capacityCount++;
+    if ((reconnect || capacity) && reconnectLines.length < 20) reconnectLines.push(line);
+  }
+}
+
+function readCodexProviderId() {
+  try {
+    const parsed = parseRouteToml(fs.readFileSync(path.join(CODEX_HOME, 'config.toml'), 'utf8'));
+    return typeof parsed.model_provider === 'string' ? parsed.model_provider : 'openai';
+  } catch { return 'openai'; }
+}
+
+function codexStreamIdleArgs() {
+  const value = config.codexStreamIdleTimeoutMs;
+  if (!Number.isSafeInteger(value) || value <= 0) return [];
+  const provider = readCodexProviderId();
+  if (['openai', 'ollama', 'lmstudio'].includes(provider)) {
+    log(`codex stream idle timeout: provider ${provider} is built-in; not overridden`);
+    return [];
+  }
+  // Codex 按点拆分 CLI 配置键；特殊 id 改用内联表，保留原 provider 的其他配置。
+  return ['-c', /^[A-Za-z0-9_-]+$/.test(provider)
+    ? `model_providers.${provider}.stream_idle_timeout_ms=${value}`
+    : `model_providers={${JSON.stringify(provider)}={stream_idle_timeout_ms=${value}}}`];
 }
 beginRound();
 
@@ -1512,7 +1585,7 @@ function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -1524,7 +1597,8 @@ function compactLog(text) {
     commands.push(`- ${first}${extra} →${(lines[j] ?? ' (无结果)').replace(/:$/, '')}`);
     i = j;
   }
-  const out = [...header, `log-mode: summary（完整过程日志已删除）`, `commands: ${commands.length}`, ...commands,
+  const out = [...header, `log-mode: summary（完整过程日志已删除）`,
+    ...reconnectLines.map((line) => `codex stream: ${line}`), `commands: ${commands.length}`, ...commands,
     '--- 最终汇报 ---', text.replace(/\s+$/, '')];
   try { fs.writeFileSync(logPath, out.join('\n') + '\n'); } catch {}
 }
@@ -1631,6 +1705,7 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
   const record = {
     time: new Date(startedAt).toISOString(), tier, model: actualModel, effort: actualEffort,
     monitor, write, fallback: usedFallback, status, exit_code: code, elapsed, tokens: numeric(tokens), session,
+    reconnect: reconnectCount, capacity: capacityCount, stall: codexStall.count, stall_seconds: codexStall.seconds,
     log_id: path.basename(base), cwd, prompt_chars: charCount(promptText), stdout_chars: charCount(output), resumed_from: resumeArg,
     verify: verifyResult,
     commit: commitHash,
@@ -1640,7 +1715,7 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
     ...(dispatchContext.enabled ? { providers: { codex: safeRouteContext(dispatchContext.codex), claude: safeRouteContext(dispatchContext.claude) } } : {}),
   };
   if (verifyResult) log(`verify result: ${JSON.stringify(verifyResult)}`);
-  log(`finish: status=${status} tokens=${tokens ?? '?'} elapsed=${elapsed} session=${session ?? '?'} exit_code=${code} stdout_chars=${record.stdout_chars} model=${actualModel} effort=${actualEffort ?? '?'} fallback=${usedFallback} executor=${executor}${commitHash ? ` commit=${commitHash}` : ''}`);
+  log(`finish: status=${status} tokens=${tokens ?? '?'} elapsed=${elapsed} session=${session ?? '?'} exit_code=${code} stdout_chars=${record.stdout_chars} model=${actualModel} effort=${actualEffort ?? '?'} fallback=${usedFallback} executor=${executor} reconnect=${reconnectCount} capacity=${capacityCount} stall=${codexStall.count} stall_seconds=${codexStall.seconds}${commitHash ? ` commit=${commitHash}` : ''}`);
   appendHistory(record);
   progressRecord = { record, text: output };
 }
@@ -1661,6 +1736,8 @@ async function finishReport(text, tokens, actualModel = model, actualEffort = ef
   const count = numeric(tokens);
   const parts = [`route: ${tier} ${actualModel} ${actualEffort}`, `${elapsed}s`,
     `${count === null ? '?' : `${Math.round(count / 1000)}k`} tok`, status ?? 'n/a', `id ${path.basename(base)}`];
+  if (reconnectCount || capacityCount) parts.push(`reconnect ${reconnectCount}`, `capacity ${capacityCount}`);
+  if (codexStall.count) parts.push(`stall ${codexStall.count}/${codexStall.seconds}s`);
   if (codexLimitReason && executor === 'claude') parts[0] += `（${codexLimitReason}）`;
   try { if (fs.statSync(reportPath).size > 0) parts.push('report'); } catch {}
   if (resumeArg !== null) parts.push(`resumed ${resumeArg}`);
@@ -2032,10 +2109,12 @@ function runCodex(spawnRetried = false) {
     '-m', model, '-c', `model_reasoning_effort="${effort}"`,
     // 只对派发生效：没有 AGENTS.md 的目录读取 CLAUDE.md，不改 ~/.codex/config.toml
     '-c', 'project_doc_fallback_filenames=["CLAUDE.md"]',
+    ...codexStreamIdleArgs(),
     ...(codexResume ? [] : ['-C', cwd]), '-o', lastMessage, ...(codexResume ? [] : ['-'])];
   log(`exec: ${codexBin} ${args.join(' ')}`);
 
   let child;
+  const codexStartedAt = Date.now();
   try {
     child = spawn(codexBin, args, { cwd, env: { ...process.env, CODEX_HOME, AGENT_ROUTE_DEPTH: '1' }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
   } catch (e) { cleanup(); return failCodex(`spawn 失败: ${e.message}`); }
@@ -2056,8 +2135,13 @@ function runCodex(spawnRetried = false) {
       sessionTail = buffered.slice(-512);
     }
   };
-  child.stdout.on('data', onOutput);
-  child.stderr.on('data', onOutput);
+  const outputLines = [child.stdout, child.stderr].map((stream) => {
+    stream.setEncoding('utf8');
+    stream.on('data', onOutput);
+    const lines = createInterface({ input: stream, crlfDelay: Infinity });
+    lines.on('line', observeCodexOutput);
+    return lines;
+  });
   const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
   const timer = setTimeout(() => {
     timedOut = true;
@@ -2070,6 +2154,7 @@ function runCodex(spawnRetried = false) {
     if (finished) return false;
     finished = true;
     clearTimeout(timer);
+    for (const lines of outputLines) lines.close();
     try { stdout = fs.readFileSync(lastMessage, 'utf8'); } catch {}
     cleanup();
     for (const s of ['SIGINT', 'SIGTERM']) process.removeListener(s, onSignal);
@@ -2088,6 +2173,8 @@ function runCodex(spawnRetried = false) {
     if (!finish()) return;
     log(`exit: code=${code} signal=${signal ?? 'none'} timedOut=${timedOut}`);
     codexTokens = [...tail.matchAll(/tokens used\s+([\d,]+)/g)].pop()?.[1] ?? null;
+    const telemetry = await sessionTelemetry(session, codexStartedAt, dispatchContext.codex?.billingType !== 'api');
+    codexStall = { count: telemetry.stall, seconds: telemetry.stall_seconds };
     if (timedOut) return failCodex(`超时（>${config.codexTimeoutMinutes ?? 90} 分钟）`);
     if (dispatchContext.codex?.billingType === 'api') {
       if (code !== 0) {
@@ -2104,7 +2191,7 @@ function runCodex(spawnRetried = false) {
       log(`stdout bytes: ${stdout.length}`);
       return finishReport(stdout, codexTokens);
     }
-    const snapshot = await sessionLimits(session);
+    const snapshot = telemetry.snapshot;
     let state = snapshot ? snapshotState(snapshot, 'session', readCodexLimit()) : null;
     if (state?.type && !state.resets_at) state.resets_at = (Date.now() + (config.limitCooldownMinutes ?? 60) * 60_000) / 1000;
     if (state) writeCodexLimit(state);

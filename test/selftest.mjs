@@ -1589,7 +1589,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(keys.length === 2 && keys.every((key) => key.startsWith('codex:')), '失败冷却未按 app/provider/model 隔离');
         noRouteSecrets(fs.readFileSync(cooldownPath, 'utf8'));
       })],
-      [72, 'CC Switch 用例 8：API 成功/异常 session 快照不查询、扫描或改写订阅状态', () => withRoutedFixture(async () => {
+      [72, 'CC Switch 用例 8：API session 仅统计停顿，不查询或改写订阅状态', () => withRoutedFixture(async () => {
         seedLimit({ query_available: true });
         const before = fs.readFileSync(limitPath, 'utf8');
         const calls = appCalls().length;
@@ -1601,8 +1601,9 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         for (const [scenario, code] of [['complete', 0], ['api-complete-snapshot', 0], ['api-429-snapshot', 15]]) {
           const result = run(scenario, [], false, { preserveCooldown: true, nodeArgs: ['--import', guard] });
           exitIs(result, code);
-          check(fs.readFileSync(limitPath, 'utf8') === before && appCalls().length === calls && !fs.existsSync(scanMarker),
-            `${scenario} 读取/改写了订阅额度或扫描了 session 快照`);
+          check(fs.readFileSync(limitPath, 'utf8') === before && appCalls().length === calls && fs.existsSync(scanMarker) &&
+            result.record.stall === 0 && result.record.stall_seconds === 0,
+            `${scenario} 读取/改写了订阅额度或停顿统计不符`);
         }
         check(Object.values(providerStates()).every((state) => !state || !Object.hasOwn(state, 'query_available') && !Object.hasOwn(state, 'snapshot')),
           'API 状态含订阅 query_available/snapshot');
@@ -2034,6 +2035,135 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
             : call.agentRouteDepth === '1', `${claude ? 'Claude' : 'Codex'} 执行方环境缺少 AGENT_ROUTE_DEPTH=1`);
         }
       }],
+    );
+    const withCodexFixture = async (test) => {
+      const configPath = path.join(home, 'config.json');
+      const tomlPath = path.join(env.CODEX_HOME, 'config.toml');
+      const originalConfig = fs.readFileSync(configPath, 'utf8');
+      const originalToml = fs.existsSync(tomlPath) ? fs.readFileSync(tomlPath, 'utf8') : null;
+      const settings = { ...config, codexStreamIdleTimeoutMs: 120000 };
+      const writeConfig = () => fs.writeFileSync(configPath, JSON.stringify(settings));
+      writeConfig();
+      fs.writeFileSync(tomlPath, 'model_provider = "fixture"\n[model_providers.fixture]\nname = "Fixture"\n');
+      try { await test({ settings, writeConfig, tomlPath }); }
+      finally {
+        fs.writeFileSync(configPath, originalConfig);
+        if (originalToml === null) fs.rmSync(tomlPath, { force: true });
+        else fs.writeFileSync(tomlPath, originalToml);
+      }
+    };
+    const idleArgs = (call) => call.args.filter((arg) => arg.includes('stream_idle_timeout_ms'));
+    scenarios.push(
+      [86, 'Codex 流超时：顶层 provider、续跑、重试、monitor 与带点 id', () => withCodexFixture(async ({ tomlPath }) => {
+        const toml = "model_provider = 'fixture' # active provider\n[profiles.other]\nmodel_provider = 'inactive'\n";
+        fs.writeFileSync(tomlPath, toml);
+        const calls = invocationRows().length;
+        const first = run('complete');
+        exitIs(first, 0);
+        exitIs(run('complete', ['--resume', first.record.log_id]), 0);
+        exitIs(run('monitor', ['--monitor']), 0);
+        resetFailCount('codex-fail-1');
+        exitIs(run('codex-fail-1', ['--resume', first.record.log_id], false, { rounds: 2 }), 0);
+        const launched = invocationRows().slice(calls).filter((row) => row.command === 'exec');
+        check(launched.length === 5 && launched.every((call) => idleArgs(call).join() ===
+          'model_providers.fixture.stream_idle_timeout_ms=120000'), '普通/续跑/重试/monitor 未传入正确超时');
+        check(fs.readFileSync(tomlPath, 'utf8') === toml, '派发修改了 Codex 配置');
+        fs.writeFileSync(tomlPath, routeToml());
+        exitIs(run('complete'), 0);
+        check(idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000}}',
+          '带点 provider id 未作为单独 TOML 键传入');
+      })],
+      [87, 'Codex 流超时：默认与内置 provider 不覆盖，禁用与数值校验', () => withCodexFixture(async ({ settings, writeConfig, tomlPath }) => {
+        for (const provider of [null, 'openai', 'ollama', 'lmstudio']) {
+          if (provider === null) fs.writeFileSync(tomlPath, '[profiles.other]\nmodel_provider = "inactive"\n');
+          else fs.writeFileSync(tomlPath, `model_provider = "${provider}"\n`);
+          const result = run('complete');
+          exitIs(result, 0);
+          check(idleArgs(invocationRows().at(-1)).length === 0 && result.log.includes(`provider ${provider ?? 'openai'} is built-in`),
+            '内置 provider 被覆盖或摘要日志未保留说明');
+        }
+        fs.rmSync(tomlPath);
+        exitIs(run('complete'), 0);
+        check(idleArgs(invocationRows().at(-1)).length === 0, '缺配置时未默认 openai');
+        fs.writeFileSync(tomlPath, 'model_provider = "fixture"\n');
+        for (const value of [0, undefined, 75000]) {
+          if (value === undefined) delete settings.codexStreamIdleTimeoutMs;
+          else settings.codexStreamIdleTimeoutMs = value;
+          writeConfig();
+          exitIs(run('complete'), 0);
+          check(idleArgs(invocationRows().at(-1)).join() === (value ? `model_providers.fixture.stream_idle_timeout_ms=${value}` : ''),
+            '零、未设置或自定义超时未按配置生效');
+        }
+        const before = invocationRows().length;
+        for (const value of [-1, 1.5, '120000']) {
+          settings.codexStreamIdleTimeoutMs = value;
+          writeConfig();
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--cwd', repo, '--no-claude'],
+            { env, input: 'AGENT_ROUTE_SELFTEST:complete\n', encoding: 'utf8', timeout: 5000 });
+          exitIs(result, 2);
+          check(result.stderr.includes('codexStreamIdleTimeoutMs 必须是非负整数'), '非法超时未给出配置诊断');
+        }
+        check(invocationRows().length === before, '非法超时仍调用了执行方');
+      })],
+      [88, 'Codex 重连：stdout/stderr、大小写、分块与同一行只计一次', () => withCodexFixture(async () => {
+        const result = run('stream-events');
+        exitIs(result, 0);
+        check(result.footer.includes('reconnect 4 | capacity 2') && result.record.reconnect === 4 && result.record.capacity === 2,
+          '重连或 capacity 的 footer/history 计数不符');
+        check(result.log.includes('log-mode: summary') && result.log.includes('Reconnecting 1/5') &&
+          result.log.includes('stream disconnected; Retry 1/5') && result.log.includes('ReConnecting 2/5') &&
+          result.log.split('\n').filter((line) => line.startsWith('codex stream: ')).length === 5,
+          '摘要日志未保留 stdout/stderr 重连行');
+        const clean = run('complete');
+        exitIs(clean, 0);
+        check(clean.record.reconnect === 0 && clean.record.capacity === 0 && !/reconnect|capacity|stall/.test(clean.footer),
+          '零计数未隐藏或泄漏到下次派发');
+      })],
+      [89, 'Codex 重连：摘要日志最多 20 行，history 保留完整计数', () => withCodexFixture(async () => {
+        const result = run('stream-many');
+        exitIs(result, 0);
+        check(result.record.reconnect === 25 && result.record.capacity === 0 && result.footer.includes('reconnect 25 | capacity 0'),
+          '20 行摘要上限截断了实际计数');
+        check(result.log.split('\n').filter((line) => line.startsWith('codex stream: ')).length === 20,
+          '摘要重连行数量不是 20');
+      })],
+      [90, 'Codex 停顿：60 秒/500 token 边界、累计差值、续跑与缺失元数据', () => withCodexFixture(async () => {
+        const first = run('stall-events');
+        exitIs(first, 0);
+        check(first.record.stall === 3 && first.record.stall_seconds === 210 && first.footer.includes('stall 3/210s'),
+          '停顿边界、累计 token 差值或历史事件过滤不符');
+        const resumed = run('stall-events', ['--resume', first.record.log_id]);
+        exitIs(resumed, 0);
+        check(resumed.record.stall === 3 && resumed.record.stall_seconds === 210, '续跑重复统计了旧停顿');
+        const high = run('stall-high');
+        exitIs(high, 0);
+        check(high.record.stall === 2 && high.record.stall_seconds === 150, '500 token 的步骤被误算为停顿');
+        const missing = run('stall-missing');
+        exitIs(missing, 0);
+        check(missing.record.stall === 0 && missing.record.stall_seconds === 0 && !missing.footer.includes('stall'),
+          '缺少输出 token 元数据时推测了停顿');
+        for (const result of [first, resumed, high, missing]) check(!result.log.includes('SELFTEST_PRIVATE_DIALOGUE'), '停顿统计泄露对话');
+      })],
+      [91, 'Codex API 停顿与摘要 history 回填保留诊断字段', () => withRoutedFixture(async () => {
+        const before = appCalls().length;
+        const result = run('stall-events');
+        exitIs(result, 0);
+        check(result.record.stall === 3 && result.record.stall_seconds === 210 && appCalls().length === before &&
+          idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000}}',
+          'API 路由未统计停顿或调用了订阅额度接口');
+        const stream = run('stream-events');
+        exitIs(stream, 0);
+        const saved = [result.record, stream.record];
+        fs.writeFileSync(historyPath, history().filter((row) => !saved.some((old) => old.log_id === row.log_id))
+          .map((row) => JSON.stringify(row)).join('\n') + '\n');
+        const stats = spawnSync(process.execPath, [SCRIPT_PATH, 'stats'], { env, encoding: 'utf8', timeout: 5000 });
+        exitIs(stats, 0);
+        for (const old of saved) {
+          const restored = history().find((row) => row.log_id === old.log_id);
+          check(restored && ['reconnect', 'capacity', 'stall', 'stall_seconds'].every((key) => restored[key] === old[key]),
+            '摘要回填丢失重连/停顿字段');
+        }
+      })],
     );
     for (const [id, name, test] of scenarios) {
       try {
