@@ -144,7 +144,7 @@ if (!['complete', 'partial', 'unknown', 'tracked-write', 'ignored-write', 'pycac
   'limit-session', 'limit-weekly', 'limit-reached', 'limit-partial', 'limit-both', 'limit-both-zero', 'limit-both-api',
   'complete-snapshot', 'metadata-healthy-error', 'premium-only', 'api-complete-snapshot', 'api-429-snapshot',
   'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both',
-  'stream-events', 'stream-many', 'stall-events', 'stall-high', 'stall-missing'].includes(scenario) && !failFirst) {
+  'stream-events', 'stream-many', 'false-diagnostics', 'structured-capacity', 'stall-events', 'stall-high', 'stall-missing'].includes(scenario) && !failFirst) {
   die(`未知场景: ${scenario ?? '(无)'}`);
 }
 const currentSession = session ?? randomUUID();
@@ -156,6 +156,24 @@ if (!claude && scenario === 'stream-events') {
 }
 if (!claude && scenario === 'stream-many') {
   for (let i = 0; i < 25; i++) fs.writeSync(2, `Reconnecting ${i + 1}/25\n`);
+}
+if (!claude && scenario === 'false-diagnostics') {
+  fs.writeSync(1, 'tool output: Selected model is at capacity. Please try a different model.\n');
+  fs.writeSync(1, 'read README: Reconnecting 1/5\n');
+  process.exit(1);
+}
+if (!claude && scenario === 'structured-capacity') {
+  const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const timestamp = new Date().toISOString();
+  const records = [
+    { timestamp, type: 'event_msg', payload: { type: 'error', message: 'Selected model is at capacity. Please try a different model.' } },
+    { timestamp, type: 'event_msg', payload: { type: 'stream_error', error: { message: 'Reconnecting 1/5' } } },
+    { timestamp, type: 'event_msg', payload: { type: 'task_complete', error: { message: 'stream disconnected' } } },
+  ];
+  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), records.map(JSON.stringify).join('\n') + '\n');
+  fs.writeSync(2, `session id: ${currentSession}\n`);
+  process.exit(1);
 }
 if (!claude && scenario.startsWith('stall-')) {
   const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');

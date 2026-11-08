@@ -292,8 +292,18 @@ function limitActive(state) {
   return Boolean(state?.type && (!state.resets_at || state.resets_at * 1000 > Date.now()));
 }
 
+function structuredErrorText(value, seen = new Set()) {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (!value || typeof value !== 'object' || seen.has(value)) return '';
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => structuredErrorText(item, seen)).filter(Boolean).join('\n');
+  return ['message', 'detail', 'reason', 'code', 'status', 'status_code', 'statusCode', 'error']
+    .map((key) => structuredErrorText(value[key], seen)).filter(Boolean).join(': ');
+}
+
 async function sessionTelemetry(id, since, includeLimits) {
-  const result = { snapshot: null, stall: 0, stall_seconds: 0 };
+  const result = { snapshot: null, stall: 0, stall_seconds: 0, structuredErrors: [] };
   if (!SESSION_ID.test(id ?? '')) return result;
   const files = (directory) => {
     const found = [];
@@ -317,6 +327,13 @@ async function sessionTelemetry(id, since, includeLimits) {
         // 对话内容不进入日志或 history；API 路由仅提取时间和 token 元数据，不读取订阅额度。
         try {
           const record = JSON.parse(line);
+          const payload = record?.payload;
+          if (payload?.type === 'error' || payload?.type === 'stream_error' ||
+              (payload?.type === 'task_complete' && payload.error)) {
+            const value = payload.type === 'task_complete' ? payload.error : payload.error ?? payload.message;
+            const text = structuredErrorText(value) || structuredErrorText(payload.message);
+            if (text) result.structuredErrors.push({ type: payload.type, text });
+          }
           if (includeLimits && line.includes('"rate_limits"')) {
             const snapshot = normalizeLimits(record.payload?.rate_limits ?? record.rate_limits);
             if (snapshot) result.snapshot = snapshot;
@@ -546,7 +563,6 @@ function detectApiLimit(text, now = new Date(), fallbackMinutes = 60) {
 
 // 将 Codex 失败归一为路由阶段使用的类别；限额识别沿用现有快照和文本检测。
 function classifyCodexFailure(tail, code, telemetry = {}) {
-  const text = String(tail ?? '');
   const snapshot = telemetry?.snapshot ?? telemetry?.rateLimits?.snapshot ?? null;
   const snapshotLimit = snapshot ? limitFromSnapshot(snapshot) : null;
   const knownLimit = telemetry?.limit ?? telemetry?.state ?? telemetry?.quota ?? null;
@@ -556,28 +572,44 @@ function classifyCodexFailure(tail, code, telemetry = {}) {
     if (value instanceof Date && Number.isFinite(value.getTime())) return value.getTime() / 1000;
     return null;
   };
-  const result = (category, resetsAt = null) => ({ category, type: category, resets_at: resetSeconds(resetsAt) });
+  const result = (category, resetsAt = null, source = 'text') =>
+    ({ category, type: category, resets_at: resetSeconds(resetsAt), source });
+  const classifyText = (text, source) => {
+    const value = String(text ?? '');
+    if (code !== 0 && /at capacity/i.test(value)) return result('capacity', null, source);
+    if (/model[\s_-]*(?:not[\s_-]*found|does not exist)|does not exist|unsupported model|unknown model/i.test(value)) {
+      return result('模型不支持', null, source);
+    }
 
-  if (code !== 0 && /at capacity/i.test(text)) return result('capacity');
-  if (/model[\s_-]*(?:not[\s_-]*found|does not exist)|does not exist|unsupported model|unknown model/i.test(text)) {
-    return result('模型不支持');
-  }
+    const apiLimit = detectApiLimit(value);
+    if (billingType === 'api' && apiLimit) return result('供应商额度', apiLimit.resets_at, source);
+    if (/\b5\d\d\b|\b(?:401|403)\b|unauthorized|internal server error|service unavailable/i.test(value)) {
+      return result('供应商故障', null, source);
+    }
 
-  const apiLimit = detectApiLimit(text);
-  if (billingType === 'api' && apiLimit) return result('供应商额度', apiLimit.resets_at);
-  if (/\b5\d\d\b|\b(?:401|403)\b|unauthorized|internal server error|service unavailable/i.test(text)) {
-    return result('供应商故障');
+    const officialLimitText = /weekly|week limit|7.?day/i.test(value) ? 'weekly' :
+      /5\s*h|5.?hour|primary/i.test(value) ? '5h' : null;
+    const officialLimitType = knownLimit?.type ?? snapshotLimit?.type ?? officialLimitText;
+    const officialReset = knownLimit?.resets_at ?? snapshotLimit?.resets_at ??
+      (detectLimit(value) ?? null);
+    if (billingType !== 'api' && (officialLimitType === 'weekly' || officialLimitType === '5h' || detectLimit(value))) {
+      return result(officialLimitType === 'weekly' ? '官方周' : '官方 5h', officialReset, source);
+    }
+    return result('其他', null, source);
+  };
+  const structured = (telemetry?.structuredErrors ?? [])
+    .map((entry) => typeof entry === 'string' ? entry : entry?.text)
+    .filter((value) => typeof value === 'string' && value.trim()).join('\n');
+  const stderr = Array.isArray(telemetry?.stderrDiagnostics)
+    ? telemetry.stderrDiagnostics.join('\n') : String(telemetry?.stderrDiagnostics ?? '');
+  if (structured) {
+    const classified = classifyText(structured, 'rollout');
+    if (classified.type !== '其他' || !stderr.trim()) return classified;
+    const stderrClassified = classifyText(stderr, 'stderr');
+    return stderrClassified.type !== '其他' ? stderrClassified : classified;
   }
-
-  const officialLimitText = /weekly|week limit|7.?day/i.test(text) ? 'weekly' :
-    /5\s*h|5.?hour|primary/i.test(text) ? '5h' : null;
-  const officialLimitType = knownLimit?.type ?? snapshotLimit?.type ?? officialLimitText;
-  const officialReset = knownLimit?.resets_at ?? snapshotLimit?.resets_at ??
-    (detectLimit(text) ?? null);
-  if (billingType !== 'api' && (officialLimitType === 'weekly' || officialLimitType === '5h' || detectLimit(text))) {
-    return result(officialLimitType === 'weekly' ? '官方周' : '官方 5h', officialReset);
-  }
-  return result('其他');
+  if (stderr.trim()) return classifyText(stderr, 'stderr');
+  return classifyText(tail, 'text');
 }
 
 function executable(file) {
@@ -1115,7 +1147,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -1455,6 +1487,7 @@ const log = (s) => fs.appendFileSync(logPath, s.endsWith('\n') ? s : s + '\n');
 function logCodexFailure(tail, code, telemetry = {}) {
   const classification = classifyCodexFailure(tail, code, telemetry);
   log(`failure class: ${classification.category}`);
+  log(`source: ${classification.source}`);
   return classification;
 }
 function beginRound() {
@@ -1469,6 +1502,7 @@ function beginRound() {
   reconnectCount = 0;
   capacityCount = 0;
   reconnectLines = [];
+  stderrDiagnosticLines = [];
   codexStall = { count: 0, seconds: 0 };
   progressRecord = null;
   // 监控总结只要两行，不需要报告文件和执行规则
@@ -1498,16 +1532,44 @@ function beginRound() {
 let reconnectCount = 0;
 let capacityCount = 0;
 let reconnectLines = [];
+let stderrDiagnosticLines = [];
 let codexStall = { count: 0, seconds: 0 };
+
+function isCodexStderrDiagnostic(line) {
+  if (/^(?:error|warning|fatal|http\s+\d{3}|unexpected status|selected model|you[’']ve hit|reconnecting|stream disconnected|retry|at capacity|model(?:[_\s-]*(?:not[_\s-]*found|does not exist|unsupported))|unauthorized|internal server error|service unavailable|status\s+\d{3})\b/i.test(line)) {
+    return true;
+  }
+  if (!line.startsWith('{')) return false;
+  try {
+    const value = JSON.parse(line);
+    return Boolean(value && typeof value === 'object' && (value.error || value.code || value.status));
+  } catch { return false; }
+}
 
 function observeCodexOutput(chunk) {
   for (const line of String(chunk).split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
-    const reconnect = /reconnecting|stream disconnected|retry/i.test(line);
-    const capacity = /at capacity/i.test(line);
-    if (reconnect) reconnectCount++;
-    if (capacity) capacityCount++;
-    if ((reconnect || capacity) && reconnectLines.length < 20) reconnectLines.push(line);
+    if (isCodexStderrDiagnostic(line)) {
+      stderrDiagnosticLines.push(line);
+    }
   }
+}
+
+function summarizeCodexDiagnostics(structuredErrors = [], stderrLines = []) {
+  const lines = [];
+  const seen = new Set();
+  for (const value of [...structuredErrors.map((entry) => typeof entry === 'string' ? entry : entry?.text), ...stderrLines]) {
+    for (const line of String(value ?? '').split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+      const key = line.replace(/^\s*(?:error|warning|fatal)\s*[:\-]\s*/i, '').trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      lines.push(line);
+    }
+  }
+  return {
+    lines,
+    reconnect: lines.filter((line) => /reconnecting|stream disconnected|retry/i.test(line)).length,
+    capacity: lines.filter((line) => /at capacity/i.test(line)).length,
+  };
 }
 
 function readCodexProviderId() {
@@ -1714,7 +1776,7 @@ function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -2267,11 +2329,11 @@ function runCodex(spawnRetried = false) {
       sessionTail = buffered.slice(-512);
     }
   };
-  const outputLines = [child.stdout, child.stderr].map((stream) => {
+  const outputLines = [[child.stdout, false], [child.stderr, true]].map(([stream, isStderr]) => {
     stream.setEncoding('utf8');
     stream.on('data', onOutput);
     const lines = createInterface({ input: stream, crlfDelay: Infinity });
-    lines.on('line', observeCodexOutput);
+    if (isStderr) lines.on('line', observeCodexOutput);
     return lines;
   });
   const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
@@ -2308,15 +2370,24 @@ function runCodex(spawnRetried = false) {
     log(`exit: code=${code} signal=${signal ?? 'none'} timedOut=${timedOut}`);
     codexTokens = [...tail.matchAll(/tokens used\s+([\d,]+)/g)].pop()?.[1] ?? null;
     const telemetry = await sessionTelemetry(session, codexStartedAt, dispatchContext.codex?.billingType !== 'api');
+    const diagnostics = summarizeCodexDiagnostics(telemetry.structuredErrors ?? [], stderrDiagnosticLines);
+    reconnectCount = diagnostics.reconnect;
+    capacityCount = diagnostics.capacity;
+    reconnectLines = diagnostics.lines.filter((line) => /reconnecting|stream disconnected|retry|at capacity/i.test(line)).slice(0, 20);
+    const stderrDiagnostics = stderrDiagnosticLines.join('\n');
+    const structuredDiagnostics = (telemetry.structuredErrors ?? [])
+      .map((entry) => typeof entry === 'string' ? entry : entry?.text).filter(Boolean);
+    const failureText = [...structuredDiagnostics, stderrDiagnostics].filter(Boolean).join('\n');
     const failureTelemetry = { ...telemetry, billingType: dispatchContext.codex?.billingType,
+      stderrDiagnostics,
       limit: dispatchContext.codex?.billingType === 'api' ? readCodexQuota(dispatchContext.codex, model) : readCodexLimit() };
     codexStall = { count: telemetry.stall, seconds: telemetry.stall_seconds };
     if (timedOut) return failCodex(`超时（>${config.codexTimeoutMinutes ?? 90} 分钟）`,
-      { tail: '', code, telemetry: failureTelemetry });
+      { tail: '', code, telemetry: { ...failureTelemetry, structuredErrors: [] } });
     if (dispatchContext.codex?.billingType === 'api') {
       if (code !== 0) {
-        logCodexFailure(tail, code, failureTelemetry);
-        const state = detectApiLimit(tail, new Date(), config.limitCooldownMinutes ?? 60);
+        logCodexFailure(failureText, code, failureTelemetry);
+        const state = detectApiLimit(failureText, new Date(), config.limitCooldownMinutes ?? 60);
         if (state) {
           writeProviderLimit(dispatchContext.codex, model, state);
           return takeOverCodex(state);
@@ -2335,10 +2406,10 @@ function runCodex(spawnRetried = false) {
     if (state?.type && !state.resets_at) state.resets_at = (Date.now() + (config.limitCooldownMinutes ?? 60) * 60_000) / 1000;
     if (state) writeCodexLimit(state);
     if (code !== 0) {
-      logCodexFailure(tail, code, { ...failureTelemetry, limit: state ?? failureTelemetry.limit });
-      const limitUntil = detectLimit(tail, new Date(), config.limitCooldownMinutes ?? 60);
+      logCodexFailure(failureText, code, { ...failureTelemetry, limit: state ?? failureTelemetry.limit });
+      const limitUntil = detectLimit(failureText, new Date(), config.limitCooldownMinutes ?? 60);
       if (state?.type || (!snapshot && limitUntil)) {
-        state ??= { last_checked_at: null, ...readCodexLimit(), type: /weekly|week limit/i.test(tail) ? 'weekly' : /5h|5.hour/i.test(tail) ? '5h' : 'unknown',
+        state ??= { last_checked_at: null, ...readCodexLimit(), type: /weekly|week limit/i.test(failureText) ? 'weekly' : /5h|5.hour/i.test(failureText) ? '5h' : 'unknown',
           resets_at: limitUntil.getTime() / 1000, detected_at: new Date().toISOString(), source: 'text', snapshot: null };
         state.last_probe_at = new Date().toISOString();
         writeCodexLimit(state);

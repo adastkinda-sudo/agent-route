@@ -2165,15 +2165,15 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         }
         check(invocationRows().length === before, '非法超时仍调用了执行方');
       })],
-      [88, 'Codex 重连：stdout/stderr、大小写、分块与同一行只计一次', () => withCodexFixture(async () => {
+      [88, 'Codex 重连：stderr、大小写、分块与同一行只计一次', () => withCodexFixture(async () => {
         const result = run('stream-events');
         exitIs(result, 0);
-        check(result.footer.includes('reconnect 4 | capacity 2') && result.record.reconnect === 4 && result.record.capacity === 2,
+        check(result.footer.includes('reconnect 3 | capacity 2') && result.record.reconnect === 3 && result.record.capacity === 2,
           '重连或 capacity 的 footer/history 计数不符');
-        check(result.log.includes('log-mode: summary') && result.log.includes('Reconnecting 1/5') &&
+        check(result.log.includes('log-mode: summary') && !result.log.includes('codex stream: Reconnecting 1/5') &&
           result.log.includes('stream disconnected; Retry 1/5') && result.log.includes('ReConnecting 2/5') &&
-          result.log.split('\n').filter((line) => line.startsWith('codex stream: ')).length === 5,
-          '摘要日志未保留 stdout/stderr 重连行');
+          result.log.split('\n').filter((line) => line.startsWith('codex stream: ')).length === 4,
+          '摘要日志未按 stderr 来源保留重连行');
         const clean = run('complete');
         exitIs(clean, 0);
         check(clean.record.reconnect === 0 && clean.record.capacity === 0 && !/reconnect|capacity|stall/.test(clean.footer),
@@ -2223,6 +2223,20 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           check(restored && ['reconnect', 'capacity', 'stall', 'stall_seconds'].every((key) => restored[key] === old[key]),
             '摘要回填丢失重连/停顿字段');
         }
+      })],
+      [92, 'Codex 工具输出中的诊断词不计数或分类', () => withCodexFixture(async () => {
+        const result = run('false-diagnostics');
+        exitIs(result, 10);
+        check(result.record.reconnect === 0 && result.record.capacity === 0 && result.log.includes('failure class: 其他') &&
+          result.log.includes('source: text') && !result.log.includes('failure class: capacity'),
+          '工具输出中的 at capacity/Reconnecting 被计数或分类');
+      })],
+      [93, 'Codex rollout 结构化错误优先分类并计数', () => withCodexFixture(async () => {
+        const result = run('structured-capacity');
+        exitIs(result, 10);
+        check(result.record.reconnect === 2 && result.record.capacity === 1 &&
+          result.log.includes('failure class: capacity') && result.log.includes('source: rollout'),
+          '结构化错误未优先分类或计数');
       })],
     );
     for (const [id, name, test] of scenarios) {
