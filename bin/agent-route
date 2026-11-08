@@ -432,6 +432,46 @@ function limitFromSnapshot(snapshot) {
     resets_at: windows.length ? Math.max(...windows.map((value) => value.resets_at)) : null };
 }
 
+// 3.2c 官方额度保留线：只读 CC Switch 的 codexQuotaProtection，config.codexQuotaReserve 可逐项覆盖。
+// 未启用、读不到或值无效时该窗口按 100%（即只认真实限额）。
+function codexQuotaThresholds(config, home = os.homedir()) {
+  const valid = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 100;
+  let directory = config.ccSwitch?.deviceDir ?? path.join(home, '.cc-switch');
+  if (typeof directory !== 'string' || !directory) directory = path.join(home, '.cc-switch');
+  directory = path.resolve(directory.startsWith('~/') ? path.join(home, directory.slice(2)) : directory);
+  let protection = null;
+  try {
+    const settings = JSON.parse(fs.readFileSync(path.join(directory, 'settings.json'), 'utf8'));
+    if (settings?.codexQuotaProtection?.enabled === true) protection = settings.codexQuotaProtection;
+  } catch {}
+  const local = config.codexQuotaReserve ?? {};
+  const pick = (key) => valid(local[key]) ? local[key] : valid(protection?.[key]) ? protection[key] : 100;
+  return { fiveHour: pick('fiveHourThreshold'), weekly: pick('weeklyThreshold') };
+}
+
+function validateCodexQuotaReserve(config) {
+  const value = config.codexQuotaReserve;
+  if (value === undefined) return;
+  if (!isConfigObject(value)) throw new Error('codexQuotaReserve 必须是对象');
+  for (const key of ['fiveHourThreshold', 'weeklyThreshold']) {
+    if (value[key] !== undefined && (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] <= 0 || value[key] > 100)) {
+      throw new Error(`codexQuotaReserve.${key} 必须是 0–100 的数值（大于 0）`);
+    }
+  }
+}
+
+// 快照中用量达到保留线且窗口尚未重置的窗口；类型和恢复时间的取法与 limitFromSnapshot 一致（周优先）。
+function reserveLimitFromSnapshot(snapshot, thresholds, now = Date.now()) {
+  const hits = [];
+  for (const [key, type, threshold] of [['secondary', 'weekly', thresholds.weekly], ['primary', '5h', thresholds.fiveHour]]) {
+    const window = snapshot?.[key];
+    if (!window || threshold >= 100 || window.resets_at * 1000 <= now || window.used_percent < threshold) continue;
+    hits.push({ type, window: type, used: window.used_percent, threshold, resets_at: window.resets_at });
+  }
+  if (!hits.length) return null;
+  return { type: hits[0].type, resets_at: Math.max(...hits.map((hit) => hit.resets_at)), hits };
+}
+
 function snapshotState(snapshot, source, previous = null) {
   const limit = limitFromSnapshot(snapshot);
   return { ...previous, ...limit, snapshot, source, last_checked_at: previous?.last_checked_at ?? null, detected_at: limit.type
@@ -639,15 +679,16 @@ function selectResetCredit(resetCredits, now = Date.now()) {
     .sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity) || a.grantedAt - b.grantedAt)[0] ?? null;
 }
 
-// 3.2a 触发条件。type 以刚读取的快照为准；quotaReserve 限额（快照未满）由调用方在 state.reserve 标出。
+// 3.2a 触发条件。type 以刚读取的快照为准；3.2c 保留线限额（快照未满）由调用方在 state.reserve / state.thresholds 标出。
 function resetCreditDecision(state, details, settings, now = Date.now()) {
   if (!settings.auto) return { use: false, reason: 'auto disabled' };
   const snapshot = details?.snapshot;
   if (!snapshot) return { use: false, reason: 'rate limits unavailable' };
   const credit = selectResetCredit(details.resetCredits, now);
   if (!credit) return { use: false, reason: 'no available credit' };
+  // 保留线限额（快照未满）用状态里记下的阈值对刚读取的快照重新判断，窗口已重置则不再算受限。
   const fresh = limitFromSnapshot(snapshot);
-  const type = fresh.type ?? (state?.reserve ? state.type : null);
+  const type = fresh.type ?? (state?.reserve ? reserveLimitFromSnapshot(snapshot, state.thresholds ?? {}, now)?.type : null);
   if (!type) return { use: false, reason: 'not limited' };
   const weekly = snapshot.secondary;
   if (type === 'weekly') {
@@ -667,8 +708,9 @@ function resetCreditDecision(state, details, settings, now = Date.now()) {
 }
 
 // 用券后重读的快照必须已解除限额，且触发用券的窗口用量下降。
-function resetConfirmed(before, after, type) {
+function resetConfirmed(before, after, type, thresholds = null) {
   if (!after || limitFromSnapshot(after).type) return false;
+  if (thresholds && reserveLimitFromSnapshot(after, thresholds)) return false;
   const windows = type === 'weekly' ? ['secondary'] : type === '5h' ? ['primary'] : ['primary', 'secondary'];
   return windows.every((key) => !before?.[key] || !after[key] || after[key].used_percent < before[key].used_percent);
 }
@@ -702,6 +744,25 @@ async function checkCodexLimit(config) {
     return reserved ? null : readCodexLimit();
   }
   return state;
+}
+
+// 3.2c：派发前用额度快照判断官方窗口是否达到保留线；达到时返回内存状态（不写限额文件，下次派发重新判断）。
+// 快照优先取 5 分钟内的已存快照，否则读一次 app-server。真实限额仍生效时原样返回。
+async function applyQuotaReserve(config, recorded) {
+  if (limitActive(recorded)) return recorded;
+  const thresholds = codexQuotaThresholds(config);
+  if (thresholds.fiveHour >= 100 && thresholds.weekly >= 100) return recorded;
+  const stored = readCodexLimit();
+  let snapshot = stored?.snapshot && Date.now() - (Date.parse(stored.observed_at) || 0) < 5 * 60_000 ? stored.snapshot : null;
+  if (!snapshot) {
+    snapshot = await queryRateLimits(config);
+    if (snapshot) writeCodexLimit(snapshotState(snapshot, 'app-server', stored?.type ? { ...stored, type: null } : stored));
+  }
+  const reserve = reserveLimitFromSnapshot(snapshot, thresholds);
+  if (!reserve) return recorded;
+  for (const hit of reserve.hits) log(`quota reserve: ${hit.window} ${hit.used}% >= ${hit.threshold}%`);
+  return { type: reserve.type, resets_at: reserve.resets_at, detected_at: new Date().toISOString(), last_checked_at: null,
+    source: 'quota-reserve', reserve: true, thresholds, snapshot };
 }
 
 // 服务商状态与订阅账号文件分开；同 ID 的 endpoint 被编辑后也不复用旧状态。
@@ -1064,6 +1125,7 @@ function validateConfig(config) {
     }
   }
   validateCodexResetCredits(config);
+  validateCodexQuotaReserve(config);
   validateClaudePacing(config);
   return config;
 }
@@ -1599,7 +1661,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -1754,6 +1816,8 @@ if (cmd === 'status') {
       const window = limit?.snapshot?.[key];
       console.log(`codex ${label}: ${window ? `${window.used_percent}% resets ${fmtLocal(new Date(window.resets_at * 1000))}` : 'unknown'}`);
     }
+    const reserve = codexQuotaThresholds(config);
+    console.log(`codex quota reserve: 5h ${reserve.fiveHour < 100 ? `${reserve.fiveHour}%` : 'off'}; weekly ${reserve.weekly < 100 ? `${reserve.weekly}%` : 'off'}`);
     // 只读：显示可用重置券，不会使用。
     const resetCredits = (await queryRateLimitDetails(config))?.resetCredits;
     const expiries = (resetCredits?.credits ?? []).filter((credit) => credit.status === 'available' && credit.expiresAt !== null && credit.expiresAt * 1000 > Date.now())
@@ -2414,7 +2478,7 @@ function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -2731,12 +2795,12 @@ async function tryResetCredit(state, { started }) {
     let result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
     if (!result.outcome) result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
     const success = ['reset', 'alreadyRedeemed'].includes(result.outcome);
-    const confirmed = success && resetConfirmed(details.snapshot, result.snapshot, type);
+    const confirmed = success && resetConfirmed(details.snapshot, result.snapshot, type, state.reserve ? state.thresholds : null);
     log(`reset credit: ${result.outcome ?? `failed (${result.error})`} ${prefix} expires ${expires}`);
     resetCreditRecord = { outcome: result.outcome ?? 'failed', credit: prefix, expires_at: expires, confirmed };
     if (result.outcome) notify('reset credit', `${result.outcome}: ${prefix} (${decision.reason})${confirmed ? '' : '; 未确认重置，转备用路由'}`);
     if (!confirmed) return false;
-    clearCodexLimit(snapshotState(result.snapshot, 'app-server', readCodexLimit() ?? state));
+    clearCodexLimit(snapshotState(result.snapshot, 'app-server', readCodexLimit() ?? (state.reserve ? null : state)));
     codexLimitReason = null;
     if (started) {
       if (resumeArg !== null) rebuildPromptFromResume();
@@ -2754,7 +2818,7 @@ async function tryResetCredit(state, { started }) {
 
 async function takeOverCodex(state, { started = true } = {}) {
   if (await tryResetCredit(state, { started })) return;
-  codexLimitReason = `codex ${dispatchContext.codex?.billingType === 'api' ? 'API 服务商 ' : ''}${state.type} 限额${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : '，恢复时间未知'}`;
+  codexLimitReason = `codex ${dispatchContext.codex?.billingType === 'api' ? 'API 服务商 ' : ''}${state.type} ${state.reserve ? '额度保留线' : '限额'}${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : '，恢复时间未知'}`;
   if (routeFailureHandled({ category: state.type === 'weekly' ? '官方周' : '官方 5h', state, resets_at: state.resets_at }, codexLimitReason)) return;
   if (noClaude) return limitStop(state);
   usedFallback = true;
@@ -3025,8 +3089,10 @@ else if (resumeArg !== null && executor === 'claude') runClaude('跟随原 Claud
 else {
   const forcedLimit = process.env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT === '1' && activeRouteKind === 'official'
     ? { type: '5h', resets_at: (Date.now() + 3_600_000) / 1000, source: 'forced-test' } : null;
-  const state = forcedLimit ?? (dispatchContext.codex?.billingType === 'api' || noClaude
+  const officialSubscription = activeRouteKind === 'official' && (!dispatchContext.codex || dispatchContext.codex.billingType === 'subscription');
+  let state = forcedLimit ?? (dispatchContext.codex?.billingType === 'api' || noClaude
     ? readCodexQuota(dispatchContext.codex, model) : await checkCodexLimit(config));
+  if (!forcedLimit && officialSubscription) state = await applyQuotaReserve(config, state);
   if (limitActive(state)) takeOverCodex(state, { started: false });
   else {
     if (state?.type) clearCodexQuota(dispatchContext.codex, model, state);

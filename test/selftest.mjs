@@ -2655,6 +2655,119 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           fs.rmSync(settingsFile, { force: true });
         }
       })],
+      [101, '官方额度保留线：启用、关闭、读不到、本地覆盖与用券', () => withMicuRoutes(async () => {
+        const settingsFile = path.join(home, 'stub-rate-limits.json');
+        const notifyFile = path.join(home, 'notifications.jsonl');
+        const stubState = (value) => writeJSON(settingsFile, value);
+        const protect = (value) => deviceSettings({ currentProviderCodex: 'official-codex', ...(value === undefined ? {} : { codexQuotaProtection: value }) });
+        const consumeRows = () => {
+          try { return fs.readFileSync(path.join(home, 'stub-app-server.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.event === 'consume'); }
+          catch { return []; }
+        };
+        const scenario = (state) => {
+          stubState(state);
+          fs.rmSync(notifyFile, { force: true });
+          const consumed = consumeRows().length;
+          const mark = invocationRows().length;
+          const result = run('complete');
+          exitIs(result, 0);
+          return { result, consumed: consumeRows().slice(consumed), calls: execCalls(mark), logs: allLogs(result) };
+        };
+        const official = (r, why) => check(r.calls.length === 1 && !isMicu(r.calls[0]) && !r.logs.includes('quota reserve:'), `${why}：应留在官方`);
+        const viaMicu = (r, why, pattern) => check(r.calls.length === 1 && isMicu(r.calls[0]) && pattern.test(r.logs), `${why}：应转 Micu 并记录保留线: ${r.logs}`);
+        const savedCredits = routeConfig.codexResetCredits;
+        const savedReserve = routeConfig.codexQuotaReserve;
+        const save = () => fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        const credits = (...items) => items.map(([id, expiresInHours]) => ({ id, expiresInHours }));
+        try {
+          const enabled = { enabled: true, fiveHourThreshold: 98, weeklyThreshold: 98 };
+          protect(enabled);
+          // 启用：周 / 5h 用量达到阈值转 Micu，恢复时间取对应窗口，低于阈值留在官方。
+          let r = scenario({ primaryUsed: 50, weeklyUsed: 98 });
+          viaMicu(r, '周 98%', /quota reserve: weekly 98% >= 98%/);
+          check(!fs.existsSync(limitPath) || !limitState()?.type, '保留线不应写入限额状态');
+          viaMicu(scenario({ primaryUsed: 98.5, weeklyUsed: 10 }), '5h 98.5%', /quota reserve: 5h 98.5% >= 98%/);
+          official(scenario({ primaryUsed: 97.9, weeklyUsed: 97.9 }), '低于阈值');
+          // 窗口已过期（resets_at 在过去）不算受限。
+          official(scenario({ primaryUsed: 99, weeklyUsed: 10, resets_at: Math.floor(Date.now() / 1000) - 60 }), '5h 窗口已重置');
+          // 关闭、读不到设置、阈值无效：按 100%。
+          protect({ ...enabled, enabled: false });
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), 'enabled=false');
+          protect(undefined);
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), '设置中没有 codexQuotaProtection');
+          protect('on');
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), 'codexQuotaProtection 不是对象');
+          protect({ ...enabled, enabled: 'yes' });
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), 'enabled 不是布尔值');
+          protect({ enabled: true, fiveHourThreshold: 'x', weeklyThreshold: 0 });
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), '阈值无效');
+          // 本地覆盖：关闭 CC Switch 时单独生效，启用时优先于 CC Switch。
+          protect({ ...enabled, enabled: false });
+          routeConfig.codexQuotaReserve = { weeklyThreshold: 90 };
+          save();
+          viaMicu(scenario({ primaryUsed: 99, weeklyUsed: 91 }), '本地覆盖周 90%', /quota reserve: weekly 91% >= 90%/);
+          official(scenario({ primaryUsed: 99, weeklyUsed: 89 }), '本地覆盖只管周窗口');
+          protect(enabled);
+          routeConfig.codexQuotaReserve = { weeklyThreshold: 99.5, fiveHourThreshold: 50 };
+          save();
+          official(scenario({ primaryUsed: 10, weeklyUsed: 99 }), '本地覆盖放宽 CC Switch 阈值');
+          viaMicu(scenario({ primaryUsed: 55, weeklyUsed: 10 }), '本地覆盖收紧 5h 阈值', /quota reserve: 5h 55% >= 50%/);
+          delete routeConfig.codexQuotaReserve;
+          save();
+          // 无效的本地覆盖配置报错。
+          routeConfig.codexQuotaReserve = { weeklyThreshold: 'x' };
+          save();
+          const invalid = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 20000 });
+          check(invalid.status !== 0 && /codexQuotaReserve\.weeklyThreshold/.test(invalid.stderr + invalid.stdout), `无效的 codexQuotaReserve 应报错: ${invalid.stderr}`);
+          delete routeConfig.codexQuotaReserve;
+          // 用券：保留线触发的周限额离重置超过 24 小时，用券后二次读取确认并在官方重跑。
+          routeConfig.codexResetCredits = { ...savedCredits, auto: true };
+          save();
+          protect(enabled);
+          const twoCredits = credits(['aaaaaaaa-0000-0000-0000-000000000001', 100], ['bbbbbbbb-0000-0000-0000-000000000002', 10]);
+          r = scenario({ primaryUsed: 50, weeklyUsed: 98.5, credits: twoCredits });
+          check(r.consumed.length === 1 && r.consumed[0].creditId === twoCredits[1].id && r.calls.length === 1 && !isMicu(r.calls[0]) &&
+            /quota reserve: weekly 98.5% >= 98%/.test(r.logs) && r.logs.includes('reset credit: reset bbbbbbbb expires') &&
+            r.result.record.reset_credit.outcome === 'reset' && r.result.record.reset_credit.confirmed === true && r.result.record.providers.codex.route === 'official',
+          `保留线周限额应用券并在官方重跑: ${JSON.stringify(r.consumed)} ${r.calls.length}`);
+          check(fs.readFileSync(notifyFile, 'utf8').includes('"event":"reset credit"'), '保留线用券应发系统通知');
+          check(!limitState()?.reserve && !limitState()?.type, '用券后不应残留保留线状态');
+          // 5h 达到保留线、周用量 ≥80%、券 3 天内到期：用券。
+          r = scenario({ primaryUsed: 98, weeklyUsed: 85, credits: credits(['cccccccc-0000-0000-0000-000000000003', 48]) });
+          check(r.consumed.length === 1 && r.calls.length === 1 && !isMicu(r.calls[0]) && /quota reserve: 5h 98% >= 98%/.test(r.logs),
+            '5h 保留线加周用量高加券将到期应用券');
+          // 5h 达到保留线、周用量低：不用券，转 Micu。
+          r = scenario({ primaryUsed: 98, weeklyUsed: 50, credits: credits(['dddddddd-0000-0000-0000-000000000004', 10]) });
+          check(r.consumed.length === 0 && r.calls.length === 1 && isMicu(r.calls[0]) && /reset credit: skipped/.test(r.logs), '5h 保留线周用量低不应用券');
+          // 用券后仍在保留线之上（reset 未生效）：转 Micu，本次不再用券。
+          r = scenario({ primaryUsed: 50, weeklyUsed: 98.5, credits: twoCredits, consumeEffect: 'none' });
+          check(r.consumed.length === 1 && r.calls.length === 1 && isMicu(r.calls[0]) && r.result.record.reset_credit.confirmed === false,
+            '用券后仍受限应转 Micu');
+          // auto:false：达到保留线直接转 Micu，不用券。
+          routeConfig.codexResetCredits = { ...savedCredits, auto: false };
+          save();
+          r = scenario({ primaryUsed: 50, weeklyUsed: 98.5, credits: twoCredits });
+          check(r.consumed.length === 0 && r.calls.length === 1 && isMicu(r.calls[0]), 'auto:false 保留线转 Micu 且不用券');
+          // 派发中途跨过阈值不打断当前任务：官方执行时快照已高于阈值，本次任务仍正常完成。
+          protect(enabled);
+          routeConfig.codexResetCredits = { ...savedCredits, auto: false };
+          save();
+          stubState({ primaryUsed: 10, weeklyUsed: 10 });
+          const mark = invocationRows().length;
+          const midway = run('complete');
+          exitIs(midway, 0);
+          check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]), '阈值以下的派发应在官方完成');
+          // status 显示保留线。
+          const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 20000 });
+          check(status.status === 0 && /codex quota reserve: 5h 98%; weekly 98%/.test(status.stdout), `status 应显示保留线: ${status.stdout}`);
+        } finally {
+          routeConfig.codexResetCredits = savedCredits;
+          if (savedReserve === undefined) delete routeConfig.codexQuotaReserve; else routeConfig.codexQuotaReserve = savedReserve;
+          save();
+          fs.rmSync(settingsFile, { force: true });
+          deviceSettings({ currentProviderCodex: 'official-codex' });
+        }
+      })],
     );
     for (const [id, name, test] of scenarios) {
       try {
