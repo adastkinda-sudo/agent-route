@@ -1,6 +1,6 @@
 # agent-route
 
-按 `tier1` / `tier2` 派发任务，优先调用 Codex，在失败、冷却或额度受限时自动交给 Claude，并记录汇报、验证结果和运行诊断。
+按 `tier1` / `tier2` 派发任务，依次尝试 Codex 官方、Claude 订阅和 Micu 临时兜底，并记录汇报、验证结果和运行诊断。
 
 ## 目录
 
@@ -90,6 +90,8 @@ EOF
 | `--resume ID` | 接受日志 id 或会话 UUID；日志 id 默认沿用原目录、要求同一 tier，UUID 必须配合 `--cwd`。跟随原执行方，按本次 `--write` 决定权限。 |
 | `--no-claude` | 禁止自动交给 Claude；Codex 失败时输出 `FALLBACK`，额度受限时输出 `LIMIT`。 |
 | `--claude` | 直接调用 Claude，不能与 `--resume`、`--no-claude`、`--monitor` 同用。 |
+| `--urgent` | 按正常顺序选路；仅当所有路由不可用时动用 Claude 应急保留，周用量上限为 `claudePacing.urgentMaxPercent`（默认 95%）。不能与 `--claude`、`--no-claude`、`--monitor` 同用。 |
+| `--ignore-budget` | 本次允许使用已达 Micu 每日软上限或缺少单价的模型，花费仍照常记账；不能与 `--claude` 同用。 |
 | `--effort LEVEL` | 覆盖本次 Codex 的 effort：`none`、`minimal`、`low`、`medium`、`high`、`xhigh`；不影响 Claude。 |
 | `--exclude PATH` | 只读核对时排除相对工作目录的路径，可重复；也支持配置 `readOnlyExclude`。日志与状态目录在工作目录内时自动排除。 |
 | `--verify COMMAND`、`--fix-rounds N` | 汇报完成后在工作目录用 `/bin/zsh -lc` 验证，可重复，每条最多 10 分钟。允许写入时验证失败可同线程返工，默认 1 轮，`0` 禁用；只读不返工。 |
@@ -98,15 +100,35 @@ EOF
 | `--full-output` | 保留完整终端汇报；默认满足完成、验证与无告警等条件时折叠，日志仍保留完整汇报。 |
 | `--monitor` | 供监控使用，Codex 默认改用 `monitorEffort`，不解析普通任务汇报状态。 |
 
-Codex 订阅额度受限时自动转 Claude，额度恢复后重新使用 Codex；服务商额度错误通过实际失败被动识别。Codex 续跑失败会先重试同一会话，再携带原任务和新增要求开新线程，最终失败才冷却并转 Claude；每次尝试写入日志与 history 的 `attempt` 字段。
+### 路由顺序与限额
+
+普通派发的顺序是 **Codex 官方 → Claude → Micu**。官方 tier2 按 `gpt-6.1-terra`、`gpt-6-luna` 依次尝试，tier1 使用 `gpt-6.1-sol`；Micu 的 tier1/tier2 都使用 `gpt-6.1-sol`，tier2 effort 为 `medium`。官方 5h/周限额、保留线和熔断会跳过相应路由，额度或冷却结束后自动恢复。`status` 显示每条路由的熔断剩余时间和 Micu 当日花费。
+
+Claude 订阅的正常派发受 `claudePacing` 每日用量线和 5h 上限约束。用量来自一次最小的 `claude -p --output-format stream-json --verbose` 调用中的 `rate_limit_event.rate_limit_info.unifiedWindows`，读取 `five_hour` 和 `seven_day` 的 utilization、resetsAt；这些字段属于 Claude Code 的 **@internal** 数据接口，版本升级可能改名、缺失或改变语义。读数超过 `staleMinutes`（默认 60 分钟）或字段不完整时，普通派发不使用 Claude，并转到 Micu；`--claude` 和耗尽时的 `--urgent` 只在能读取到足够的周限额信息时动用应急保留。
+
+Micu 每日花费是软上限，默认 `dailyBudgetUsd: 5`。达到上限或模型没有 `codexPricing` 单价时，普通派发跳过 Micu；`--ignore-budget` 可越过这两项限制，但仍记录估算花费，无法估算时记为 `unknown`。Micu 的密钥只放在子进程环境变量，日志、history 和状态输出会脱敏。
+
+全部路由不可用时，脚本计算官方额度、熔断、Micu 次日预算和 Claude 日线的最早恢复时间。最早恢复在 `claudePacing.maxAutoWaitMinutes`（默认 30 分钟）内会自动等待并重新选路；更久则输出 `LIMIT`、退出码 15，主 agent 应单独向用户确认，必要时再用 `--urgent`。`--no-claude` 不等待，直接输出 `FALLBACK` 或 `LIMIT`。
+
+可观测命令：`status` 显示额度、Claude 日线与剩余、重置券、熔断和 Micu 花费；`route <tier1|tier2> --explain` 只预演候选顺序与阻塞原因，不派发、不使用重置券；`stats [--days N]` 除模型分组外显示按路由派发次数、用券次数、Micu 当日花费和两边周额度剩余。
+
+Codex 续跑失败会先重试同一会话，再携带原任务和新增要求开新线程，最终失败才进入下一条路由；每次尝试写入日志与 history 的 `attempt` 字段。
+
+### 关键配置
+
+- `tiers.*.codex.models` 按顺序列出官方候选；保留 `model` 单值也兼容。`codexFallback.providers[].models` 列出 Micu 候选，`retryOfficialMinutes`、`capacityBackoffSeconds` 和 `dailyBudgetUsd` 控制重试、退避和每日软上限。
+- `codexCircuit` 控制 capacity、服务端故障和认证故障的连续失败阈值、熔断时长及单次派发的最大切换次数；`codexResetCredits.auto` 控制是否自动使用官方额度重置券。
+- `claudePacing` 控制日线起始时间、保留比例、5h 上限、最后 36 小时窗口、`urgentMaxPercent`、过期时间和自动等待上限。未知或过期的 Claude 用量读数不会阻塞 `--claude`，但普通路由会跳过 Claude。
+- `codexPricing` 提供 Micu 花费估算的输入、缓存输入和输出单价；缺少模型单价时只有 `--ignore-budget` 会使用该模型。
 
 ```sh
 ~/.claude/agent-route/bin/agent-route status
 ~/.claude/agent-route/bin/agent-route stats --days 7
+~/.claude/agent-route/bin/agent-route route tier2 --explain
 ~/.claude/agent-route/bin/agent-route clear-cooldown
 ```
 
-`status` 查看版本、目录、额度、冷却与路由；`stats` 按 tier / 模型汇总，`--days` 只接受正整数；`clear-cooldown` 清空模型冷却及当前 Codex 路由的限额记录。
+`status` 查看版本、目录、额度、冷却与路由；`stats` 按 tier / 模型和最终路由汇总，`--days` 只接受正整数；`route <tier> --explain` 只读预演选路；`clear-cooldown` 清空模型冷却及当前 Codex 路由的限额记录。
 
 ### 日志与 footer
 
@@ -137,33 +159,6 @@ history 对应字段为 `reconnect`、`capacity`、`stall`、`stall_seconds`。�
 | `130` | 收到中断或终止信号。 |
 
 `WARNING` 不单独决定退出码，需同时查看汇报、验证结果和告警内容。
-
-## 开发与同步
-
-在仓库修改后，先完成验证、审阅差异，再提交推送，最后同步安装版：
-
-```sh
-bin/agent-route selftest
-node --test test/monitor-loop.test.mjs
-git diff --check
-git diff
-git add <本次改动的文件>
-git commit -m 'docs(readme): update usage'
-git push origin <当前任务分支>
-scripts/promote --dry-run
-scripts/promote
-~/.claude/agent-route/bin/agent-route status
-```
-
-`scripts/promote --dry-run` 显示差异并执行前置检查（包括 selftest），不会写入安装目录。正式同步前备份现有文件，写入包含提交、分支、时间和描述的 `VERSION`；安装目录的 `config.local.json`、日志及状态保留。`--skip-push-check` 仅跳过推送检查，`--force` 跳过工作区、推送和运行中派发检查，均不跳过 selftest。
-
-```sh
-scripts/promote --rollback --dry-run
-scripts/promote --rollback
-scripts/promote --rollback <promote-备份目录名>
-```
-
-回滚默认选择最近的 `promote-*` 备份，也可指定目录名；恢复前检查没有运行中的线上派发，并备份当前安装。同步或回滚后默认保留最近 10 个 `promote-*` 目录，可用 `AGENT_ROUTE_KEEP_BACKUPS` 调整；其他备份文件不自动删除。`AGENT_ROUTE_DEST`、`CLAUDE_AGENTS_DEST`、`CLAUDE_SKILLS_DEST` 分别覆盖三个安装位置，演练时应同时指向隔离目录。
 
 ## 执行方防嵌套
 

@@ -77,6 +77,7 @@ const USAGE = `usage:
   agent-route setup
   agent-route selftest
   agent-route stats [--days N]
+  agent-route route <tier1|tier2> --explain
 
 AGENT_ROUTE_HOME 覆盖 config、agents、state 和 logs 的根目录，只供 selftest 使用。
 config.local.json 可选 stateDir（支持 ~ 开头）以共享额度和冷却状态；日志仍写入 <ROOT>/logs。
@@ -1882,6 +1883,125 @@ function stats(args) {
   const width = (text) => Array.from(text).reduce((sum, char) => sum + (/\p{Script=Han}/u.test(char) ? 2 : 1), 0);
   const widths = rows[0].map((_, i) => Math.max(...rows.map((row) => width(row[i]))));
   for (const row of rows) console.log(row.map((cell, i) => cell + ' '.repeat(widths[i] - width(cell))).join('  ').trimEnd());
+
+  // 路由汇总使用最终执行方计数；routes 字段保留的是本次派发经过的候选序列，
+  // 不把同一派发的重试和切换重复计入 dispatches。
+  const routeGroups = new Map();
+  const routeFor = (record) => record.executor === 'claude'
+    ? 'Claude' : record.providers?.codex?.route ?? (record.executor === 'codex' ? 'official' : 'unknown');
+  for (const record of history) {
+    if (cutoff !== null && !(Date.parse(record.time) >= cutoff)) continue;
+    const route = routeFor(record);
+    const row = routeGroups.get(route) ?? { dispatches: 0, resetCredits: 0 };
+    row.dispatches++;
+    if (record.reset_credit && ['reset', 'alreadyRedeemed'].includes(record.reset_credit.outcome)) row.resetCredits++;
+    routeGroups.set(route, row);
+  }
+  const spend = readProviderSpend()[todayKey()] ?? {};
+  console.log('route summary');
+  console.log('route  dispatches  reset_credits  spend_today_usd');
+  for (const route of [...routeGroups.keys()].sort()) {
+    const row = routeGroups.get(route);
+    const amount = typeof spend[route] === 'number' && Number.isFinite(spend[route]) ? spend[route].toFixed(6) : '0.000000';
+    console.log(`${route}  ${row.dispatches}  ${row.resetCredits}  ${amount}`);
+  }
+  for (const [route, amount] of Object.entries(spend)) {
+    if (routeGroups.has(route)) continue;
+    const value = typeof amount === 'number' && Number.isFinite(amount) ? amount.toFixed(6) : '0.000000';
+    console.log(`${route}  0  0  ${value}`);
+  }
+  const readWeekly = (file, collection, key) => {
+    const value = readJsonFile(file, {});
+    const entry = collection ? value?.[collection]?.[key] : value;
+    const window = entry?.snapshot?.secondary ?? entry?.seven_day;
+    if (!window || typeof window.used_percent !== 'number' || !Number.isFinite(window.used_percent) ||
+      typeof window.resets_at !== 'number' || !Number.isFinite(window.resets_at)) return 'unknown';
+    return `${Math.max(0, 100 - window.used_percent).toFixed(1).replace(/\.0$/, '')}% resets ${fmtLocal(new Date(window.resets_at * 1000))}`;
+  };
+  const codexWeekly = readWeekly(CODEX_LIMIT_FILE, 'accounts', codexAccount());
+  let claudeWeekly = 'unknown';
+  const claudeState = readJsonFile(CLAUDE_USAGE_FILE, {});
+  for (const entry of Object.values(claudeState.accounts ?? {})) {
+    const candidate = entry?.seven_day;
+    if (!candidate || typeof candidate.used_percent !== 'number' || !Number.isFinite(candidate.used_percent) ||
+      typeof candidate.resets_at !== 'number' || !Number.isFinite(candidate.resets_at)) continue;
+    claudeWeekly = `${Math.max(0, 100 - candidate.used_percent).toFixed(1).replace(/\.0$/, '')}% resets ${fmtLocal(new Date(candidate.resets_at * 1000))}`;
+    break;
+  }
+  console.log(`weekly remaining: Codex ${codexWeekly}; Claude ${claudeWeekly}`);
+}
+
+function readCodexQuotaReadonly(context, model) {
+  if (context?.billingType === 'api') {
+    return readLimitEntries(PROVIDER_LIMIT_FILE, 'providers')[routeStateKey('codex', context, model)] ?? null;
+  }
+  if (context?.billingType !== 'subscription' && context) return null;
+  const account = readLimitEntries(CODEX_LIMIT_FILE, 'accounts')[codexAccount()] ?? null;
+  if (account) return account;
+  const until = activeUntil(readCooldown(), LIMIT_KEY);
+  return until ? { type: 'unknown', resets_at: until.getTime() / 1000 } : null;
+}
+
+function routeExplain(tier, config, context) {
+  const tierCfg = config.tiers?.[tier];
+  const officialModels = context.codex?.billingType === 'api' && tier === 'tier2'
+    ? [tierCfg.codex.apiModel ?? tierCfg.codex.models?.[0] ?? tierCfg.codex.model]
+    : tierCfg.codex.models ?? [tierCfg.codex.model];
+  const candidates = [];
+  for (const model of officialModels.filter(Boolean)) candidates.push({ kind: 'official', label: `official/${model}`, model, context: context.codex });
+  const claude = resolveClaudeModel(tier, context.claude, config);
+  candidates.push({ kind: 'claude', label: `Claude/${claude.model}`, model: claude.model, context: context.claude });
+  for (const fallback of context.codexFallbacks ?? []) {
+    if (fallback.providerId === context.codex?.providerId) continue;
+    for (const item of fallback.config?.models?.[tier] ?? []) {
+      candidates.push({ kind: 'micu', label: `${fallback.providerName ?? 'Micu'}/${item.model}`, model: item.model,
+        context: fallback, config: fallback.config });
+    }
+  }
+  const reasonFor = (candidate) => {
+    if (candidate.kind === 'claude') {
+      if (context.claude?.billingType === 'unknown') return 'provider/billing unknown';
+      if (context.claude?.billingType !== 'subscription') return null;
+      const settings = claudePacingConfig(config);
+      const now = Date.now();
+      const stored = readStoredClaudeUsage(context.claude);
+      const age = stored ? now - Date.parse(stored.observed_at) : Infinity;
+      const usable = stored && (stored.seven_day?.resets_at * 1000 > now || stored.five_hour?.resets_at * 1000 > now);
+      const usage = stored && age >= 0 && age <= settings.staleMinutes * 60_000 && usable ? stored : null;
+      const decision = claudePacingDecision(settings, usage,
+        readJsonFile(CLAUDE_PACING_FILE, {}).accounts?.[claudeUsageKey(context.claude)]?.u0, now, 'normal');
+      return decision.allowed ? null : `blocked: ${decision.reason}`;
+    }
+    if (candidate.context?.billingType === 'unknown') return 'blocked: provider/billing unknown';
+    if (modelUnavailable(candidate, candidate.model)) return 'blocked: model-unavailable';
+    const quota = readCodexQuotaReadonly(candidate.context, candidate.model);
+    if (limitActive(quota)) return `blocked: ${quota.type ?? 'quota'}${quota.resets_at ? ` until ${fmtLocal(new Date(quota.resets_at * 1000))}` : ''}`;
+    if (candidate.kind === 'official' && candidate.context?.billingType === 'subscription') {
+      const reserve = reserveLimitFromSnapshot(quota?.snapshot, codexQuotaThresholds(config));
+      if (reserve) return `blocked: quota reserve ${reserve.type}${reserve.resets_at ? ` until ${fmtLocal(new Date(reserve.resets_at * 1000))}` : ''}`;
+    }
+    const circuit = circuitEntry(circuitKeyFor(candidate));
+    const openUntil = Number(circuit.opened_at ?? 0) * 1000 + Number(circuit.open_seconds ?? 0) * 1000;
+    if (circuit.state === 'open' && openUntil > Date.now()) return `blocked: circuit open until ${fmtLocal(new Date(openUntil))}`;
+    if (circuit.state === 'half_open' && circuit.probe?.pid && pidAlive(circuit.probe.pid) && circuit.probe.pid !== process.pid) return 'blocked: circuit probing';
+    if (candidate.kind === 'micu') {
+      const label = candidate.context?.providerName ?? candidate.config?.label ?? 'Micu';
+      const spent = providerSpend(label);
+      const budget = codexFallbackConfig(config).dailyBudgetUsd;
+      if (spent >= budget) return `blocked: budget ${spent.toFixed(4)} >= ${budget}`;
+      if (!config.codexPricing?.[candidate.model]) return 'blocked: price-unknown';
+    }
+    return null;
+  };
+  console.log(`route explain: ${tier}`);
+  console.log('order: official -> Claude -> Micu');
+  let selected = null;
+  candidates.forEach((candidate, index) => {
+    const reason = reasonFor(candidate);
+    if (!reason && !selected) selected = candidate;
+    console.log(`candidate ${index + 1}: ${candidate.label} | ${reason ?? 'available'}`);
+  });
+  console.log(`selected: ${selected?.label ?? 'none'}`);
 }
 
 // 显式导出 selftest 使用的运行时依赖，按需传入以避免循环导入。
@@ -1901,6 +2021,16 @@ if (cmd === 'selftest') {
 }
 if (cmd === 'stats') {
   stats(argv.slice(1));
+  process.exit(0);
+}
+if (cmd === 'route') {
+  if (argv.length !== 3 || !['tier1', 'tier2'].includes(argv[1]) || argv[2] !== '--explain') {
+    die('route 只接受 <tier1|tier2> --explain');
+  }
+  const routeConfig = readConfig();
+  const routeContext = await resolveDispatchContext(routeConfig);
+  if (routeContext.enabled && routeContext.codex.billingType !== 'unknown') CODEX_HOME = routeContext.codex.configDir;
+  routeExplain(argv[1], routeConfig, routeContext);
   process.exit(0);
 }
 if (cmd === 'setup') {
@@ -1994,7 +2124,8 @@ if (cmd === 'status') {
     const gate = claudeGateFor(config, claude, process.cwd(), 'normal', { probe: false });
     const usage = gate.usage;
     console.log(`claude weekly: ${usage?.seven_day ? `${usage.seven_day.used_percent}% resets ${fmtLocal(new Date(usage.seven_day.resets_at * 1000))}` : 'unknown (no fresh usage reading)'}; 5h: ${usage?.five_hour ? `${usage.five_hour.used_percent}%` : 'unknown'}`);
-    console.log(`claude pacing: ${gate.allowed ? 'allow' : 'block'} (${gate.reason})${gate.line !== undefined ? `; daily line ${gate.line}% from u0 ${gate.u0}%` : ''}; urgent cap ${settings.urgentMaxPercent}%${usage ? `; observed ${usage.observed_at}` : ''}`);
+    const dailyRemaining = gate.line !== undefined && gate.used !== null ? Math.max(0, Math.round((gate.line - gate.used) * 10) / 10) : null;
+    console.log(`claude pacing: ${gate.allowed ? 'allow' : 'block'} (${gate.reason})${gate.line !== undefined ? `; daily line ${gate.line}% from u0 ${gate.u0}%; remaining ${dailyRemaining}%` : '; daily line unknown; remaining unknown'}; urgent cap ${settings.urgentMaxPercent}%${usage ? `; observed ${usage.observed_at}` : ''}`);
   } else console.log(`claude weekly: ${claude?.billingType === 'api' ? 'not applicable (API)' : 'unknown (provider not verified)'}`);
   if (config.claudeWeeklyThreshold !== undefined) console.log('claude weekly threshold: ignored (replaced by claudePacing)');
   for (const tier of Object.keys(config.tiers ?? {})) {

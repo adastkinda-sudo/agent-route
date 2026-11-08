@@ -2964,6 +2964,44 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           fs.rmSync(settingsFile, { force: true });
         }
       })],
+      [105, 'status、route explain 与按路由 stats 只读可观测', () => withMicuRoutes(async () => {
+        const localConfigPath = path.join(home, 'config.local.json');
+        fs.writeFileSync(localConfigPath, JSON.stringify({ codexBin: config.codexBin, claudeBin: config.claudeBin }));
+        const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date());
+        writeJSON(path.join(home, 'state', 'provider-spend.json'), { [today]: { Micu: 1.25 } });
+        writeJSON(path.join(home, 'state', 'codex-limit.json'), { accounts: { 'selftest-account': {
+          snapshot: { secondary: { used_percent: 40, resets_at: Math.floor(Date.now() / 1000) + 3600 } },
+        } } });
+        writeJSON(path.join(home, 'state', 'claude-usage.json'), { accounts: { default: {
+          seven_day: { used_percent: 30, resets_at: Math.floor(Date.now() / 1000) + 7200 },
+        } } });
+        const before = JSON.stringify({
+          state: fs.readdirSync(path.join(home, 'state')).sort().map((name) => [name, fs.readFileSync(path.join(home, 'state', name), 'utf8')]),
+          invocations: fs.existsSync(path.join(home, 'stub-invocations.jsonl')) ? fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8') : '',
+        });
+        const explained = spawnSync(process.execPath, [SCRIPT_PATH, 'route', 'tier2', '--explain'], { env, cwd: home, encoding: 'utf8', timeout: 15000 });
+        exitIs(explained, 0);
+        check(explained.stdout.includes('route explain: tier2') && explained.stdout.includes('order: official -> Claude -> Micu') &&
+          explained.stdout.includes('candidate 1: official/gpt-6.1-terra') && explained.stdout.includes('selected: official/gpt-6.1-terra'),
+        `route explain 输出不符: ${explained.stdout}`);
+        noRouteSecrets(explained.stdout + explained.stderr);
+        const after = JSON.stringify({
+          state: fs.readdirSync(path.join(home, 'state')).sort().map((name) => [name, fs.readFileSync(path.join(home, 'state', name), 'utf8')]),
+          invocations: fs.existsSync(path.join(home, 'stub-invocations.jsonl')) ? fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8') : '',
+        });
+        check(before === after, 'route explain 不应写入状态或派发执行方');
+        fs.writeFileSync(historyPath, [
+          { time: new Date().toISOString(), executor: 'codex', providers: { codex: { route: 'official' } }, reset_credit: { outcome: 'reset' } },
+          { time: new Date().toISOString(), executor: 'codex', providers: { codex: { route: 'Micu' } } },
+          { time: new Date().toISOString(), executor: 'claude' },
+        ].map((row, index) => JSON.stringify({ log_id: `stage5-${index}`, tier: 'tier2', model: 'fixture', effort: 'medium', monitor: false,
+          status: 'complete', ...row })).join('\n') + '\n');
+        const statsResult = spawnSync(process.execPath, [SCRIPT_PATH, 'stats'], { env, cwd: home, encoding: 'utf8', timeout: 15000 });
+        exitIs(statsResult, 0);
+        check(statsResult.stdout.includes('route summary') && /Micu\s+\d+\s+0\s+1\.250000/.test(statsResult.stdout) &&
+          /official\s+\d+\s+1\s+0\.000000/.test(statsResult.stdout) && statsResult.stdout.includes('weekly remaining: Codex 60%') &&
+          statsResult.stdout.includes('Claude 70%'), `stats 路由汇总不符: ${statsResult.stdout}`);
+      })],
     );
     for (const [id, name, test] of scenarios) {
       try {
