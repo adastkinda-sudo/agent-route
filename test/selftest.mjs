@@ -3002,6 +3002,39 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           /official\s+\d+\s+1\s+0\.000000/.test(statsResult.stdout) && statsResult.stdout.includes('weekly remaining: Codex 60%') &&
           statsResult.stdout.includes('Claude 70%'), `stats 路由汇总不符: ${statsResult.stdout}`);
       })],
+      [106, 'Claude unifiedWindows 字段缺失或格式变化时普通路由降级', () => withMicuRoutes(async () => {
+        useBothSubscriptions();
+        const usagePath = path.join(home, 'stub-claude-usage.json');
+        const writePartialUsage = (fiveHour) => {
+          fs.rmSync(path.join(home, 'state', 'claude-usage.json'), { force: true });
+          const now = Math.floor(Date.now() / 1000);
+          writeJSON(usagePath, { ...(fiveHour === undefined ? {} : { five_hour: fiveHour }),
+            seven_day: { utilization: 0.2, resetsAt: now + 3 * 86400 } });
+        };
+        const limited = () => {
+          const state = seedLimit();
+          appMode('limited', state.resets_at);
+          return state;
+        };
+        // 缺少 five_hour 时，普通派发不能把未知 5h 用量当作 0% 放行；应直接转 Micu。
+        limited();
+        writePartialUsage(undefined);
+        const missing = run('complete', [], true, { preserveCooldown: true });
+        exitIs(missing, 0);
+        check(missing.record.executor === 'codex' && missing.record.providers.codex.route === 'Micu' &&
+          /claude pacing\[normal\]: block usage-stale/.test(allLogs(missing)), '缺少 five_hour 时普通路由未降级');
+        // 应急通道沿用“只检查读得到的限额”：周额度可读时允许 --claude。
+        const urgent = run('complete', ['--claude'], true, { preserveCooldown: true });
+        exitIs(urgent, 0);
+        check(urgent.record.executor === 'claude', '缺少 5h 字段时 --claude 不应阻断应急通道');
+        // 字段格式变化同样降级；weekly 仍可读，但 five_hour 的 utilization 非数值。
+        limited();
+        writePartialUsage({ utilization: '20%', resetsAt: Math.floor(Date.now() / 1000) + 3 * 3600 });
+        const malformed = run('complete', [], true, { preserveCooldown: true });
+        exitIs(malformed, 0);
+        check(malformed.record.executor === 'codex' && malformed.record.providers.codex.route === 'Micu' &&
+          /claude pacing\[normal\]: block usage-stale/.test(allLogs(malformed)), '用量字段格式变化时普通路由未降级');
+      })],
     );
     for (const [id, name, test] of scenarios) {
       try {

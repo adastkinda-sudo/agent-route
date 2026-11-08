@@ -41,6 +41,9 @@ const PROVIDER_SPEND_FILE = path.join(STATE_DIR, 'provider-spend.json');
 const CIRCUIT_FILE = path.join(STATE_DIR, 'circuit.json');
 const MODEL_UNAVAILABLE_FILE = path.join(STATE_DIR, 'model-unavailable.json');
 let CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+let redactSecrets = (value) => String(value ?? '')
+  .replace(/(Bearer\s+)[^\s\r\n]+/gi, '$1[redacted]')
+  .replace(/((?:OPENAI|CODEX|ANTHROPIC|AGENT_ROUTE_PROVIDER)[A-Z_]*(?:KEY|TOKEN|SECRET)\s*[=:]\s*)([^\s,}\]"']+)/gi, '$1[redacted]');
 
 const REPORT_FOOTER = `
 完成后只输出以下格式的简短汇报（不超过 30 行），不要输出过程：
@@ -245,6 +248,10 @@ function logCircuit(candidate, from, to, reason, routeModel = candidate?.model) 
 
 // 判断路由能否使用；claim 为真且处于 HalfOpen 时占用唯一探测名额。
 function circuitGate(candidate, { claim = false, timeoutMinutes = 90 } = {}) {
+  return withRouteLockSync(() => circuitGateUnlocked(candidate, { claim, timeoutMinutes }));
+}
+
+function circuitGateUnlocked(candidate, { claim = false, timeoutMinutes = 90 } = {}) {
   const key = circuitKeyFor(candidate);
   const data = readCircuit();
   const entry = circuitEntry(key, data);
@@ -277,6 +284,10 @@ function retryAfterSeconds(text) {
 
 // 记录当前路由的一次失败；返回转换后的状态。soleRoute 为真时只计数，不打开熔断。
 function recordCircuitFailure(category, { retryAfter = null, soleRoute = false, text = '' } = {}) {
+  return withRouteLockSync(() => recordCircuitFailureUnlocked(category, { retryAfter, soleRoute, text }));
+}
+
+function recordCircuitFailureUnlocked(category, { retryAfter = null, soleRoute = false, text = '' } = {}) {
   const kind = circuitCategory(category, text);
   if (!kind || !activeCodexContext) return null;
   const settings = circuitSettings(config);
@@ -307,6 +318,10 @@ function recordCircuitFailure(category, { retryAfter = null, soleRoute = false, 
 }
 
 function circuitSuccess() {
+  return withRouteLockSync(circuitSuccessUnlocked);
+}
+
+function circuitSuccessUnlocked() {
   if (!activeCodexContext) return;
   const candidate = { kind: activeRouteKind, context: activeCodexContext, model };
   const key = circuitKeyFor(candidate);
@@ -583,7 +598,9 @@ async function sessionTelemetry(id, since, includeLimits) {
 // initialize 失败返回 null；超时或会话中断时返回已收到的部分响应。
 function appServerRequests(config, requests, { stopOnError = false } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(config.codexBin ?? 'codex', ['app-server'], { env: { ...process.env, CODEX_HOME }, stdio: ['pipe', 'pipe', 'ignore'], detached: true });
+    const appEnv = { ...process.env, CODEX_HOME };
+    delete appEnv.AGENT_ROUTE_PROVIDER_KEY;
+    const child = spawn(config.codexBin ?? 'codex', ['app-server'], { env: appEnv, stdio: ['pipe', 'pipe', 'ignore'], detached: true });
     const responses = [];
     let pending = '';
     let finished = false;
@@ -867,11 +884,12 @@ function probeClaudeUsage(config, context, cwd, env = process.env) {
 }
 
 // 返回新鲜的用量读数：存档不超过 probeMinutes 直接用，否则探测一次；探测失败时存档不超过 staleMinutes 仍可用。
-function readClaudeUsage(config, context, cwd, { probe = true, now = Date.now() } = {}) {
+function readClaudeUsage(config, context, cwd, { probe = true, now = Date.now(), allowPartial = false } = {}) {
   const settings = claudePacingConfig(config);
   const stored = readStoredClaudeUsage(context);
   const age = stored ? now - Date.parse(stored.observed_at) : Infinity;
-  const usable = (entry) => entry && (entry.seven_day?.resets_at * 1000 > now || entry.five_hour?.resets_at * 1000 > now);
+  const usable = (entry) => entry?.seven_day && entry.seven_day.resets_at * 1000 > now &&
+    (allowPartial || entry.five_hour?.resets_at * 1000 > now);
   if (stored && age >= 0 && age <= settings.probeMinutes * 60_000 && usable(stored)) return stored;
   if (probe) {
     const fresh = probeClaudeUsage(config, context, cwd);
@@ -959,7 +977,10 @@ function claudePacingDecision(settings, usage, u0, now, mode = 'normal') {
   const five = usage?.five_hour ?? null;
   const fiveUsed = five && five.resets_at * 1000 > now ? five.used_percent : 0;
   const base = { used: week?.used_percent ?? null, fiveHour: fiveUsed, weekResets: week?.resets_at ?? null };
-  if (!usage || !week) return { ...base, allowed: mode !== 'normal', reason: mode === 'normal' ? 'usage-stale' : 'usage-unavailable', retryAt: null };
+  if (!usage || !week) {
+    return { ...base, allowed: mode !== 'normal', reason: mode === 'normal' ? 'usage-stale' : 'usage-unavailable', retryAt: null };
+  }
+  if (mode === 'normal' && !five) return { ...base, allowed: false, reason: 'usage-stale', retryAt: null };
   const remainingMs = week.resets_at * 1000 - now;
   if (mode !== 'normal') {
     if (week.used_percent >= settings.urgentMaxPercent) {
@@ -991,7 +1012,7 @@ function claudePacingDecision(settings, usage, u0, now, mode = 'normal') {
 function claudeGateFor(config, context, cwd, mode, { probe = true, now = Date.now() } = {}) {
   if (context?.billingType !== 'subscription') return { allowed: true, reason: 'not-subscription', applies: false };
   const settings = claudePacingConfig(config);
-  const usage = readClaudeUsage(config, context, cwd, { probe, now });
+  const usage = readClaudeUsage(config, context, cwd, { probe, now, allowPartial: mode !== 'normal' });
   const u0 = usage && mode === 'normal' && probe ? claudeDayStart(context, usage, settings, now)?.u0
     : readJsonFile(CLAUDE_PACING_FILE, {}).accounts?.[claudeUsageKey(context)]?.u0;
   return { ...claudePacingDecision(settings, usage, u0, now, mode), applies: true, observed_at: usage?.observed_at ?? null, usage };
@@ -1375,19 +1396,26 @@ function readProviderSpend() {
   return readJsonFile(PROVIDER_SPEND_FILE, {});
 }
 
-function providerSpend(label) {
+function providerSpendUnlocked(label) {
   const state = readProviderSpend();
   const day = state[todayKey()];
   return typeof day?.[label] === 'number' && Number.isFinite(day[label]) ? day[label] : 0;
 }
 
+function providerSpend(label) {
+  return withRouteLockSync(() => providerSpendUnlocked(label));
+}
+
 function addProviderSpend(label, amount) {
   if (!Number.isFinite(amount) || amount < 0) return;
-  const state = readProviderSpend();
-  const day = state[todayKey()] ?? {};
-  day[label] = (typeof day[label] === 'number' ? day[label] : 0) + amount;
-  state[todayKey()] = day;
-  writeJsonAtomic(PROVIDER_SPEND_FILE, state);
+  return withRouteLockSync(() => {
+    const state = readProviderSpend();
+    const day = state[todayKey()] ?? {};
+    day[label] = (typeof day[label] === 'number' ? day[label] : 0) + amount;
+    state[todayKey()] = day;
+    writeJsonAtomic(PROVIDER_SPEND_FILE, state);
+    return day[label];
+  });
 }
 
 function estimateProviderCost(modelName, usage, config, multiplier = 1, invalid = false) {
@@ -1779,7 +1807,7 @@ function readHistory() {
 
 function appendHistory(record) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.appendFileSync(HISTORY_FILE, JSON.stringify(record) + '\n');
+  fs.appendFileSync(HISTORY_FILE, redactSecrets(JSON.stringify(record)) + '\n');
 }
 
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1966,7 +1994,8 @@ function routeExplain(tier, config, context) {
       const now = Date.now();
       const stored = readStoredClaudeUsage(context.claude);
       const age = stored ? now - Date.parse(stored.observed_at) : Infinity;
-      const usable = stored && (stored.seven_day?.resets_at * 1000 > now || stored.five_hour?.resets_at * 1000 > now);
+      const usable = stored?.five_hour && stored?.seven_day && stored.seven_day.resets_at * 1000 > now &&
+        stored.five_hour.resets_at * 1000 > now;
       const usage = stored && age >= 0 && age <= settings.staleMinutes * 60_000 && usable ? stored : null;
       const decision = claudePacingDecision(settings, usage,
         readJsonFile(CLAUDE_PACING_FILE, {}).accounts?.[claudeUsageKey(context.claude)]?.u0, now, 'normal');
@@ -2140,9 +2169,11 @@ if (cmd === 'clear-cooldown') {
   const config = readConfig();
   const context = await resolveDispatchContext(config);
   if (context.enabled && context.codex.billingType !== 'unknown') CODEX_HOME = context.codex.configDir;
-  writeCooldown({});
-  writeCircuit({});
-  writeJsonAtomic(MODEL_UNAVAILABLE_FILE, {});
+  withRouteLockSync(() => {
+    writeCooldown({});
+    writeCircuit({});
+    writeJsonAtomic(MODEL_UNAVAILABLE_FILE, {});
+  });
   for (const [tier, tierCfg] of Object.entries(config.tiers ?? {})) {
     const model = resolveCodexModel(tier, context.codex, tierCfg);
     const state = readCodexQuota(context.codex, model);
@@ -2335,20 +2366,45 @@ let lastFailureText = '';
 const skippedRoutes = [];
 const redactions = new Set();
 const routesTried = [];
+function collectRouteSecrets(value, key = '') {
+  if (typeof value === 'string') {
+    if (value.length >= 4 && (/(?:key|token|secret|bearer|password|auth|base_url|endpoint)/i.test(key) || /^https?:\/\//i.test(value))) {
+      redactions.add(value);
+    }
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  for (const [childKey, childValue] of Object.entries(value)) collectRouteSecrets(childValue, childKey);
+}
+collectRouteSecrets(dispatchContext.codex?.credentials);
+for (const [key, value] of Object.entries(process.env)) collectRouteSecrets(value, key);
+for (const fallback of dispatchContext.codexFallbacks ?? []) {
+  collectRouteSecrets(fallback.runtime?.key, 'key');
+  collectRouteSecrets(fallback.runtime?.baseUrl, 'base_url');
+}
+redactSecrets = (value) => {
+  let text = String(value ?? '');
+  for (const secret of redactions) if (secret) text = text.split(secret).join('[redacted]');
+  return text
+    .replace(/(Bearer\s+)[^\s\r\n]+/gi, '$1[redacted]')
+    .replace(/((?:OPENAI|CODEX|ANTHROPIC|AGENT_ROUTE_PROVIDER)[A-Z_]*(?:KEY|TOKEN|SECRET)\s*[=:]\s*)([^\s,}\]"']+)/gi, '$1[redacted]');
+};
+function appendLog(value) {
+  try { fs.appendFileSync(logPath, redactSecrets(value)); } catch {}
+}
 const log = (s) => {
-  let text = s.endsWith('\n') ? s : s + '\n';
-  for (const secret of redactions) text = text.split(secret).join('[redacted]');
-  fs.appendFileSync(logPath, text);
+  const text = redactSecrets(s);
+  appendLog(text.endsWith('\n') ? text : text + '\n');
 };
 // macOS 系统通知；测试通过 AGENT_ROUTE_NOTIFY_FILE 改为写文件，不弹出通知。通知失败不影响派发。
 function notify(event, message) {
   log(`notify: ${event}`);
   try {
     if (process.env.AGENT_ROUTE_NOTIFY_FILE) {
-      fs.appendFileSync(process.env.AGENT_ROUTE_NOTIFY_FILE, JSON.stringify({ event, message }) + '\n');
+      fs.appendFileSync(process.env.AGENT_ROUTE_NOTIFY_FILE, JSON.stringify({ event, message: redactSecrets(message) }) + '\n');
     } else if (process.platform === 'darwin') {
       spawnSync('osascript', ['-e', 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run',
-        `agent-route: ${event}`, message], { timeout: 5000, stdio: 'ignore' });
+        `agent-route: ${event}`, redactSecrets(message)], { timeout: 5000, stdio: 'ignore' });
     }
   } catch { /* 通知只是提示 */ }
 }
@@ -2501,10 +2557,11 @@ function logExecArgs(bin, args) {
 }
 
 function setActiveRoute(candidate, reason = null) {
+  const safeReason = reason === null ? null : redactSecrets(String(reason).slice(0, 120));
   activeRouteKind = candidate.kind;
   if (candidate.kind === 'claude') {
-    routesTried.push({ route: 'claude', model: candidate.model, ...(reason ? { reason: String(reason).slice(0, 120) } : {}) });
-    if (reason) log(`route: claude ${candidate.model} (${reason})`);
+    routesTried.push({ route: 'claude', model: candidate.model, ...(safeReason ? { reason: safeReason } : {}) });
+    if (safeReason) log(`route: claude ${candidate.model} (${safeReason})`);
     return;
   }
   activeCodexContext = candidate.context;
@@ -2515,10 +2572,10 @@ function setActiveRoute(candidate, reason = null) {
   const routeName = candidate.kind === 'micu' ? (candidate.context?.providerName ?? 'Micu') : 'official';
   const last = routesTried.at(-1);
   if (!last || last.route !== routeName || last.model !== candidate.model) {
-    routesTried.push({ route: routeName, model: candidate.model, ...(reason ? { reason: String(reason).slice(0, 120) } : {}) });
+    routesTried.push({ route: routeName, model: candidate.model, ...(safeReason ? { reason: safeReason } : {}) });
   }
-  if (reason) {
-    log(`route: ${candidate.kind} ${candidate.context?.providerName ?? 'Codex'} ${model} (${reason})`);
+  if (safeReason) {
+    log(`route: ${candidate.kind} ${candidate.context?.providerName ?? 'Codex'} ${model} (${safeReason})`);
     log(`providers: ${JSON.stringify({ codex: routeSafeContext(), claude: safeRouteContext(dispatchContext.claude) })}`);
   }
 }
@@ -2837,6 +2894,7 @@ function readOnlyWarning() {
 function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
+  const safeText = redactSecrets(text);
   const lines = full.split('\n');
   const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
@@ -2852,7 +2910,7 @@ function compactLog(text) {
   }
   const out = [...header, `log-mode: summary（完整过程日志已删除）`,
     ...reconnectLines.map((line) => `codex stream: ${line}`), `commands: ${commands.length}`, ...commands,
-    '--- 最终汇报 ---', text.replace(/\s+$/, '')];
+    '--- 最终汇报 ---', safeText.replace(/\s+$/, '')];
   try { fs.writeFileSync(logPath, out.join('\n') + '\n'); } catch {}
 }
 
@@ -2909,7 +2967,7 @@ function runVerify(command) {
     let pending = '';
     const collect = (chunk) => {
       const text = String(chunk);
-      fs.appendFileSync(logPath, text);
+      appendLog(text);
       const parts = text.split('\n');
       for (let i = 0; i < parts.length; i++) {
         pending = Array.from(pending + parts[i]).slice(0, 200).join('');
@@ -2955,11 +3013,12 @@ function verifySummary(result) {
 }
 
 function recordFinish(status, code, output, tokens, actualModel = model, actualEffort = effort, elapsed = Math.round((Date.now() - startedAt) / 1000)) {
+  const safeOutput = redactSecrets(output);
   const record = {
     time: new Date(startedAt).toISOString(), tier, model: actualModel, effort: actualEffort,
     monitor, write, fallback: usedFallback, status, exit_code: code, elapsed, tokens: numeric(tokens), session,
     reconnect: reconnectCount, capacity: capacityCount, stall: codexStall.count, stall_seconds: codexStall.seconds,
-    log_id: path.basename(base), cwd, prompt_chars: charCount(promptText), stdout_chars: charCount(output), resumed_from: resumeArg,
+    log_id: path.basename(base), cwd, prompt_chars: charCount(promptText), stdout_chars: charCount(safeOutput), resumed_from: resumeArg,
     verify: verifyResult,
     commit: commitHash,
     executor,
@@ -2972,7 +3031,11 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
   if (verifyResult) log(`verify result: ${JSON.stringify(verifyResult)}`);
   log(`finish: status=${status} tokens=${tokens ?? '?'} elapsed=${elapsed} session=${session ?? '?'} exit_code=${code} stdout_chars=${record.stdout_chars} model=${actualModel} effort=${actualEffort ?? '?'} fallback=${usedFallback} executor=${executor} reconnect=${reconnectCount} capacity=${capacityCount} stall=${codexStall.count} stall_seconds=${codexStall.seconds}${commitHash ? ` commit=${commitHash}` : ''}`);
   appendHistory(record);
-  progressRecord = { record, text: output };
+  progressRecord = { record, text: safeOutput };
+}
+
+function emitOutput(output, callback) {
+  process.stdout.write(redactSecrets(output), callback);
 }
 
 async function finishReport(text, tokens, actualModel = model, actualEffort = effort, executor = 'codex') {
@@ -3022,7 +3085,7 @@ async function finishReport(text, tokens, actualModel = model, actualEffort = ef
     ? compactReport(text) : null;
   const output = retry ? '' : compactPaths(summary === null ? rawOutput : summary + verification + lines.join('\n') + '\n');
   recordFinish(status ?? 'n/a', code, output, tokens, actualModel, actualEffort, elapsed);
-  if (summary !== null) progressRecord.text = compactPaths(text);
+  if (summary !== null) progressRecord.text = compactPaths(redactSecrets(text));
   if (config.logMode === 'summary' && code === 0 && !warning) compactLog(report);
   if (retry) {
     const previous = path.basename(base);
@@ -3039,13 +3102,14 @@ async function finishReport(text, tokens, actualModel = model, actualEffort = ef
     codexResume = true;
     return runCodex();
   }
-  process.stdout.write(output, () => process.exit(code));
+  emitOutput(output, () => process.exit(code));
 }
 
 function fallback(reason) {
   usedFallback = true;
-  log(`fallback: ${reason}`);
-  let oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  const safeReason = redactSecrets(reason);
+  log(`fallback: ${safeReason}`);
+  let oneLine = redactSecrets(String(reason).replace(/\s+/g, ' ').trim());
   if (!noClaude) {
     const gate = claudeGate(claudeMode, { refresh: true });
     if (gate.allowed) return runClaude(oneLine);
@@ -3061,35 +3125,37 @@ prompt-file: ${fullPromptPath}
 log: ${logPath}
 ${recoveryFlow && attemptPhase ? `attempt: ${attemptPhase}\n` : ''}`;
   recordFinish('fallback', 10, output, codexTokens);
-  process.stdout.write(output, () => process.exit(10));
+  emitOutput(output, () => process.exit(10));
 }
 
 function failResume(reason) {
-  const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  const oneLine = redactSecrets(String(reason).replace(/\s+/g, ' ').trim());
   log(`resume failure: ${oneLine}`);
   const output = `ERROR\ntier: ${tier}\nreason: ${oneLine}\nwrite: ${write}\ncwd: ${cwd}\nprompt-file: ${fullPromptPath}\nlog: ${logPath}\nresumed: ${resumeArg}\n`;
   recordFinish('error', 12, output, codexTokens);
-  process.stdout.write(output, () => process.exit(12));
+  emitOutput(output, () => process.exit(12));
 }
 
 function recordCodexFailure(reason) {
-  const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  const oneLine = redactSecrets(String(reason).replace(/\s+/g, ' ').trim());
   log(`attempt failure: ${attemptPhase ?? 'resume'}: ${oneLine}`);
   recordFinish('error', 12, '', codexTokens);
 }
 
 function stopUnknownRoute(app) {
   executor = app;
-  const reason = dispatchContext[app].diagnostics.join(', ') || 'billing-unverified';
+  const reason = redactSecrets(dispatchContext[app].diagnostics.join(', ') || 'billing-unverified');
   const output = `ERROR\ntier: ${tier}\nreason: ${app} 服务商或计费类型无法确认 (${reason})\nlog: ${logPath}\n`;
   recordFinish('error', 12, output, null);
-  process.stdout.write(output, () => process.exit(12));
+  emitOutput(output, () => process.exit(12));
 }
 
 function writeModelCooldown() {
-  const data = readCooldown();
-  data[routeStateKey('codex', dispatchContext.codex, model)] = new Date(Date.now() + cooldownMs).toISOString();
-  writeCooldown(data);
+  withRouteLockSync(() => {
+    const data = readCooldown();
+    data[routeStateKey('codex', dispatchContext.codex, model)] = new Date(Date.now() + cooldownMs).toISOString();
+    writeCooldown(data);
+  });
 }
 
 function limitStop(state, claudeLimit = null, actualModel = model, actualEffort = effort) {
@@ -3102,7 +3168,7 @@ function limitStop(state, claudeLimit = null, actualModel = model, actualEffort 
   const reason = claudeLimit ? `${codexLabel}，${codexReset}；Claude 用量限额，${claudeReset}` : `${codexLabel}，${codexReset} 恢复；已指定 --no-claude`;
   const output = `LIMIT\ntier: ${tier}\nreason: ${reason}\nresets: ${resets?.toISOString() ?? 'unknown'}\n${claudeLimit ? `claude-resets: ${claudeLimit.resets_at ? new Date(claudeLimit.resets_at * 1000).toISOString() : 'unknown'}\n` : ''}write: ${write}\ncwd: ${cwd}\nprompt-file: ${fullPromptPath}\nlog: ${logPath}\n${resumeArg !== null ? `resumed: ${resumeArg}\n` : ''}`;
   recordFinish('limit', 15, output, codexTokens, actualModel, actualEffort);
-  process.stdout.write(output, () => process.exit(15));
+  emitOutput(output, () => process.exit(15));
 }
 
 const PARTIAL_WORK_REMINDER = '工作区可能已有上一个执行方的部分改动，先查看 git diff。';
@@ -3143,7 +3209,7 @@ function rebuildPromptFromResume() {
 
 // 3.2a：官方额度受限时先判断是否用券；用券并确认重置后返回 true，并在官方路由上重跑本次任务。
 // 其他情况（未触发、无券、结果为 nothingToReset / noCredit、重置未生效、读取失败）返回 false，由调用方转 Micu。
-// 每次派发最多尝试一次。并发派发的锁留给阶段 4。
+// 每次派发最多尝试一次；判断、调用和确认在 route.lock 内完成。
 async function tryResetCredit(state, { started }) {
   const settings = codexResetCreditsConfig(config);
   const official = activeRouteKind === 'official' && (!activeCodexContext || activeCodexContext.billingType === 'subscription');
@@ -3274,7 +3340,7 @@ prompt-file: ${fullPromptPath}
 log: ${logPath}
 ${resumeArg !== null ? `resumed: ${resumeArg}\n` : ''}`;
   recordFinish('limit', 15, output, codexTokens);
-  process.stdout.write(output, () => process.exit(15));
+  emitOutput(output, () => process.exit(15));
 }
 
 // 等待结束后从头重新选路（熔断、限额、用量线都重新判断）。
@@ -3361,7 +3427,7 @@ function routeFailureHandled(classification, reason) {
 }
 
 function switchRoute(reason, state = null, options = {}) {
-  const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  const oneLine = redactSecrets(String(reason).replace(/\s+/g, ' ').trim());
   if (routeSwitches >= circuitSettings(config).maxRouteSwitches) return false;
   const next = nextCandidate(oneLine, options);
   if (!next) return false;
@@ -3385,7 +3451,7 @@ function switchRoute(reason, state = null, options = {}) {
 
 // 续跑时 Codex 失败：同 session 重试 1 次 → 新 Codex 线程最多 2 次 → 写冷却并交给 Claude（--no-claude 输出 FALLBACK）。
 function failCodex(reason, failureContext = {}) {
-  const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  const oneLine = redactSecrets(String(reason).replace(/\s+/g, ' ').trim());
   const classification = failureContext.classification ?? classifyCodexFailure(failureContext.tail ?? reason,
     failureContext.code ?? 1, failureContext.telemetry ?? {});
   if (!failureContext.classified) {
@@ -3441,18 +3507,18 @@ function runClaude(codexReason, resume = false, spawnRetried = false) {
   const env = { ...claudeEnvironment(dispatchContext.claude), AGENT_ROUTE_DEPTH: '1' };
 
   const failClaude = (reason) => {
-    const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+    const oneLine = redactSecrets(String(reason).replace(/\s+/g, ' ').trim());
     log(`claude failure: ${oneLine}`);
     const output = `ERROR
 tier: ${tier}
-codex: ${codexReason}
+codex: ${redactSecrets(codexReason)}
 claude: ${oneLine}
 cwd: ${cwd}
 prompt-file: ${fullPromptPath}
 log: ${logPath}
 `;
     recordFinish('error', 12, output, codexTokens, claudeModel, claudeEffort);
-    process.stdout.write(output, () => process.exit(12));
+    emitOutput(output, () => process.exit(12));
   };
 
   if (!refreshProgramConfig(config, 'claude', false)) return failClaude(missingProgram('claude'));
@@ -3476,7 +3542,7 @@ log: ${logPath}
   let finished = false;
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (c) => { stdout += c; });
-  child.stderr.on('data', (c) => { stderr = (stderr + c.toString()).slice(-4096); try { fs.appendFileSync(logPath, c); } catch {} });
+  child.stderr.on('data', (c) => { stderr = (stderr + c.toString()).slice(-4096); appendLog(c); });
   const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
   const timer = setTimeout(() => {
     timedOut = true;
@@ -3604,6 +3670,8 @@ function runCodex(spawnRetried = false) {
     const childEnv = { ...process.env, CODEX_HOME, AGENT_ROUTE_DEPTH: '1' };
     childEnv.AGENT_ROUTE_ACTIVE_PROVIDER = activeRouteKind;
     if (activeRouteKind === 'micu') {
+      // Micu 的自定义 provider 只应看到本次派发注入的密钥，避免继承父进程中的其他服务商密钥。
+      for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete childEnv[key];
       log(`micu credentials: ${activeCodexContext.runtime?.key ? 'present' : 'missing'}`);
       if (activeCodexContext.runtime?.key) childEnv[activeCodexContext.runtime.envKey ?? 'AGENT_ROUTE_PROVIDER_KEY'] = activeCodexContext.runtime.key;
       else delete childEnv[activeCodexContext.runtime?.envKey ?? 'AGENT_ROUTE_PROVIDER_KEY'];
@@ -3619,7 +3687,7 @@ function runCodex(spawnRetried = false) {
   let finished = false;
   // codex exec 的 stdout/stderr 是过程输出，只进日志；汇报取 -o 文件，token 数取输出末尾的 "tokens used"
   const onOutput = (c) => {
-    try { fs.appendFileSync(logPath, c); } catch {}
+    appendLog(c);
     tail = (tail + c.toString('utf8')).slice(-4096);
     if (!session) {
       const buffered = sessionTail + c.toString('utf8');
@@ -3671,7 +3739,8 @@ function runCodex(spawnRetried = false) {
     const diagnostics = summarizeCodexDiagnostics(telemetry.structuredErrors ?? [], stderrDiagnosticLines);
     reconnectCount = diagnostics.reconnect;
     capacityCount = diagnostics.capacity;
-    reconnectLines = diagnostics.lines.filter((line) => /reconnecting|stream disconnected|retry|at capacity/i.test(line)).slice(0, 20);
+    reconnectLines = diagnostics.lines.filter((line) => /reconnecting|stream disconnected|retry|at capacity/i.test(line))
+      .slice(0, 20).map((line) => redactSecrets(line));
     const stderrDiagnostics = stderrDiagnosticLines.join('\n');
     const structuredDiagnostics = (telemetry.structuredErrors ?? [])
       .map((entry) => typeof entry === 'string' ? entry : entry?.text).filter(Boolean);
@@ -3687,9 +3756,9 @@ function runCodex(spawnRetried = false) {
         telemetry.tokenUsageInvalid);
       if (pricing !== null) {
         const label = activeCodexContext.providerName ?? 'Micu';
-        addProviderSpend(label, pricing);
+        const totalSpend = addProviderSpend(label, pricing);
         const limit = codexFallbackConfig(config).dailyBudgetUsd;
-        if (providerSpend(label) >= limit) notifyOnce('micu-budget', `${label} 当日花费 $${providerSpend(label).toFixed(2)} 已达上限 $${limit}`);
+        if (totalSpend >= limit) notifyOnce('micu-budget', `${label} 当日花费 $${totalSpend.toFixed(2)} 已达上限 $${limit}`);
       }
       log(`spend: ${pricing === null ? 'unknown' : pricing.toFixed(6)} usd`);
     }
