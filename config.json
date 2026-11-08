@@ -12,7 +12,10 @@
     },
     "tier2": {
       "codex": {
-        "model": "gpt-6-luna",
+        "models": [
+          "gpt-6.1-terra",
+          "gpt-6-luna"
+        ],
         "effort": "xhigh",
         "apiModel": "gpt-6.1-sol"
       },
@@ -43,5 +46,32 @@
     "enabled": true,
     "onReadError": "live-config"
   },
-  "claudeWeeklyThreshold": 80
+  "claudeWeeklyThreshold": 80,
+  "codexFallback": {
+    "Micu": {
+      "ccSwitchId": "b1461721-a885-478c-80b4-6631c3134bb7",
+      "label": "Micu",
+      "models": {
+        "tier1": [
+          {
+            "model": "gpt-6.1-sol"
+          }
+        ],
+        "tier2": [
+          {
+            "model": "gpt-6.1-sol",
+            "effort": "medium"
+          }
+        ]
+      },
+      "retryOfficialMinutes": 15,
+      "capacityBackoffSeconds": 30,
+      "dailyBudgetUsd": 5
+    }
+  },
+  "claudePacing": {
+    "windowHours": 36,
+    "reservePercent": 90,
+    "staleMinutes": 60
+  }
 }

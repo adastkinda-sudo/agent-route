@@ -438,8 +438,9 @@ function routeStateKey(app, context, model) {
 }
 
 function resolveCodexModel(tier, providerContext, tierCfg) {
+  const officialModel = tierCfg.codex.models?.[0] ?? tierCfg.codex.model;
   return tier === 'tier2' && providerContext?.billingType === 'api'
-    ? tierCfg.codex.apiModel ?? 'gpt-6.1-sol' : tierCfg.codex.model;
+    ? tierCfg.codex.apiModel ?? officialModel : officialModel;
 }
 
 function resolveClaudeModel(tier, context, config, { write = false, monitor = false } = {}) {
@@ -611,6 +612,93 @@ function missingProgram(program) {
   return `缺少可执行程序 ${program}；请在 config.local.json 手动填写 ${program}Bin`;
 }
 
+const CODEX_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const isConfigObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const validConfigString = (value) => typeof value === 'string' && value.trim().length > 0;
+
+function normalizeCodexModels(codex, label) {
+  let models;
+  if (codex.models === undefined) {
+    if (!validConfigString(codex.model)) throw new Error(`${label}.model 必须是非空字符串`);
+    models = [codex.model.trim()];
+  } else {
+    if (!Array.isArray(codex.models) || codex.models.length === 0 ||
+      codex.models.some((model) => !validConfigString(model))) {
+      throw new Error(`${label}.models 必须是非空字符串数组`);
+    }
+    models = codex.models.map((model) => model.trim());
+  }
+  codex.models = models;
+  // 保留现有调用点和日志字段；旧的 model 单值等同于列表首项。
+  codex.model = models[0];
+  if (codex.effort !== undefined &&
+      (typeof codex.effort !== 'string' || !CODEX_EFFORTS.has(codex.effort))) {
+    throw new Error(`${label}.effort 必须是 none、minimal、low、medium、high 或 xhigh`);
+  }
+  if (codex.apiModel !== undefined && !validConfigString(codex.apiModel)) {
+    throw new Error(`${label}.apiModel 必须是非空字符串`);
+  }
+}
+
+function validateCodexFallback(config) {
+  const fallback = config.codexFallback;
+  if (!isConfigObject(fallback)) throw new Error('codexFallback 必须是对象');
+  for (const [name, entry] of Object.entries(fallback)) {
+    const label = `codexFallback.${name}`;
+    if (!isConfigObject(entry)) throw new Error(`${label} 必须是对象`);
+    for (const key of ['ccSwitchId', 'label']) {
+      if (!validConfigString(entry[key])) throw new Error(`${label}.${key} 必须是非空字符串`);
+    }
+    if (!isConfigObject(entry.models)) throw new Error(`${label}.models 必须是对象`);
+    for (const tier of ['tier1', 'tier2']) {
+      const models = entry.models[tier];
+      if (!Array.isArray(models) || models.length === 0 || models.some((item) => !isConfigObject(item))) {
+        throw new Error(`${label}.models.${tier} 必须是非空对象数组`);
+      }
+      for (const [index, item] of models.entries()) {
+        if (!validConfigString(item.model)) throw new Error(`${label}.models.${tier}[${index}].model 必须是非空字符串`);
+        if (item.effort !== undefined &&
+            (typeof item.effort !== 'string' || !CODEX_EFFORTS.has(item.effort))) {
+          throw new Error(`${label}.models.${tier}[${index}].effort 必须是 none、minimal、low、medium、high 或 xhigh`);
+        }
+      }
+    }
+    for (const key of ['retryOfficialMinutes', 'capacityBackoffSeconds', 'dailyBudgetUsd']) {
+      if (typeof entry[key] !== 'number' || !Number.isFinite(entry[key]) || entry[key] < 0) {
+        throw new Error(`${label}.${key} 必须是非负数`);
+      }
+    }
+  }
+}
+
+function validateClaudePacing(config) {
+  const pacing = config.claudePacing;
+  if (!isConfigObject(pacing)) throw new Error('claudePacing 必须是对象');
+  if (typeof pacing.windowHours !== 'number' || !Number.isFinite(pacing.windowHours) || pacing.windowHours <= 0) {
+    throw new Error('claudePacing.windowHours 必须是正数');
+  }
+  if (typeof pacing.reservePercent !== 'number' || !Number.isFinite(pacing.reservePercent) ||
+      pacing.reservePercent < 0 || pacing.reservePercent > 100) {
+    throw new Error('claudePacing.reservePercent 必须是 0–100 的数值');
+  }
+  if (typeof pacing.staleMinutes !== 'number' || !Number.isFinite(pacing.staleMinutes) || pacing.staleMinutes <= 0) {
+    throw new Error('claudePacing.staleMinutes 必须是正数');
+  }
+}
+
+function validateConfig(config) {
+  if (!isConfigObject(config.tiers)) throw new Error('tiers 必须是对象');
+  for (const [tier, tierConfig] of Object.entries(config.tiers)) {
+    if (!isConfigObject(tierConfig) || !isConfigObject(tierConfig.codex)) {
+      throw new Error(`tiers.${tier}.codex 必须是对象`);
+    }
+    normalizeCodexModels(tierConfig.codex, `tiers.${tier}.codex`);
+  }
+  validateCodexFallback(config);
+  validateClaudePacing(config);
+  return config;
+}
+
 function readConfig({ forceProbe = false } = {}) {
   try {
     const base = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
@@ -637,7 +725,7 @@ function readConfig({ forceProbe = false } = {}) {
       (!Number.isSafeInteger(config.codexStreamIdleTimeoutMs) || config.codexStreamIdleTimeoutMs < 0)) {
       throw new Error('codexStreamIdleTimeoutMs 必须是非负整数');
     }
-    return config;
+    return validateConfig(config);
   } catch (e) {
     process.stderr.write(`agent-route: 无法读取 ${CONFIG_FILE}: ${e.message}\n`);
     process.exit(2);

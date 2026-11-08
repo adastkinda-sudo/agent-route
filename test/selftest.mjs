@@ -30,6 +30,7 @@ export async function selftest({
     fs.copyFileSync(CONFIG_FILE, path.join(home, 'config.json'));
     fs.copyFileSync(path.join(ROOT, 'agents.json'), path.join(home, 'agents.json'));
     const config = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+    const officialModel = (tier) => config.tiers[tier].codex.models?.[0] ?? config.tiers[tier].codex.model;
     config.codexBin = path.resolve(path.dirname(SCRIPT_PATH), '../test/codex-stub');
     config.claudeBin = config.codexBin;
     config.logMode = 'summary';
@@ -346,6 +347,38 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           fs.readdirSync(path.join(configuredRoot, 'logs')).some((name) => name.endsWith('.log')) &&
           !fs.existsSync(path.join(configuredRoot, 'state', 'history.jsonl')),
           `stateDir 未共享状态或日志跟随 stateDir: status=${dispatch.status} stderr=${dispatch.stderr.trim()} stdout=${dispatch.stdout.trim()}`);
+      }],
+      [0.4, 'Codex models 列表解析并派发首项', () => {
+        const result = run('complete', [], false, { tier: 'tier2' });
+        exitIs(result, 0);
+        const call = invocationRows().at(-1);
+        check(result.record.model === officialModel('tier2') &&
+          call.args[call.args.indexOf('-m') + 1] === officialModel('tier2'), 'models 列表未使用首项');
+      }],
+      [0.5, 'Codex model 单值兼容为单元素列表', () => {
+        const configPath = path.join(home, 'config.json');
+        const savedConfig = fs.readFileSync(configPath, 'utf8');
+        try {
+          const single = JSON.parse(savedConfig);
+          delete single.tiers.tier1.codex.models;
+          single.tiers.tier1.codex.model = 'fixture-single-model';
+          fs.writeFileSync(configPath, JSON.stringify(single));
+          const result = run('complete');
+          exitIs(result, 0);
+          check(result.record.model === 'fixture-single-model', '单值 model 未兼容为列表');
+        } finally { fs.writeFileSync(configPath, savedConfig); }
+      }],
+      [0.6, '非法 Codex 模型配置给出明确报错', () => {
+        const configPath = path.join(home, 'config.json');
+        const savedConfig = fs.readFileSync(configPath, 'utf8');
+        try {
+          const invalid = JSON.parse(savedConfig);
+          invalid.tiers.tier2.codex.models = [];
+          fs.writeFileSync(configPath, JSON.stringify(invalid));
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 5000 });
+          exitIs(result, 2);
+          check(result.stderr.includes('tiers.tier2.codex.models 必须是非空字符串数组'), '非法 models 未给出明确报错');
+        } finally { fs.writeFileSync(configPath, savedConfig); }
       }],
       [1, '汇报完成', () => {
         complete = run('complete');
@@ -1516,7 +1549,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           ]) {
             const result = run(args.includes('--monitor') ? 'monitor' : 'complete', args, false, { tier });
             exitIs(result, 0);
-            const expectedModel = tier === 'tier2' && billing === 'api' ? config.tiers.tier2.codex.apiModel : config.tiers[tier].codex.model;
+            const expectedModel = tier === 'tier2' && billing === 'api' ? config.tiers.tier2.codex.apiModel : officialModel(tier);
             const call = invocationRows().at(-1);
             check(result.record.model === expectedModel && result.record.effort === expectedEffort &&
               call.args[call.args.indexOf('-m') + 1] === expectedModel && call.args.includes(`model_reasoning_effort="${expectedEffort}"`),
@@ -1682,7 +1715,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: 5000 });
         exitIs(status, 0);
         check(status.stdout.includes('billing: subscription') && status.stdout.includes('codex 5h:') &&
-          status.stdout.includes(`codex tier2 model: ${config.tiers.tier2.codex.model}`), '订阅 status 缺少窗口或使用了 API 模型');
+          status.stdout.includes(`codex tier2 model: ${officialModel('tier2')}`), '订阅 status 缺少窗口或使用了 API 模型');
         for (const billing of ['subscription', 'api']) {
           if (billing === 'api') await useApi();
           fs.rmSync(limitPath, { force: true });
