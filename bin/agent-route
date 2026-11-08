@@ -535,32 +535,37 @@ async function sessionTelemetry(id, since, includeLimits) {
   return result;
 }
 
-function queryRateLimits(config) {
+// 复用同一个 app-server 会话按顺序发送请求；返回每个请求的响应（{result} 或 {error}）。
+// initialize 失败返回 null；超时或会话中断时返回已收到的部分响应。
+function appServerRequests(config, requests, { stopOnError = false } = {}) {
   return new Promise((resolve) => {
     const child = spawn(config.codexBin ?? 'codex', ['app-server'], { env: { ...process.env, CODEX_HOME }, stdio: ['pipe', 'pipe', 'ignore'], detached: true });
+    const responses = [];
     let pending = '';
     let finished = false;
     let initialized = false;
     let closed = false;
     const kill = (signal) => { try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch {} } };
-    const timer = setTimeout(() => finish(null), 15_000);
+    const timer = setTimeout(() => finish(), 15_000);
     const onSignal = () => { kill('SIGKILL'); process.exit(130); };
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, onSignal);
-    const finish = (snapshot) => {
+    const finish = () => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
       for (const signal of ['SIGINT', 'SIGTERM']) process.removeListener(signal, onSignal);
-      if (closed) { resolve(snapshot); return; }
+      const value = initialized ? responses : null;
+      if (closed) { resolve(value); return; }
       const killTimer = setTimeout(() => kill('SIGKILL'), 1000);
-      child.once('close', () => { clearTimeout(killTimer); resolve(snapshot); });
+      child.once('close', () => { clearTimeout(killTimer); resolve(value); });
       child.stdin.end();
       kill('SIGTERM');
     };
     const send = (message) => child.stdin.write(JSON.stringify(message) + '\n');
-    child.stdin.on('error', () => finish(null));
-    child.on('error', () => finish(null));
-    child.on('close', () => { closed = true; finish(null); });
+    const sendNext = () => send({ id: responses.length + 2, method: requests[responses.length].method, params: requests[responses.length].params ?? {} });
+    child.stdin.on('error', () => finish());
+    child.on('error', () => finish());
+    child.on('close', () => { closed = true; finish(); });
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
       pending += chunk;
@@ -571,18 +576,101 @@ function queryRateLimits(config) {
         let message;
         try { message = JSON.parse(line); } catch { continue; }
         if (message.id === 1 && !initialized) {
-          if (message.error || !message.result) return finish(null);
+          if (message.error || !message.result) { initialized = false; return finish(); }
           initialized = true;
           send({ method: 'initialized' });
-          send({ id: 2, method: 'account/rateLimits/read', params: {} });
-        } else if (message.id === 2 && initialized) {
-          const result = message.result;
-          finish(normalizeLimits(result?.rateLimitsByLimitId?.codex ?? result?.rateLimits, true));
+          if (!requests.length) return finish();
+          sendNext();
+        } else if (initialized && message.id === responses.length + 2) {
+          responses.push(message.error ? { error: message.error } : { result: message.result });
+          if (responses.length >= requests.length || (message.error && stopOnError)) return finish();
+          sendNext();
         }
       }
     });
     send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'agent-route', title: 'agent-route', version: '1.0.0' } } });
   });
+}
+
+const RATE_LIMITS_READ = { method: 'account/rateLimits/read', params: {} };
+
+function snapshotOf(response) {
+  const result = response?.result;
+  return normalizeLimits(result?.rateLimitsByLimitId?.codex ?? result?.rateLimits, true);
+}
+
+// account/rateLimits/read 结果里的 rateLimitResetCredits：{ availableCount, credits[] | null }。
+function normalizeResetCredits(raw) {
+  if (!raw || typeof raw !== 'object' || !Number.isFinite(raw.availableCount)) return null;
+  const credits = Array.isArray(raw.credits) ? raw.credits.filter((credit) => credit && typeof credit.id === 'string' && credit.id)
+    .map((credit) => ({ id: credit.id, resetType: credit.resetType ?? 'unknown', status: credit.status ?? 'unknown',
+      grantedAt: Number.isFinite(credit.grantedAt) ? credit.grantedAt : 0,
+      expiresAt: Number.isFinite(credit.expiresAt) ? credit.expiresAt : null, title: typeof credit.title === 'string' ? credit.title : null })) : null;
+  return { availableCount: raw.availableCount, credits };
+}
+
+async function queryRateLimits(config) {
+  const responses = await appServerRequests(config, [RATE_LIMITS_READ]);
+  return snapshotOf(responses?.[0]);
+}
+
+// 一次读取额度快照和重置券；读取失败返回 null。
+async function queryRateLimitDetails(config) {
+  const responses = await appServerRequests(config, [RATE_LIMITS_READ]);
+  const response = responses?.[0];
+  if (!response?.result) return null;
+  return { snapshot: snapshotOf(response), resetCredits: normalizeResetCredits(response.result.rateLimitResetCredits) };
+}
+
+// 用券：同一会话内 consume 后再读取一次额度。重试沿用同一个 idempotencyKey。
+async function consumeResetCredit(config, { idempotencyKey, creditId }) {
+  const responses = await appServerRequests(config, [
+    { method: 'account/rateLimitResetCredit/consume', params: { idempotencyKey, creditId } }, RATE_LIMITS_READ], { stopOnError: true });
+  const outcome = responses?.[0]?.result?.outcome;
+  if (typeof outcome !== 'string') return { outcome: null, error: responses?.[0]?.error ? 'rpc-error' : 'no-response', snapshot: null };
+  return { outcome, snapshot: snapshotOf(responses[1]) };
+}
+
+// 最早到期的可用券；不会过期的券排在最后。
+function selectResetCredit(resetCredits, now = Date.now()) {
+  return (resetCredits?.credits ?? [])
+    .filter((credit) => credit.status === 'available' && credit.resetType === 'codexRateLimits' &&
+      (credit.expiresAt === null || credit.expiresAt * 1000 > now))
+    .sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity) || a.grantedAt - b.grantedAt)[0] ?? null;
+}
+
+// 3.2a 触发条件。type 以刚读取的快照为准；quotaReserve 限额（快照未满）由调用方在 state.reserve 标出。
+function resetCreditDecision(state, details, settings, now = Date.now()) {
+  if (!settings.auto) return { use: false, reason: 'auto disabled' };
+  const snapshot = details?.snapshot;
+  if (!snapshot) return { use: false, reason: 'rate limits unavailable' };
+  const credit = selectResetCredit(details.resetCredits, now);
+  if (!credit) return { use: false, reason: 'no available credit' };
+  const fresh = limitFromSnapshot(snapshot);
+  const type = fresh.type ?? (state?.reserve ? state.type : null);
+  if (!type) return { use: false, reason: 'not limited' };
+  const weekly = snapshot.secondary;
+  if (type === 'weekly') {
+    const resetsAt = weekly?.resets_at ?? state?.resets_at;
+    const hours = resetsAt ? (resetsAt * 1000 - now) / 3_600_000 : Infinity;
+    return hours > settings.minWaitHours ? { use: true, type, credit, reason: `weekly resets in ${Math.round(hours)}h` }
+      : { use: false, reason: `weekly resets in ${Math.round(hours)}h <= ${settings.minWaitHours}h` };
+  }
+  if (type === '5h') {
+    const expiring = credit.expiresAt !== null && credit.expiresAt * 1000 - now <= settings.expiringDays * 86_400_000;
+    if (weekly && weekly.used_percent >= settings.weeklyPercentForExpiring && expiring) {
+      return { use: true, type, credit, reason: `5h limit, weekly ${weekly.used_percent}%, credit expiring` };
+    }
+    return { use: false, reason: `5h limit, weekly ${weekly?.used_percent ?? '?'}%${expiring ? '' : ', no credit expiring soon'}` };
+  }
+  return { use: false, reason: `limit type ${type}` };
+}
+
+// 用券后重读的快照必须已解除限额，且触发用券的窗口用量下降。
+function resetConfirmed(before, after, type) {
+  if (!after || limitFromSnapshot(after).type) return false;
+  const windows = type === 'weekly' ? ['secondary'] : type === '5h' ? ['primary'] : ['primary', 'secondary'];
+  return windows.every((key) => !before?.[key] || !after[key] || after[key].used_percent < before[key].used_percent);
 }
 
 async function checkCodexLimit(config) {
@@ -975,8 +1063,28 @@ function validateConfig(config) {
       if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`codexCircuit.${key} 必须是非负数`);
     }
   }
+  validateCodexResetCredits(config);
   validateClaudePacing(config);
   return config;
+}
+
+const RESET_CREDIT_DEFAULTS = { auto: true, minWaitHours: 24, weeklyPercentForExpiring: 80, expiringDays: 3 };
+
+function validateCodexResetCredits(config) {
+  const value = config.codexResetCredits;
+  if (value === undefined) return;
+  if (!isConfigObject(value)) throw new Error('codexResetCredits 必须是对象');
+  if (value.auto !== undefined && typeof value.auto !== 'boolean') throw new Error('codexResetCredits.auto 必须是布尔值');
+  for (const key of ['minWaitHours', 'weeklyPercentForExpiring', 'expiringDays']) {
+    if (value[key] !== undefined && (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] < 0 ||
+      (key === 'weeklyPercentForExpiring' && value[key] > 100))) {
+      throw new Error(`codexResetCredits.${key} 必须是${key === 'weeklyPercentForExpiring' ? ' 0–100 的数值' : '非负数'}`);
+    }
+  }
+}
+
+function codexResetCreditsConfig(config) {
+  return { ...RESET_CREDIT_DEFAULTS, ...(config.codexResetCredits ?? {}) };
 }
 
 function codexFallbackConfig(config) {
@@ -1491,7 +1599,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -1646,6 +1754,12 @@ if (cmd === 'status') {
       const window = limit?.snapshot?.[key];
       console.log(`codex ${label}: ${window ? `${window.used_percent}% resets ${fmtLocal(new Date(window.resets_at * 1000))}` : 'unknown'}`);
     }
+    // 只读：显示可用重置券，不会使用。
+    const resetCredits = (await queryRateLimitDetails(config))?.resetCredits;
+    const expiries = (resetCredits?.credits ?? []).filter((credit) => credit.status === 'available' && credit.expiresAt !== null && credit.expiresAt * 1000 > Date.now())
+      .map((credit) => credit.expiresAt);
+    console.log(`codex reset credits: ${resetCredits ? `${resetCredits.availableCount} available${expiries.length
+      ? `; earliest expiry ${fmtLocal(new Date(Math.min(...expiries) * 1000))}` : ''}` : 'unknown'}; auto: ${codexResetCreditsConfig(config).auto ? 'on' : 'off'}`);
     if (!context.enabled) console.log(`route: ${limitActive(limit) ? `Claude (codex ${limit.type} 限额${limit.resets_at ? `至 ${fmtLocal(new Date(limit.resets_at * 1000))}` : '，恢复时间未知'})` : 'Codex'}`);
   } else console.log(`codex subscription quota: ${codex.billingType === 'api' ? 'not applicable (API)' : 'unknown'}`);
   if (context.enabled) {
@@ -1870,6 +1984,20 @@ const log = (s) => {
   for (const secret of redactions) text = text.split(secret).join('[redacted]');
   fs.appendFileSync(logPath, text);
 };
+// macOS 系统通知；测试通过 AGENT_ROUTE_NOTIFY_FILE 改为写文件，不弹出通知。通知失败不影响派发。
+function notify(event, message) {
+  log(`notify: ${event}`);
+  try {
+    if (process.env.AGENT_ROUTE_NOTIFY_FILE) {
+      fs.appendFileSync(process.env.AGENT_ROUTE_NOTIFY_FILE, JSON.stringify({ event, message }) + '\n');
+    } else if (process.platform === 'darwin') {
+      spawnSync('osascript', ['-e', 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run',
+        `agent-route: ${event}`, message], { timeout: 5000, stdio: 'ignore' });
+    }
+  } catch { /* 通知只是提示 */ }
+}
+let resetCreditAttempted = false;
+let resetCreditRecord = null;
 function logCodexFailure(tail, code, telemetry = {}) {
   const classification = classifyCodexFailure(tail, code, telemetry);
   log(`failure class: ${classification.category}`);
@@ -2286,7 +2414,7 @@ function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -2415,6 +2543,7 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
     ...(providerChange ? { provider_change: providerChange } : {}),
     ...(dispatchContext.enabled ? { providers: { codex: routeSafeContext(), claude: safeRouteContext(dispatchContext.claude) } } : {}),
     ...(routesTried.length > 1 ? { routes: routesTried } : {}),
+    ...(resetCreditRecord ? { reset_credit: resetCreditRecord } : {}),
   };
   if (verifyResult) log(`verify result: ${JSON.stringify(verifyResult)}`);
   log(`finish: status=${status} tokens=${tokens ?? '?'} elapsed=${elapsed} session=${session ?? '?'} exit_code=${code} stdout_chars=${record.stdout_chars} model=${actualModel} effort=${actualEffort ?? '?'} fallback=${usedFallback} executor=${executor} reconnect=${reconnectCount} capacity=${capacityCount} stall=${codexStall.count} stall_seconds=${codexStall.seconds}${commitHash ? ` commit=${commitHash}` : ''}`);
@@ -2583,7 +2712,48 @@ function rebuildPromptFromResume() {
   return true;
 }
 
-function takeOverCodex(state) {
+// 3.2a：官方额度受限时先判断是否用券；用券并确认重置后返回 true，并在官方路由上重跑本次任务。
+// 其他情况（未触发、无券、结果为 nothingToReset / noCredit、重置未生效、读取失败）返回 false，由调用方转 Micu。
+// 每次派发最多尝试一次。并发派发的锁留给阶段 4。
+async function tryResetCredit(state, { started }) {
+  const settings = codexResetCreditsConfig(config);
+  const official = activeRouteKind === 'official' && (!activeCodexContext || activeCodexContext.billingType === 'subscription');
+  if (!official || !settings.auto || resetCreditAttempted || state?.source === 'forced-test' || !state?.type) return false;
+  resetCreditAttempted = true;
+  try {
+    const details = await queryRateLimitDetails(config);
+    const decision = resetCreditDecision(state, details, settings);
+    if (!decision.use) { log(`reset credit: skipped (${decision.reason})`); return false; }
+    const { credit, type } = decision;
+    const prefix = credit.id.slice(0, 8);
+    const expires = credit.expiresAt ? new Date(credit.expiresAt * 1000).toISOString() : 'never';
+    const idempotencyKey = crypto.randomUUID();
+    let result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
+    if (!result.outcome) result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
+    const success = ['reset', 'alreadyRedeemed'].includes(result.outcome);
+    const confirmed = success && resetConfirmed(details.snapshot, result.snapshot, type);
+    log(`reset credit: ${result.outcome ?? `failed (${result.error})`} ${prefix} expires ${expires}`);
+    resetCreditRecord = { outcome: result.outcome ?? 'failed', credit: prefix, expires_at: expires, confirmed };
+    if (result.outcome) notify('reset credit', `${result.outcome}: ${prefix} (${decision.reason})${confirmed ? '' : '; 未确认重置，转备用路由'}`);
+    if (!confirmed) return false;
+    clearCodexLimit(snapshotState(result.snapshot, 'app-server', readCodexLimit() ?? state));
+    codexLimitReason = null;
+    if (started) {
+      if (resumeArg !== null) rebuildPromptFromResume();
+      session = null;
+      codexResume = false;
+      startAttempt('reset credit');
+    }
+    runCodex();
+    return true;
+  } catch (error) {
+    log(`reset credit: failed (${String(error?.message ?? error).slice(0, 80)})`);
+    return false;
+  }
+}
+
+async function takeOverCodex(state, { started = true } = {}) {
+  if (await tryResetCredit(state, { started })) return;
   codexLimitReason = `codex ${dispatchContext.codex?.billingType === 'api' ? 'API 服务商 ' : ''}${state.type} 限额${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : '，恢复时间未知'}`;
   if (routeFailureHandled({ category: state.type === 'weekly' ? '官方周' : '官方 5h', state, resets_at: state.resets_at }, codexLimitReason)) return;
   if (noClaude) return limitStop(state);
@@ -2857,7 +3027,7 @@ else {
     ? { type: '5h', resets_at: (Date.now() + 3_600_000) / 1000, source: 'forced-test' } : null;
   const state = forcedLimit ?? (dispatchContext.codex?.billingType === 'api' || noClaude
     ? readCodexQuota(dispatchContext.codex, model) : await checkCodexLimit(config));
-  if (limitActive(state)) takeOverCodex(state);
+  if (limitActive(state)) takeOverCodex(state, { started: false });
   else {
     if (state?.type) clearCodexQuota(dispatchContext.codex, model, state);
     if (allRoutesBlocked) fallback(`所有 Codex 路由处于冷却或不可用: ${skippedRoutes.join('; ')}`);

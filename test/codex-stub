@@ -69,12 +69,40 @@ if (args[0] === 'app-server') {
       if (!acknowledged) die('未完成初始化');
       if (settings.mode === 'hang' || settings.mode === 'hang-stubborn') return;
       if (settings.mode === 'unavailable') return reply({ id: request.id, error: { code: -32601, message: 'Method not found' } });
+      const now = Math.floor(Date.now() / 1000);
       const rateLimits = { limitId: settings.mode === 'malformed' ? 'premium' : 'codex',
-        primary: { usedPercent: settings.mode === 'recovered' ? 20 : 100, windowDurationMins: 300,
-          resetsAt: settings.resets_at ?? Math.floor(Date.now() / 1000) + 7200 },
-        secondary: { usedPercent: 3, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 604800 },
+        primary: { usedPercent: settings.primaryUsed ?? (settings.mode === 'recovered' ? 20 : 100), windowDurationMins: 300,
+          resetsAt: settings.resets_at ?? now + 7200 },
+        secondary: { usedPercent: settings.weeklyUsed ?? 3, windowDurationMins: 10080,
+          resetsAt: settings.weeklyResetsAt ?? now + 604800 },
         rateLimitReachedType: null };
-      reply({ id: request.id, result: { rateLimits: { limitId: 'premium' }, rateLimitsByLimitId: { codex: rateLimits } } });
+      const result = { rateLimits: { limitId: 'premium' }, rateLimitsByLimitId: { codex: rateLimits } };
+      // 重置券：credits 为 [{ id, expiresInHours?, ... }]；未配置 credits 时不返回该字段。
+      if (settings.credits) {
+        const credits = settings.credits.map((credit) => ({ id: credit.id, resetType: credit.resetType ?? 'codexRateLimits',
+          status: credit.status ?? 'available', grantedAt: now - 86400, title: 'Full reset (Weekly + 5 hr)',
+          expiresAt: credit.expiresInHours === undefined ? null : now + Math.round(credit.expiresInHours * 3600) }));
+        result.rateLimitResetCredits = { availableCount: credits.filter((credit) => credit.status === 'available').length,
+          credits: settings.creditsDetail === false ? null : credits };
+      }
+      reply({ id: request.id, result });
+    } else if (request.method === 'account/rateLimitResetCredit/consume') {
+      if (!acknowledged) die('未完成初始化');
+      // 真实账号上不得调用 consume；替身只在隔离目录里记录并模拟四种结果。
+      const { idempotencyKey, creditId } = request.params ?? {};
+      if (typeof idempotencyKey !== 'string' || !idempotencyKey) die('consume 缺少 idempotencyKey');
+      fs.appendFileSync(path.join(process.env.HOME, 'stub-app-server.jsonl'), JSON.stringify({ event: 'consume', idempotencyKey, creditId: creditId ?? null }) + '\n');
+      if (settings.consumeMode === 'error') return reply({ id: request.id, error: { code: -32000, message: 'consume failed' } });
+      if (settings.consumeMode === 'hang') return;
+      const outcome = settings.consumeOutcome ?? 'reset';
+      if (outcome === 'reset' && settings.consumeEffect !== 'none') {
+        // 重置生效：两个窗口回到 0，被用掉的券不再可用，official 路由的 limit 场景从此成功。
+        const next = { ...settings, primaryUsed: 0, weeklyUsed: 0, recovered: true,
+          credits: (settings.credits ?? []).filter((credit) => credit.id !== creditId) };
+        fs.writeFileSync(settingsPath, JSON.stringify(next));
+        settings = next;
+      }
+      reply({ id: request.id, result: { outcome } });
     } else die(`未知方法 ${request.method}`);
   });
   await new Promise((resolve) => lines.on('close', () => {
@@ -268,7 +296,9 @@ if (!claude && routeMatch) {
     rate: 'HTTP 429 Too Many Requests\nRetry-After: 120',
     other: 'ERROR: connect ECONNREFUSED',
   };
-  if (kind !== 'ok' && (!only || modelArg.includes(only))) {
+  let recovered = false;
+  try { recovered = JSON.parse(fs.readFileSync(path.join(process.env.HOME, 'stub-rate-limits.json'), 'utf8')).recovered === true; } catch {}
+  if (kind !== 'ok' && !(kind === 'limit' && !micu && recovered) && (!only || modelArg.includes(only))) {
     if (!failures[kind]) die(`未知失败类型: ${kind}`);
     fs.writeSync(2, `session id: ${currentSession}\n${failures[kind]}\n`);
     process.exit(1);

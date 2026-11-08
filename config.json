@@ -103,5 +103,11 @@
     "windowHours": 36,
     "reservePercent": 90,
     "staleMinutes": 60
+  },
+  "codexResetCredits": {
+    "auto": true,
+    "minWaitHours": 24,
+    "weeklyPercentForExpiring": 80,
+    "expiringDays": 3
   }
 }
