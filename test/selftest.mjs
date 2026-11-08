@@ -200,7 +200,10 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     const resolveRoutes = (overrides = {}) => resolveDispatchContext(routeConfig, { home, env, cwd: repo, ...overrides });
     const withRoutedFixture = async (test) => {
       await resetRoutes();
-      for (const file of ['cooldown.json', 'codex-limit.json', 'provider-limit.json', 'claude-limit.json']) fs.rmSync(path.join(home, 'state', file), { force: true });
+      for (const file of ['cooldown.json', 'codex-limit.json', 'provider-limit.json', 'claude-limit.json', 'claude-usage.json', 'claude-pacing.json', 'notify-state.json', 'route.lock']) {
+        fs.rmSync(path.join(home, 'state', file), { force: true });
+      }
+      for (const file of ['stub-claude-usage.json', 'stub-claude-probes.jsonl', 'notifications.jsonl', 'stub-rate-limits.json']) fs.rmSync(path.join(home, file), { force: true });
       const previousConfig = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
       fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
       const previousTimeout = dispatchTimeout;
@@ -282,6 +285,24 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
       writeJSON(path.join(home, '.claude', 'settings.json'), { env: {} });
       writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'claude.ai' });
       if (used !== null) claudeAccount(used);
+    };
+    // 写入 stub 的用量读数（百分比）；week 为 null 表示探测不返回事件。同时清掉已存档读数，避免 5 分钟复用。
+    const claudeUsage = (week, { five = 10, weekDays = 3.5, fiveHours = 3 } = {}) => {
+      const now = Math.floor(Date.now() / 1000);
+      fs.rmSync(path.join(home, 'state', 'claude-usage.json'), { force: true });
+      if (week === null) return fs.rmSync(path.join(home, 'stub-claude-usage.json'), { force: true });
+      writeJSON(path.join(home, 'stub-claude-usage.json'), { five_hour: { utilization: five / 100, resetsAt: now + Math.round(fiveHours * 3600) },
+        seven_day: { utilization: week / 100, resetsAt: now + Math.round(weekDays * 86400) } });
+    };
+    const pacingState = () => {
+      try { return Object.values(JSON.parse(fs.readFileSync(path.join(home, 'state', 'claude-pacing.json'), 'utf8')).accounts ?? {})[0] ?? null; }
+      catch { return null; }
+    };
+    // Codex 与 Claude 都走官方订阅（deviceSettings 每次整体覆盖指针，所以要一起设置）。
+    const useBothSubscriptions = () => {
+      useSubscription();
+      useClaudeSubscription();
+      deviceSettings({ currentProviderCodex: 'official-codex', currentProviderClaude: 'official-claude' });
     };
     const routeSnapshot = () => {
       const files = {};
@@ -1887,11 +1908,13 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         }
         deviceSettings({ currentProviderClaude: 'official-claude', claudeConfigDir: custom });
         writeJSON(path.join(custom, 'settings.json'), { env: {} });
-        claudeAccount(80, {}, custom);
+        claudeUsage(96);
         const count = claudeCalls().length;
         const blocked = run('complete', ['--claude'], true);
         exitIs(blocked, 12);
-        check(claudeCalls().length === count && blocked.stdout.includes('80%'), '自定义目录周额度未生效');
+        check(claudeCalls().length === count && blocked.stdout.includes('96%') && fs.readFileSync(path.join(home, 'stub-claude-probes.jsonl'), 'utf8').includes(custom),
+          '自定义目录周额度未生效，或探测没有使用自定义配置目录');
+        claudeUsage(null);
         writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'api_key' });
         const unresolved = run('complete', ['--claude'], true);
         exitIs(unresolved, 12);
@@ -1902,7 +1925,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         exitIs(officialApi, 0);
         check(officialApi.record.providers.claude.billingType === 'api' && claudeCalls().at(-1).model === 'sonnet', '官方 API key 错用了订阅模型');
       })],
-      [77, 'Claude 周额度：阈值边界、冷却持久化、到点恢复与账号隔离', () => withRoutedFixture(async () => {
+      [77, 'Claude 每日用量线：U0 跨日记录、余量、5h、最后 36 小时、先刷新先用、过期与 --claude 上限', () => withRoutedFixture(async () => {
         useClaudeSubscription(79);
         const beforeTimeout = claudeCalls().length;
         writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'claude.ai', delayMs: 6000 });
@@ -1915,72 +1938,131 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'claude.ai' });
         }
         exitIs(run('complete', ['--claude'], true), 0);
-        const quotaFile = path.join(home, 'state', 'claude-limit.json');
-        let count = claudeCalls().length;
-        for (const percent of [80, 91]) {
-          claudeAccount(percent);
-          const blocked = run('complete', ['--claude'], true);
-          exitIs(blocked, 12);
-          check(claudeCalls().length === count && blocked.stdout.includes(`${percent}%`) && blocked.stdout.includes('冷却至'), '达到阈值仍调用 Claude');
-        }
-        exitIs(run('complete', ['--write']), 0); // Claude 冷却不改变 Codex 优先。
-        exitIs(run('api-429', ['--write']), 15);
-        const dual = run('complete', ['--write'], true, { preserveCooldown: true });
-        exitIs(dual, 15);
-        check(dual.stdout.includes('Codex API 服务商限额') && dual.stdout.includes('Claude 用量限额') && claudeCalls().length === count,
-          'Claude 周额度冷却没有挡住 Codex 受限后的 fallback');
-        const saved = fs.readFileSync(quotaFile, 'utf8');
-        noRouteSecrets(saved);
-        fs.rmSync(path.join(home, '.claude.json'));
-        exitIs(run('complete', ['--claude'], true), 0); // 无法确认账号时不复用另一个账号的冷却。
-        count++;
-        writeJSON(path.join(home, '.claude.json'), { oauthAccount: { accountUuid: 'SELFTEST_PRIVATE_CLAUDE_ACCOUNT' } });
+        // 每日用量线：官方受限时 Claude 排在 Micu/耗尽处理之前；U0 当天第一次派发时记录。
+        useBothSubscriptions();
+        const pace = (week, options, extra = []) => {
+          const state = seedLimit();
+          appMode('limited', state.resets_at);
+          claudeUsage(week, options);
+          return run('complete', extra, true, { preserveCooldown: true });
+        };
+        // 25% 起、3.5 天剩余：线 = 25 + 60/3.5 ≈ 42.1%。
+        let result = pace(25);
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && result.record.fallback && pacingState()?.u0 === 25 &&
+          /claude pacing\[normal\]: allow daily-line used=25% 5h=10% line=42\.[01]%/.test(result.log), `用量线以内应交给 Claude: ${result.log}`);
+        check(fs.readFileSync(path.join(home, 'stub-claude-probes.jsonl'), 'utf8').trim().split('\n').length >= 1, '没有探测用量');
+        // 同一天 U0 不变：39% + 2% 余量 ≤ 42.1% 通过，41% 超线（log 里 line 仍按 u0=25）。
+        result = pace(39);
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && pacingState().u0 === 25, 'U0 不应在当天更新');
+        result = pace(41);
+        exitIs(result, 15);
+        check(/claude pacing\[normal\]: block daily line 42\.[01]% \(weekly 41% \+ 2% headroom\)/.test(result.log) && pacingState().u0 === 25 &&
+          result.stdout.includes('claude-resets:'), `超出用量线应不交给 Claude: ${result.stdout}`);
+        // 跨日重新记录 U0：把存档日期改成过去，用量 30% 成为新的 U0，线 = 30 + 55/3.5 ≈ 45.7%。
+        const pacingFile = path.join(home, 'state', 'claude-pacing.json');
+        const saved = JSON.parse(fs.readFileSync(pacingFile, 'utf8'));
+        for (const entry of Object.values(saved.accounts)) { entry.day = '2000-01-01'; entry.u0 = 10; }
+        writeJSON(pacingFile, saved);
+        result = pace(30);
+        exitIs(result, 0);
+        check(pacingState().u0 === 30 && pacingState().day !== '2000-01-01' && /line=45\.[67]%/.test(result.log), '跨日后应重新记录 U0');
+        // 周额度重置后（resets_at 变化）也重新记录。
+        const week = pacingState().week_resets_at;
+        result = pace(12, { weekDays: 6.5 });
+        exitIs(result, 0);
+        check(pacingState().u0 === 12 && pacingState().week_resets_at !== week, '周重置后应重新记录 U0');
+        // 5h 达到 70% 不交给 Claude；69% 可以。
+        exitIs(pace(25, { five: 70 }), 15);
+        exitIs(pace(25, { five: 69 }), 0);
+        // 最后 36 小时：不受每日线限制，周用量低于 95% 即可；已用 94% 通过，95% 不通过。
+        result = pace(94, { weekDays: 1.4 });
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && /allow final-window/.test(result.log), '最后 36 小时应只受 95% 保留限制');
+        result = pace(95, { weekDays: 1.4 });
+        exitIs(result, 15);
+        check(/final window weekly 95% >= 95%/.test(result.log), '最后 36 小时 95% 应不交给 Claude');
+        // 数据过期或探测不到：视为没有 Claude 额度。
+        result = pace(null);
+        exitIs(result, 15);
+        check(/block usage-stale/.test(result.log), '没有用量读数应不派 Claude');
+        // --claude：可动用应急保留，上限 95%；超过每日线仍可用；5h 100% 不可用；没有读数时只检查读得到的限额。
+        claudeUsage(90);
+        exitIs(run('complete', ['--claude'], true), 0);
+        claudeUsage(96);
         exitIs(run('complete', ['--claude'], true), 12);
-        check(claudeCalls().length === count, '缓存消失后没有保持同账号冷却');
+        claudeUsage(50, { five: 100 });
+        exitIs(run('complete', ['--claude'], true), 12);
+        claudeUsage(null);
+        exitIs(run('complete', ['--claude'], true), 0);
+        // 最后 36 小时且 Claude 周额度先于 Codex 重置：Claude 排在官方之前；Codex 先重置则仍用 Codex。
+        fs.rmSync(path.join(home, 'state', 'codex-limit.json'), { force: true });
+        writeJSON(path.join(home, 'stub-rate-limits.json'), { primaryUsed: 20, weeklyUsed: 3 });
+        claudeUsage(50, { weekDays: 1.4 });
+        result = run('complete', [], true);
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && !result.record.fallback && result.log.includes('claude first: final window'), 'Claude 先重置时应先用 Claude');
+        writeJSON(path.join(home, 'stub-rate-limits.json'), { primaryUsed: 20, weeklyUsed: 3, weeklyResetsAt: Math.floor(Date.now() / 1000) + 3600 });
+        claudeUsage(50, { weekDays: 1.4 });
+        result = run('complete', [], true);
+        exitIs(result, 0);
+        check(result.record.executor === 'codex' && !result.log.includes('claude first'), 'Codex 先重置时应先用 Codex');
+        // status 只读显示存档读数和节奏。
         const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: dispatchTimeout });
-        check(status.status === 0 && status.stdout.includes('claude weekly: 91%') &&
-          status.stdout.includes('claude weekly threshold: 80%; cooldown: until'), 'status 未显示周额度冷却');
-        writeJSON(path.join(home, '.claude.json'), { oauthAccount: { accountUuid: 'SELFTEST_PRIVATE_OTHER_ACCOUNT' } });
-        exitIs(run('complete', ['--claude'], true), 0);
-        const states = JSON.parse(saved);
-        for (const state of Object.values(states.accounts)) state.resets_at = Math.floor(Date.now() / 1000) - 1;
-        writeJSON(quotaFile, states);
-        writeJSON(path.join(home, '.claude.json'), { oauthAccount: { accountUuid: 'SELFTEST_PRIVATE_CLAUDE_ACCOUNT' } });
-        exitIs(run('complete', ['--claude'], true), 0);
-        check(Object.values(JSON.parse(fs.readFileSync(quotaFile, 'utf8')).accounts).every((state) => !state), '过期冷却未清除');
-        claudeAccount(91);
-        exitIs(run('complete', ['--claude'], true), 12);
-        claudeAccount(20);
-        exitIs(run('complete', ['--claude'], true), 0);
+        check(status.status === 0 && /claude weekly: 50% resets/.test(status.stdout) && /claude pacing: /.test(status.stdout), `status 缺少 Claude 节奏: ${status.stdout}`);
       })],
-      [78, 'Claude 周额度：缺失/损坏/过期数据退回被动检测，API 不使用订阅缓存', () => withRoutedFixture(async () => {
-        useClaudeSubscription();
-        for (const changes of [null, { fetchedAtMs: Date.now() - 3_600_001 }, { fetchedAtMs: Date.now() + 60_000 },
-          { accountUuid: 'SELFTEST_PRIVATE_OTHER_ACCOUNT' }, { utilization: { seven_day: null } },
-          { utilization: { seven_day: { utilization: '91', resets_at: new Date(Date.now() + 7200_000).toISOString() } } },
-          { utilization: { seven_day: { utilization: 91, resets_at: new Date(Date.now() - 1000).toISOString() } } }]) {
-          if (changes) claudeAccount(91, changes); else fs.rmSync(path.join(home, '.claude.json'), { force: true });
-          exitIs(run('complete', ['--claude'], true), 0);
-        }
-        fs.writeFileSync(path.join(home, '.claude.json'), '{"secret":"SELFTEST_PRIVATE');
+      [78, 'Claude 用量读数：过期存档、探测失败、被动限额检测、API 不使用订阅读数、旧配置项', () => withRoutedFixture(async () => {
+        useBothSubscriptions();
+        // 存档读数在 probeMinutes 内直接复用，不再探测。
+        claudeUsage(40);
         exitIs(run('complete', ['--claude'], true), 0);
+        const probes = () => fs.readFileSync(path.join(home, 'stub-claude-probes.jsonl'), 'utf8').trim().split('\n').length;
+        const probed = probes();
+        exitIs(run('complete', ['--claude'], true), 0);
+        check(probes() === probed, '5 分钟内的存档读数应复用');
+        // 存档超过 staleMinutes 且探测不到：视为没有读数，--claude 仍只检查读得到的限额。
+        const usageFile = path.join(home, 'state', 'claude-usage.json');
+        const stored = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
+        for (const entry of Object.values(stored.accounts)) entry.observed_at = new Date(Date.now() - 2 * 3600_000).toISOString();
+        writeJSON(usageFile, stored);
+        fs.rmSync(path.join(home, 'stub-claude-usage.json'), { force: true });
+        const state = seedLimit();
+        appMode('limited', state.resets_at);
+        const stale = run('complete', [], true, { preserveCooldown: true });
+        exitIs(stale, 15);
+        check(/block usage-stale/.test(stale.log), '超过 60 分钟的存档应视为过期');
+        // 存档 30 分钟前且探测不到：仍可使用存档（周 40% 低于用量线）。
+        for (const entry of Object.values(stored.accounts)) entry.observed_at = new Date(Date.now() - 30 * 60_000).toISOString();
+        writeJSON(usageFile, stored);
+        const fresh = run('complete', [], true, { preserveCooldown: true });
+        exitIs(fresh, 0);
+        check(fresh.record.executor === 'claude', '60 分钟内的存档应可用');
+        // 被动限额检测保持：用量允许但 Claude 实际返回限额时，没有其他路由则 ERROR 或 LIMIT。
+        claudeUsage(40);
         const passive = run('limit-both', ['--claude'], true);
         exitIs(passive, 12);
-        check(passive.stdout.includes('Claude 用量限额'), '周额度不可读时丢失了被动限额检测');
-        claudeAccount(91);
-        exitIs(run('complete', ['--claude'], true), 12);
-        deviceSettings();
-        writeJSON(path.join(home, '.claude', 'settings.json'), claudeSettings());
+        check(passive.stdout.includes('Claude 用量限额'), '丢失了被动限额检测');
+        // API 路径不使用订阅读数，也不探测。
+        deviceSettings({ currentProviderClaude: 'official-claude' });
+        writeJSON(path.join(home, '.claude', 'settings.json'), { env: { ANTHROPIC_API_KEY: routeKey } });
+        claudeUsage(99);
+        const before = probes();
         exitIs(run('complete', ['--claude'], true), 0);
-        const changedConfig = structuredClone(routeConfig);
-        changedConfig.claudeWeeklyThreshold = 95;
-        writeJSON(path.join(home, 'config.json'), changedConfig);
-        useClaudeSubscription(91);
-        exitIs(run('complete', ['--claude'], true), 0);
-        changedConfig.claudeWeeklyThreshold = 0;
-        writeJSON(path.join(home, 'config.json'), changedConfig);
-        claudeAccount(0);
-        exitIs(run('complete', ['--claude'], true), 12);
+        check(probes() === before, 'API 路径不应探测订阅用量');
+        // 旧配置：windowHours / reservePercent 报错，claudeWeeklyThreshold 被忽略并在 status 说明。
+        for (const [key, value] of [['windowHours', 36], ['reservePercent', 90], ['bogus', 1], ['urgentMaxPercent', 101], ['dayStartHour', 24]]) {
+          const bad = structuredClone(routeConfig);
+          bad.claudePacing = { ...bad.claudePacing, [key]: value };
+          writeJSON(path.join(home, 'config.json'), bad);
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: dispatchTimeout });
+          check(result.status === 2 && result.stderr.includes('claudePacing'), `${key} 应报配置错误: ${result.stderr}`);
+        }
+        const legacy = structuredClone(routeConfig);
+        legacy.claudeWeeklyThreshold = 80;
+        writeJSON(path.join(home, 'config.json'), legacy);
+        const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: dispatchTimeout });
+        check(status.status === 0 && status.stdout.includes('claude weekly threshold: ignored'), `旧阈值应被忽略并提示: ${status.stdout}`);
       })],
       [79, 'CC Switch 用例 13：Codex 续跑同服务商继续，变更服务商或 endpoint 后重建并记录', () => withRoutedFixture(async () => {
         let first = run('complete', ['--write']);
@@ -2766,6 +2848,120 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           save();
           fs.rmSync(settingsFile, { force: true });
           deviceSettings({ currentProviderCodex: 'official-codex' });
+        }
+      })],
+      [102, '路由顺序官方 → Claude → Micu，耗尽时等待、LIMIT、--urgent 与通知', () => withMicuRoutes(async () => {
+        useBothSubscriptions();
+        const notifyFile = path.join(home, 'notifications.jsonl');
+        const events = () => { try { return fs.readFileSync(notifyFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line).event); } catch { return []; } };
+        const limited = (week, options, args = [], scenario = 'complete') => {
+          const state = seedLimit();
+          appMode('limited', state.resets_at);
+          claudeUsage(week, options);
+          fs.rmSync(notifyFile, { force: true });
+          const mark = invocationRows().length;
+          const result = run(scenario, args, true, { preserveCooldown: true });
+          return { result, calls: execCalls(mark), state };
+        };
+        // Claude 在用量线内：官方受限 → Claude，不到 Micu，没有 Micu 通知。
+        let r = limited(25);
+        exitIs(r.result, 0);
+        check(r.result.record.executor === 'claude' && r.calls.length === 0 && !events().includes('micu-switch'), '用量线内应走 Claude 而不是 Micu');
+        check(r.result.record.routes?.map((row) => row.route).join() === 'official,claude', `routes 记录不符: ${JSON.stringify(r.result.record.routes)}`);
+        // 超线：转 Micu，并发一次 micu-switch 通知；120 分钟内同事件不重复。
+        r = limited(41);
+        exitIs(r.result, 0);
+        check(r.result.record.executor === 'codex' && r.calls.length === 1 && isMicu(r.calls[0]) && events().includes('micu-switch'), '超线应转 Micu 并通知');
+        r = limited(41);
+        exitIs(r.result, 0);
+        check(!events().includes('micu-switch') && allLogs(r.result).includes('notify skipped: micu-switch'), `notifyRepeatMinutes 内不应重复通知: ${events()}`);
+        const notifyState = path.join(home, 'state', 'notify-state.json');
+        const aged = JSON.parse(fs.readFileSync(notifyState, 'utf8'));
+        aged['micu-switch'] = new Date(Date.now() - 121 * 60_000 - 86400_000).toISOString();
+        writeJSON(notifyState, aged);
+        r = limited(41);
+        exitIs(r.result, 0);
+        check(events().includes('micu-switch'), '超过间隔后应再次通知');
+        // 周用量进入应急保留区（≥85%）通知。
+        r = limited(86);
+        check(events().includes('claude-reserve'), '应急保留区应通知');
+        // Micu 当日花费达到上限后不可用：Claude 也超线 → 耗尽。
+        const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date());
+        writeJSON(path.join(home, 'state', 'provider-spend.json'), { [day]: { Micu: 6 } });
+        r = limited(41, { fiveHours: 3, five: 10 });
+        // Claude 超线的恢复时间是次日 7:00（本地），Micu 是新加坡次日零点，官方 2 小时：最早的在 30 分钟以外时输出 LIMIT。
+        check([15, 0].includes(r.result.status), `耗尽应 LIMIT 或在 30 分钟内等待恢复: ${r.result.status}`);
+        if (r.result.status === 15) {
+          check(r.result.stdout.startsWith('LIMIT\n') && /^route: codex 官方 \|/m.test(r.result.stdout) && /^route: claude \|/m.test(r.result.stdout) &&
+            /^urgent: .*--urgent/m.test(r.result.stdout) && /^earliest: \d{4}-/m.test(r.result.stdout) && events().includes('exhausted') &&
+            r.calls.length === 0, `LIMIT 输出不符: ${r.result.stdout}`);
+          // --urgent：全部不可用时动用 Claude 应急保留（周 41% < 95%）。
+          r = limited(41, {}, ['--urgent']);
+          exitIs(r.result, 0);
+          check(r.result.record.executor === 'claude' && allLogs(r.result).includes('urgent: 全部路由不可用'), '--urgent 应动用应急保留');
+          // 周用量超过 95% 时 --urgent 也不行。
+          r = limited(96, {}, ['--urgent']);
+          exitIs(r.result, 15);
+          check(allLogs(r.result).includes('urgent: Claude 应急保留不可用'), '95% 以上 --urgent 应不可用');
+        }
+        // 正常顺序下 --urgent 不抢先：用量线内仍走正常顺序，不记 urgent。
+        r = limited(25, {}, ['--urgent']);
+        exitIs(r.result, 0);
+        check(r.result.record.executor === 'claude' && !allLogs(r.result).includes('urgent:'), '--urgent 在正常路由可用时不应动用应急保留');
+        fs.rmSync(path.join(home, 'state', 'provider-spend.json'), { force: true });
+        // 参数冲突。
+        for (const bad of [['--urgent', '--claude'], ['--urgent', '--no-claude'], ['--urgent', '--monitor']]) {
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', ...bad, '--cwd', repo], { env, cwd: home, input: 'x', encoding: 'utf8', timeout: 10000 });
+          check(result.status === 2, `${bad.join(' ')} 应报参数错误`);
+        }
+      })],
+      [103, '耗尽后最早恢复在 30 分钟内：等待并重新路由', () => withRoutedFixture(async () => {
+        useBothSubscriptions();
+        const waitEnv = { ...env, AGENT_ROUTE_WAIT_MS: '2500' };
+        // 官方 2 秒后恢复；Claude 5h 80% 不可用（3 小时后恢复）。等待结束后重新路由回到官方。
+        const state = seedLimit({ resets_at: Math.floor(Date.now() / 1000) + 2 });
+        appMode('limited', state.resets_at);
+        claudeUsage(25, { five: 80 });
+        const input = 'AGENT_ROUTE_SELFTEST:complete\n';
+        const result = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--cwd', repo], { env: waitEnv, cwd: home, input, encoding: 'utf8', timeout: dispatchTimeout });
+        exitIs(result, 0);
+        const record = history().at(-1);
+        const log = fs.readFileSync(path.join(home, 'logs', `${record.log_id}.log`), 'utf8');
+        check(/wait: \d+ until .* \(codex 官方: /.test(log) && record.executor === 'codex' && !log.includes('exhausted ') ,
+          `应等待后回到官方: ${result.stdout} ${log.slice(-600)}`);
+      })],
+      [104, '并发派发只用一张重置券', () => withMicuRoutes(async () => {
+        const settingsFile = path.join(home, 'stub-rate-limits.json');
+        const consumeRows = () => {
+          try { return fs.readFileSync(path.join(home, 'stub-app-server.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.event === 'consume'); }
+          catch { return []; }
+        };
+        const savedCredits = routeConfig.codexResetCredits;
+        routeConfig.codexResetCredits = { ...savedCredits, auto: true };
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        try {
+          writeJSON(settingsFile, { primaryUsed: 50, weeklyUsed: 100, credits: [
+            { id: 'aaaaaaaa-0000-0000-0000-000000000001', expiresInHours: 100 }, { id: 'bbbbbbbb-0000-0000-0000-000000000002', expiresInHours: 10 }] });
+          seedLimit({ type: 'weekly', source: 'session' });
+          const before = consumeRows().length;
+          const count = history().length;
+          const results = await Promise.all(Array.from({ length: 2 }, () => new Promise((resolve) => {
+            const child = spawn(process.execPath, [SCRIPT_PATH, 'tier1', '--no-claude', '--cwd', repo], { env, cwd: home, stdio: ['pipe', 'pipe', 'pipe'] });
+            let out = '';
+            child.stdout.on('data', (chunk) => { out += chunk; });
+            child.on('close', (code) => resolve({ code, out }));
+            child.stdin.end('AGENT_ROUTE_SELFTEST:complete\n');
+          })));
+          check(results.every((row) => row.code === 0), `并发派发应都成功: ${JSON.stringify(results)}`);
+          check(consumeRows().length === before + 1, `两个并发派发应只用一张券: ${consumeRows().length - before} ${JSON.stringify(results)} ${history().slice(count).map((row) => allLogs({ record: row }).slice(-1500)).join('\n=====\n')}`);
+          const rows = history().slice(count);
+          check(rows.length === 2 && rows.every((row) => row.executor === 'codex' && row.providers.codex.route === 'official'), '两个派发都应在官方运行');
+          check(rows.filter((row) => row.reset_credit).length === 1, '只有一个派发记录用券');
+          check(!fs.existsSync(path.join(home, 'state', 'route.lock')), '不应残留 route.lock');
+        } finally {
+          routeConfig.codexResetCredits = savedCredits;
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+          fs.rmSync(settingsFile, { force: true });
         }
       })],
     );

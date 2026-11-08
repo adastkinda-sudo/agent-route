@@ -46,7 +46,6 @@
     "enabled": true,
     "onReadError": "live-config"
   },
-  "claudeWeeklyThreshold": 80,
   "codexFallback": {
     "providers": [
       {
@@ -100,9 +99,17 @@
     "maxRouteSwitches": 3
   },
   "claudePacing": {
-    "windowHours": 36,
-    "reservePercent": 90,
-    "staleMinutes": 60
+    "dayStartHour": 7,
+    "emergencyReservePercent": 15,
+    "minDailyHeadroomPercent": 2,
+    "fiveHourMaxPercent": 70,
+    "finalWindowHours": 36,
+    "finalWindowReservePercent": 5,
+    "urgentMaxPercent": 95,
+    "staleMinutes": 60,
+    "probeMinutes": 5,
+    "maxAutoWaitMinutes": 30,
+    "notifyRepeatMinutes": 120
   },
   "codexResetCredits": {
     "auto": true,

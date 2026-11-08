@@ -36,7 +36,6 @@ const COOLDOWN_FILE = path.join(STATE_DIR, 'cooldown.json');
 const HISTORY_FILE = path.join(STATE_DIR, 'history.jsonl');
 const CODEX_LIMIT_FILE = path.join(STATE_DIR, 'codex-limit.json');
 const PROVIDER_LIMIT_FILE = path.join(STATE_DIR, 'provider-limit.json');
-const CLAUDE_LIMIT_FILE = path.join(STATE_DIR, 'claude-limit.json');
 const MICU_MODEL_FILE = path.join(STATE_DIR, 'micu-models.json');
 const PROVIDER_SPEND_FILE = path.join(STATE_DIR, 'provider-spend.json');
 const CIRCUIT_FILE = path.join(STATE_DIR, 'circuit.json');
@@ -71,7 +70,7 @@ const RULES = `执行规则：
 - 你的执行时间有上限（Claude 60 分钟、Codex 90 分钟），超时会被强制结束且没有汇报。预计超过 10 分钟的命令（全量扫描、批量迁移、长测试等）不要前台运行或循环等待：先在小样本上验证，再用 nohup 脱离运行并把输出写进日志，然后立即汇报"部分完成"，在遗留问题里写明完整命令、日志路径、预计耗时和结束后要核对的内容，由主 agent 等待结果。多个长命令不要并行争抢同一批文件。临时文件不要写进 /tmp，写在任务说明给出的目录或 --cwd 下已被 git 忽略的位置。`;
 
 const USAGE = `usage:
-  agent-route <tier1|tier2> [--resume ID] [--write] [--no-claude | --claude] [--monitor] [--full-output] [--ignore-budget] [--effort LEVEL] [--exclude PATH]... [--cwd DIR] [--prompt-file FILE] [--verify COMMAND]... [--fix-rounds N] [--progress-doc PATH] [--label TEXT] [--commit MSG]
+  agent-route <tier1|tier2> [--resume ID] [--write] [--no-claude | --claude] [--monitor] [--full-output] [--ignore-budget] [--urgent] [--effort LEVEL] [--exclude PATH]... [--cwd DIR] [--prompt-file FILE] [--verify COMMAND]... [--fix-rounds N] [--progress-doc PATH] [--label TEXT] [--commit MSG]
   (无 --prompt-file 时读 stdin)
   agent-route status
   agent-route clear-cooldown
@@ -84,7 +83,10 @@ config.local.json 可选 stateDir（支持 ~ 开头）以共享额度和冷却�
 日志是 <ROOT>/logs/<id>.log，报告是 <ROOT>/logs/<id>.report.md；<ROOT> 为 ${ROOT}。
 默认在 Codex 失败或冷却时调用 Claude；--no-claude 时只输出 FALLBACK 块。
 Codex 订阅账号受限时自动交给 Claude；每 5 分钟查询额度，接口不可用时每 15 分钟用真实任务重试 Codex。API 服务商只被动检测限速或余额错误。--no-claude 保持 LIMIT、退出码 15。
---claude 跳过 Codex 和冷却，直接交给 Claude 执行（Codex 不可用时由主 agent 显式选择）；不能与 --resume、--no-claude、--monitor 同用。
+路由顺序：Codex 官方 → Claude（受每日用量线约束，见 config 的 claudePacing）→ Micu → 全部不可用。Claude 用量取自 claude -p 的 stream-json rate_limit_event，读数超过 claudePacing.staleMinutes 视为没有 Claude 额度。
+全部不可用且最早恢复时间在 maxAutoWaitMinutes 内时自动等待后重新路由；更久则输出 LIMIT（退出码 15），写明各路由恢复时间。--no-claude 不等待，直接输出 LIMIT 或 FALLBACK。
+--claude 跳过 Codex 和冷却，直接交给 Claude 执行，可动用应急保留（周用量上限 claudePacing.urgentMaxPercent）；不能与 --resume、--no-claude、--monitor 同用。
+--urgent 按正常顺序路由，只在全部不可用时动用 Claude 应急保留（同一上限）；不能与 --claude、--no-claude、--monitor 同用。
 --monitor 时 Codex 的 effort 改用 config 的 monitorEffort（monitor-loop 使用），不解析汇报状态。
 --effort 覆盖本次 Codex 的 effort（${'none|minimal|low|medium|high|xhigh'}），不影响 Claude fallback。
 config 的 codexStreamIdleTimeoutMs 设置 Codex 流空闲超时（毫秒，默认 120000；0 或未设置时不覆盖）。
@@ -237,6 +239,7 @@ function circuitLabel(candidate, routeModel = candidate?.model) {
 
 function logCircuit(candidate, from, to, reason, routeModel = candidate?.model) {
   if (typeof log === 'function' && from !== to) log(`circuit: ${circuitLabel(candidate, routeModel)} ${from}→${to} (${reason})`);
+  if (typeof log === 'function' && from !== to && to === 'open') notifyOnce(`circuit-${circuitLabel(candidate, routeModel)}`, `熔断器打开: ${circuitLabel(candidate, routeModel)} (${reason})`);
 }
 
 // 判断路由能否使用；claim 为真且处于 HalfOpen 时占用唯一探测名额。
@@ -807,41 +810,190 @@ function claudeSubscriptionAuth(config, context, env, home, cwd) {
   } catch { return false; }
 }
 
-// Claude Code 2.1.308 的本地缓存：账号必须匹配，且 fetchedAtMs 在一小时内；不读取凭据或主动查额度。
-function claudeWeeklyUsage(data, now = Date.now()) {
-  const cache = data?.cachedUsageUtilization;
-  const account = data?.oauthAccount?.accountUuid;
-  if (!present(account) || cache?.accountUuid !== account || !Number.isFinite(cache?.fetchedAtMs) ||
-    now - cache.fetchedAtMs < 0 || now - cache.fetchedAtMs > 3_600_000) return null;
-  const weekly = cache.utilization?.seven_day;
-  const resets = typeof weekly?.resets_at === 'string' ? Date.parse(weekly.resets_at) : NaN;
-  if (typeof weekly?.utilization !== 'number' || !Number.isFinite(weekly.utilization) || weekly.utilization < 0 ||
-    weekly.utilization > 100 || !Number.isFinite(resets) || resets <= now) return null;
-  return { used_percent: weekly.utilization, resets_at: resets / 1000, observed_at: new Date(cache.fetchedAtMs).toISOString(),
-    source: 'claude-code-cache' };
+// ---------- Claude 订阅节奏（3.3） ----------
+// 用量来源：claude -p --output-format stream-json 的 rate_limit_event.unifiedWindows（Claude Code 2.1.308 实测；
+// utilization 为 0–1 的小数，与 statusLine 的 rate_limits 同源）。本地 cachedUsageUtilization 只在打开 /usage 时刷新，不可靠。
+const CLAUDE_USAGE_FILE = path.join(STATE_DIR, 'claude-usage.json');
+const CLAUDE_PACING_FILE = path.join(STATE_DIR, 'claude-pacing.json');
+const ROUTE_LOCK_FILE = path.join(STATE_DIR, 'route.lock');
+const CLAUDE_PACING_DEFAULTS = { dayStartHour: 7, emergencyReservePercent: 15, minDailyHeadroomPercent: 2, fiveHourMaxPercent: 70,
+  finalWindowHours: 36, finalWindowReservePercent: 5, urgentMaxPercent: 95, staleMinutes: 60, probeMinutes: 5,
+  maxAutoWaitMinutes: 30, notifyRepeatMinutes: 120 };
+
+function claudePacingConfig(config) {
+  return { ...CLAUDE_PACING_DEFAULTS, ...(isConfigObject(config?.claudePacing) ? config.claudePacing : {}) };
 }
 
-function claudeQuota(config, context, persist = false) {
-  if (context?.billingType !== 'subscription') return { limit: null, snapshot: null };
-  const key = `${routeStateKey('claude', context, 'weekly')}:${context.accountFingerprint}`;
-  const previous = readLimitEntries(CLAUDE_LIMIT_FILE, 'accounts')[key] ?? null;
-  const threshold = config.claudeWeeklyThreshold ?? 80;
-  const snapshot = context.weeklyUsage ?? null;
-  const select = (current) => {
-    let limit = limitActive(current) && current.used_percent >= threshold ? current : null;
-    if (snapshot && (!current || Date.parse(snapshot.observed_at) >= Date.parse(current.observed_at))) {
-      limit = snapshot.used_percent >= threshold ? { ...snapshot, type: 'weekly', threshold } : null;
-    }
-    return limit;
-  };
-  let limit = select(previous);
-  if (persist && (snapshot || previous)) {
-    updateLimitEntries(CLAUDE_LIMIT_FILE, 'accounts', key, (current) => {
-      limit = select(current);
-      return JSON.stringify(limit) === JSON.stringify(current) ? undefined : limit;
-    });
+function claudeUsageWindow(raw, now) {
+  const used = raw?.utilization;
+  const reset = raw?.resetsAt;
+  if (typeof used !== 'number' || !Number.isFinite(used) || used < 0 || typeof reset !== 'number' || !Number.isFinite(reset) ||
+    reset * 1000 <= now) return null;
+  return { used_percent: Math.round(Math.min(used, 1) * 1000) / 10, resets_at: reset };
+}
+
+function parseClaudeUsageEvents(text, now = Date.now()) {
+  let windows = null;
+  for (const line of String(text).split('\n')) {
+    if (!line.includes('rate_limit_event')) continue;
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    if (event?.type === 'rate_limit_event' && event.rate_limit_info?.unifiedWindows) windows = event.rate_limit_info.unifiedWindows;
   }
-  return { limit, snapshot };
+  if (!windows) return null;
+  const five = claudeUsageWindow(windows.five_hour, now);
+  const week = claudeUsageWindow(windows.seven_day, now);
+  return five || week ? { five_hour: five, seven_day: week, observed_at: new Date(now).toISOString(), source: 'stream-json' } : null;
+}
+
+function claudeUsageKey(context) {
+  return context?.accountFingerprint ?? 'default';
+}
+
+function readStoredClaudeUsage(context) {
+  const entry = readJsonFile(CLAUDE_USAGE_FILE, {}).accounts?.[claudeUsageKey(context)];
+  return entry && Number.isFinite(Date.parse(entry.observed_at)) ? entry : null;
+}
+
+// 用一次最小的 haiku 调用取得用量；失败返回 null。
+function probeClaudeUsage(config, context, cwd, env = process.env) {
+  const model = config.monitorClaude?.model ?? config.tiers?.tier2?.claude?.model ?? 'haiku';
+  const result = spawnSync(config.claudeBin ?? 'claude', ['-p', 'ok', '--model', model, '--output-format', 'stream-json', '--verbose',
+    '--no-session-persistence', '--setting-sources', '', '--tools', '', '--disable-slash-commands'],
+    { cwd, env: claudeEnvironment(context, env), encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024 });
+  if (result.error) return null;
+  return parseClaudeUsageEvents(result.stdout);
+}
+
+// 返回新鲜的用量读数：存档不超过 probeMinutes 直接用，否则探测一次；探测失败时存档不超过 staleMinutes 仍可用。
+function readClaudeUsage(config, context, cwd, { probe = true, now = Date.now() } = {}) {
+  const settings = claudePacingConfig(config);
+  const stored = readStoredClaudeUsage(context);
+  const age = stored ? now - Date.parse(stored.observed_at) : Infinity;
+  const usable = (entry) => entry && (entry.seven_day?.resets_at * 1000 > now || entry.five_hour?.resets_at * 1000 > now);
+  if (stored && age >= 0 && age <= settings.probeMinutes * 60_000 && usable(stored)) return stored;
+  if (probe) {
+    const fresh = probeClaudeUsage(config, context, cwd);
+    if (fresh) {
+      const state = readJsonFile(CLAUDE_USAGE_FILE, {});
+      state.accounts = { ...(state.accounts ?? {}), [claudeUsageKey(context)]: fresh };
+      writeJsonAtomic(CLAUDE_USAGE_FILE, state);
+      return fresh;
+    }
+  }
+  return stored && age >= 0 && age <= settings.staleMinutes * 60_000 && usable(stored) ? stored : null;
+}
+
+function pidOf(file) {
+  try { return Number(fs.readFileSync(file, 'utf8').trim()); } catch { return NaN; }
+}
+
+function tryAcquireRouteLock() {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  try {
+    const fd = fs.openSync(ROUTE_LOCK_FILE, 'wx', 0o600);
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    return true;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    let age = 0;
+    try { age = Date.now() - fs.statSync(ROUTE_LOCK_FILE).mtimeMs; } catch { return false; }
+    const owner = pidOf(ROUTE_LOCK_FILE);
+    if ((Number.isFinite(owner) && owner > 0 && !pidAlive(owner)) || age > 120_000) fs.rmSync(ROUTE_LOCK_FILE, { force: true });
+    return false;
+  }
+}
+
+// state/route.lock：用券、花费账本、熔断和 claude-pacing.json 的读改写互斥。进程退出时遗留的锁按 pid 回收。
+function withRouteLockSync(fn, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!tryAcquireRouteLock()) {
+    if (Date.now() > deadline) throw new Error('route.lock 超时');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  try { return fn(); } finally { fs.rmSync(ROUTE_LOCK_FILE, { force: true }); }
+}
+
+async function withRouteLock(fn, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!tryAcquireRouteLock()) {
+    if (Date.now() > deadline) throw new Error('route.lock 超时');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  try { return await fn(); } finally { fs.rmSync(ROUTE_LOCK_FILE, { force: true }); }
+}
+
+function pacingDay(now, dayStartHour) {
+  const shifted = new Date(now - dayStartHour * 3_600_000);
+  return `${shifted.getFullYear()}-${String(shifted.getMonth() + 1).padStart(2, '0')}-${String(shifted.getDate()).padStart(2, '0')}`;
+}
+
+function nextPacingDayStart(now, dayStartHour) {
+  const next = new Date(now);
+  next.setHours(dayStartHour, 0, 0, 0);
+  if (next.getTime() <= now) next.setDate(next.getDate() + 1);
+  return next.getTime();
+}
+
+// 每天第一次派发（或周额度重置后）记录当时的周用量 U0；在文件锁内读改写。resets_at 相差 1 小时内视为同一周（读数有秒级抖动）。
+function claudeDayStart(context, usage, settings, now) {
+  const week = usage.seven_day;
+  if (!week) return null;
+  const day = pacingDay(now, settings.dayStartHour);
+  return withRouteLockSync(() => {
+    const state = readJsonFile(CLAUDE_PACING_FILE, {});
+    const key = claudeUsageKey(context);
+    const entry = state.accounts?.[key];
+    if (entry?.day === day && Math.abs(entry.week_resets_at - week.resets_at) < 3600 && Number.isFinite(entry.u0)) return entry;
+    const next = { day, u0: week.used_percent, recorded_at: new Date(now).toISOString(), week_resets_at: week.resets_at };
+    writeJsonAtomic(CLAUDE_PACING_FILE, { ...state, accounts: { ...(state.accounts ?? {}), [key]: next } });
+    return next;
+  });
+}
+
+// mode: normal（每日用量线）/ urgent（动用应急保留，上限 urgentMaxPercent）；--claude 同 urgent。
+function claudePacingDecision(settings, usage, u0, now, mode = 'normal') {
+  const week = usage?.seven_day ?? null;
+  const five = usage?.five_hour ?? null;
+  const fiveUsed = five && five.resets_at * 1000 > now ? five.used_percent : 0;
+  const base = { used: week?.used_percent ?? null, fiveHour: fiveUsed, weekResets: week?.resets_at ?? null };
+  if (!usage || !week) return { ...base, allowed: mode !== 'normal', reason: mode === 'normal' ? 'usage-stale' : 'usage-unavailable', retryAt: null };
+  const remainingMs = week.resets_at * 1000 - now;
+  if (mode !== 'normal') {
+    if (week.used_percent >= settings.urgentMaxPercent) {
+      return { ...base, allowed: false, reason: `weekly ${week.used_percent}% >= urgent cap ${settings.urgentMaxPercent}%`, retryAt: week.resets_at * 1000 };
+    }
+    if (fiveUsed >= 100) return { ...base, allowed: false, reason: `5h ${fiveUsed}%`, retryAt: five.resets_at * 1000 };
+    return { ...base, allowed: true, reason: 'urgent', cap: settings.urgentMaxPercent };
+  }
+  const final = remainingMs <= settings.finalWindowHours * 3_600_000;
+  if (fiveUsed >= settings.fiveHourMaxPercent) {
+    return { ...base, final, allowed: false, reason: `5h ${fiveUsed}% >= ${settings.fiveHourMaxPercent}%`, retryAt: five.resets_at * 1000 };
+  }
+  if (final) {
+    const cap = 100 - settings.finalWindowReservePercent;
+    return week.used_percent < cap ? { ...base, final, allowed: true, reason: 'final-window', cap }
+      : { ...base, final, allowed: false, reason: `final window weekly ${week.used_percent}% >= ${cap}%`, retryAt: week.resets_at * 1000 };
+  }
+  const days = Math.max(1, remainingMs / 86_400_000);
+  const start = Number.isFinite(u0) ? u0 : week.used_percent;
+  const line = start + (100 - settings.emergencyReservePercent - start) / days;
+  const rounded = Math.round(line * 10) / 10;
+  return week.used_percent + settings.minDailyHeadroomPercent <= line
+    ? { ...base, final, allowed: true, reason: 'daily-line', line: rounded, u0: start }
+    : { ...base, final, allowed: false, reason: `daily line ${rounded}% (weekly ${week.used_percent}% + ${settings.minDailyHeadroomPercent}% headroom)`,
+      line: rounded, u0: start, retryAt: nextPacingDayStart(now, settings.dayStartHour) };
+}
+
+// 订阅账号才受节奏约束；API 和未启用 CC Switch 的路径不变。
+function claudeGateFor(config, context, cwd, mode, { probe = true, now = Date.now() } = {}) {
+  if (context?.billingType !== 'subscription') return { allowed: true, reason: 'not-subscription', applies: false };
+  const settings = claudePacingConfig(config);
+  const usage = readClaudeUsage(config, context, cwd, { probe, now });
+  const u0 = usage && mode === 'normal' && probe ? claudeDayStart(context, usage, settings, now)?.u0
+    : readJsonFile(CLAUDE_PACING_FILE, {}).accounts?.[claudeUsageKey(context)]?.u0;
+  return { ...claudePacingDecision(settings, usage, u0, now, mode), applies: true, observed_at: usage?.observed_at ?? null, usage };
 }
 
 function readCodexQuota(context, model) {
@@ -1088,16 +1240,20 @@ function validateCodexFallback(config) {
 
 function validateClaudePacing(config) {
   const pacing = config.claudePacing;
+  if (pacing === undefined) return;
   if (!isConfigObject(pacing)) throw new Error('claudePacing 必须是对象');
-  if (typeof pacing.windowHours !== 'number' || !Number.isFinite(pacing.windowHours) || pacing.windowHours <= 0) {
-    throw new Error('claudePacing.windowHours 必须是正数');
+  for (const [legacy, replacement] of [['windowHours', 'finalWindowHours'], ['reservePercent', 'emergencyReservePercent / finalWindowReservePercent']]) {
+    if (pacing[legacy] !== undefined) throw new Error(`claudePacing.${legacy} 已移除，改用 ${replacement}`);
   }
-  if (typeof pacing.reservePercent !== 'number' || !Number.isFinite(pacing.reservePercent) ||
-      pacing.reservePercent < 0 || pacing.reservePercent > 100) {
-    throw new Error('claudePacing.reservePercent 必须是 0–100 的数值');
-  }
-  if (typeof pacing.staleMinutes !== 'number' || !Number.isFinite(pacing.staleMinutes) || pacing.staleMinutes <= 0) {
-    throw new Error('claudePacing.staleMinutes 必须是正数');
+  for (const key of Object.keys(pacing)) {
+    if (!Object.hasOwn(CLAUDE_PACING_DEFAULTS, key)) throw new Error(`claudePacing.${key} 不是有效配置项`);
+    const value = pacing[key];
+    const percent = /Percent$/.test(key);
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || (percent && value > 100)) {
+      throw new Error(`claudePacing.${key} 必须是${percent ? ' 0–100 的' : '非负'}数值`);
+    }
+    if (key === 'dayStartHour' && (!Number.isInteger(value) || value > 23)) throw new Error('claudePacing.dayStartHour 必须是 0–23 的整数');
+    if (['staleMinutes', 'probeMinutes', 'finalWindowHours'].includes(key) && value <= 0) throw new Error(`claudePacing.${key} 必须是正数`);
   }
 }
 
@@ -1265,10 +1421,6 @@ function readConfig({ forceProbe = false } = {}) {
       for (const key of ['claudeBin', 'codexBin']) if (forceProbe ? found[key] : !Object.hasOwn(nextLocal, key) && found[key]) nextLocal[key] = found[key];
       if (forceProbe || !localExists || Object.keys(nextLocal).length !== Object.keys(local).length) writeLocalConfig(nextLocal);
       Object.assign(config, nextLocal);
-    }
-    if (config.claudeWeeklyThreshold !== undefined && (typeof config.claudeWeeklyThreshold !== 'number' ||
-      !Number.isFinite(config.claudeWeeklyThreshold) || config.claudeWeeklyThreshold < 0 || config.claudeWeeklyThreshold > 100)) {
-      throw new Error('claudeWeeklyThreshold 必须是 0–100 的数值');
     }
     if (config.codexStreamIdleTimeoutMs !== undefined &&
       (!Number.isSafeInteger(config.codexStreamIdleTimeoutMs) || config.codexStreamIdleTimeoutMs < 0)) {
@@ -1551,7 +1703,6 @@ async function resolveDispatchContext(config, { home = os.homedir(), env = proce
             catch { context.diagnostics.push('claude-usage-unreadable'); }
             context.accountFingerprint = crypto.createHash('sha256').update(JSON.stringify([
               context.configDir, account.oauthAccount?.accountUuid ?? null])).digest('hex');
-            context.weeklyUsage = claudeWeeklyUsage(account);
           }
         }
         if (context.billingType === 'unknown') context.diagnostics.push(...(app === 'claude' ? ['claude-login-unverified'] :
@@ -1661,7 +1812,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -1837,12 +1988,15 @@ if (cmd === 'status') {
     }
   }
   const claude = context.claude;
-  const claudeQuotaState = claudeQuota(config, claude);
-  const weekly = claudeQuotaState.snapshot ?? claudeQuotaState.limit;
-  console.log(`claude weekly: ${claude?.billingType === 'api' ? 'not applicable (API)' : weekly
-    ? `${weekly.used_percent}% resets ${fmtLocal(new Date(weekly.resets_at * 1000))}` : 'unknown (passive detection)'}`);
-  console.log(`claude weekly threshold: ${config.claudeWeeklyThreshold ?? 80}%; cooldown: ${claudeQuotaState.limit
-    ? `until ${new Date(claudeQuotaState.limit.resets_at * 1000).toISOString()}` : 'none'}`);
+  // status 只读：用最近一次存档的用量，不触发探测。
+  if (claude?.billingType === 'subscription') {
+    const settings = claudePacingConfig(config);
+    const gate = claudeGateFor(config, claude, process.cwd(), 'normal', { probe: false });
+    const usage = gate.usage;
+    console.log(`claude weekly: ${usage?.seven_day ? `${usage.seven_day.used_percent}% resets ${fmtLocal(new Date(usage.seven_day.resets_at * 1000))}` : 'unknown (no fresh usage reading)'}; 5h: ${usage?.five_hour ? `${usage.five_hour.used_percent}%` : 'unknown'}`);
+    console.log(`claude pacing: ${gate.allowed ? 'allow' : 'block'} (${gate.reason})${gate.line !== undefined ? `; daily line ${gate.line}% from u0 ${gate.u0}%` : ''}; urgent cap ${settings.urgentMaxPercent}%${usage ? `; observed ${usage.observed_at}` : ''}`);
+  } else console.log(`claude weekly: ${claude?.billingType === 'api' ? 'not applicable (API)' : 'unknown (provider not verified)'}`);
+  if (config.claudeWeeklyThreshold !== undefined) console.log('claude weekly threshold: ignored (replaced by claudePacing)');
   for (const tier of Object.keys(config.tiers ?? {})) {
     const selected = resolveClaudeModel(tier, claude, config);
     console.log(`claude ${tier} model: ${selected.model}; effort: ${selected.effort}`);
@@ -1879,6 +2033,7 @@ let write = false;
 let noClaude = false;
 let forceClaude = false;
 let ignoreBudget = false;
+let urgent = false;
 let monitor = false;
 let fullOutput = false;
 let cwdArg = null;
@@ -1898,6 +2053,7 @@ for (let i = 1; i < argv.length; i++) {
   else if (a === '--no-claude') noClaude = true;
   else if (a === '--claude') forceClaude = true;
   else if (a === '--ignore-budget') ignoreBudget = true;
+  else if (a === '--urgent') urgent = true;
   else if (a === '--monitor') monitor = true;
   else if (a === '--full-output') fullOutput = true;
   else if (['--cwd', '--prompt-file', '--effort', '--exclude', '--resume', '--verify', '--fix-rounds', '--progress-doc', '--label', '--commit'].includes(a)) {
@@ -1974,6 +2130,7 @@ const config = readConfig();
 const dispatchContext = await resolveDispatchContext(config, { cwd });
 if (dispatchContext.enabled && dispatchContext.codex.billingType !== 'unknown') CODEX_HOME = dispatchContext.codex.configDir;
 const tierCfg = config.tiers?.[tier];
+if (urgent && (forceClaude || noClaude || monitor)) die('--urgent 不能与 --claude、--no-claude 或 --monitor 同用');
 if (forceClaude && (resumeArg !== null || noClaude || monitor || ignoreBudget)) die('--claude 不能与 --resume、--no-claude、--monitor 或 --ignore-budget 同用');
 if (!tierCfg?.codex?.model) { process.stderr.write(`agent-route: config 中缺少 ${tier}.codex\n`); process.exit(2); }
 const officialModels = tierCfg.codex.models ?? [tierCfg.codex.model];
@@ -2011,6 +2168,8 @@ let verifyResult = null;
 let session = resumeInfo?.session ?? null;
 let codexTokens = null;
 let usedFallback = false;
+let claudeMode = forceClaude ? 'urgent' : 'normal';
+let waitCount = 0;
 let commitHash = null;
 let progressRecord = null;
 let codexLimitReason = null;
@@ -2035,6 +2194,8 @@ const officialCodexContext = dispatchContext.codex;
 let activeCodexContext = dispatchContext.codex;
 let activeRouteKind = 'official';
 let routeCandidates = [];
+let claudeFirst = false;
+const claudeGateCache = new Map();
 let routeIndex = 0;
 let capacityRetried = false;
 let budgetIgnoredUsed = false;
@@ -2059,6 +2220,26 @@ function notify(event, message) {
         `agent-route: ${event}`, message], { timeout: 5000, stdio: 'ignore' });
     }
   } catch { /* 通知只是提示 */ }
+}
+// 同一事件每次派发最多一条；repeatMinutes 给定时，还要求距上一次通知超过该间隔或已跨自然日（状态在 notify-state.json）。
+const notifiedEvents = new Set();
+function notifyOnce(event, message, { repeatMinutes = null } = {}) {
+  if (notifiedEvents.has(event)) return false;
+  notifiedEvents.add(event);
+  if (repeatMinutes !== null) {
+    const file = path.join(STATE_DIR, 'notify-state.json');
+    const due = withRouteLockSync(() => {
+      const state = readJsonFile(file, {});
+      const last = Date.parse(state[event]);
+      const now = Date.now();
+      if (Number.isFinite(last) && now - last < repeatMinutes * 60_000 && todayKey() === new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date(last))) return false;
+      writeJsonAtomic(file, { ...state, [event]: new Date(now).toISOString() });
+      return true;
+    });
+    if (!due) { log(`notify skipped: ${event} (repeat < ${repeatMinutes}m)`); return false; }
+  }
+  notify(event, message);
+  return true;
 }
 let resetCreditAttempted = false;
 let resetCreditRecord = null;
@@ -2190,6 +2371,11 @@ function logExecArgs(bin, args) {
 
 function setActiveRoute(candidate, reason = null) {
   activeRouteKind = candidate.kind;
+  if (candidate.kind === 'claude') {
+    routesTried.push({ route: 'claude', model: candidate.model, ...(reason ? { reason: String(reason).slice(0, 120) } : {}) });
+    if (reason) log(`route: claude ${candidate.model} (${reason})`);
+    return;
+  }
   activeCodexContext = candidate.context;
   dispatchContext.codex = candidate.context;
   model = candidate.model;
@@ -2206,6 +2392,28 @@ function setActiveRoute(candidate, reason = null) {
   }
 }
 
+function nextLocalMidnightSingapore(now = Date.now()) {
+  return Math.floor((now + 8 * 3_600_000) / 86_400_000) * 86_400_000 + 86_400_000 - 8 * 3_600_000;
+}
+
+// 同一派发内 2 分钟复用同一次判断；refresh 强制重读（会按 probeMinutes 决定是否探测）。
+function claudeGate(mode = 'normal', { refresh = false } = {}) {
+  const hit = claudeGateCache.get(mode);
+  if (hit && !refresh && Date.now() - hit.at < 120_000) return hit.gate;
+  const gate = claudeGateFor(config, dispatchContext.claude, cwd, mode);
+  claudeGateCache.set(mode, { at: Date.now(), gate });
+  if (gate.applies) {
+    const parts = [`used=${gate.used ?? '?'}%`, `5h=${gate.fiveHour ?? '?'}%`, ...(gate.line !== undefined ? [`line=${gate.line}%`, `u0=${gate.u0}%`] : []),
+      ...(gate.cap !== undefined ? [`cap=${gate.cap}%`] : [])];
+    log(`claude pacing[${mode}]: ${gate.allowed ? 'allow' : 'block'} ${gate.reason} ${parts.join(' ')}${gate.observed_at ? ` observed ${gate.observed_at}` : ''}`);
+    const settings = claudePacingConfig(config);
+    if (gate.used !== null && gate.used >= 100 - settings.emergencyReservePercent) {
+      notifyOnce('claude-reserve', `Claude 周用量 ${gate.used}% 已进入应急保留区（≥ ${100 - settings.emergencyReservePercent}%）`);
+    }
+  }
+  return gate;
+}
+
 async function initializeRouteCandidates() {
   const candidates = [];
   const officialEffort = effortArg ?? (monitor ? (config.monitorEffort ?? tierCfg.codex.effort) : tierCfg.codex.effort);
@@ -2213,6 +2421,22 @@ async function initializeRouteCandidates() {
     ? [tierCfg.codex.apiModel ?? officialModels[0]] : officialModels;
   for (const official of officialList) {
     candidates.push({ kind: 'official', context: officialCodexContext, model: official, effort: officialEffort });
+  }
+  if (!noClaude && !forceClaude) {
+    const claudeCandidate = { kind: 'claude', context: dispatchContext.claude,
+      model: resolveClaudeModel(tier, dispatchContext.claude, config, { write, monitor }).model };
+    // 最后 36 小时且 Claude 周额度先于 Codex 重置时，先刷新的先用。
+    const gate = claudeGate('normal');
+    if (gate.allowed && gate.final && gate.weekResets && resumeArg === null &&
+      (!officialCodexContext || officialCodexContext.billingType === 'subscription')) {
+      const codexWeek = (await queryRateLimits(config))?.secondary?.resets_at;
+      if (codexWeek && gate.weekResets < codexWeek) {
+        claudeFirst = true;
+        log(`claude first: final window, claude resets ${new Date(gate.weekResets * 1000).toISOString()} before codex ${new Date(codexWeek * 1000).toISOString()}`);
+        candidates.unshift(claudeCandidate);
+      }
+    }
+    if (!claudeFirst) candidates.push(claudeCandidate);
   }
   for (const fallback of dispatchContext.codexFallbacks ?? []) {
     for (const secret of [fallback.runtime?.key, fallback.runtime?.baseUrl]) if (typeof secret === 'string' && secret.length >= 8) redactions.add(secret);
@@ -2235,17 +2459,23 @@ async function initializeRouteCandidates() {
 
 // 返回 null 表示可用；否则给出跳过原因。ignored 表示仅因软预算被 --ignore-budget 放行。
 function candidateBlock(candidate, { claim = false } = {}) {
+  if (candidate.kind === 'claude') {
+    const gate = claudeGate('normal');
+    return gate.allowed ? { reason: null, ignored: false } : { reason: `claude ${gate.reason}`, until: gate.retryAt ? new Date(gate.retryAt) : undefined };
+  }
   if (modelUnavailable(candidate, candidate.model)) return { reason: 'model-unavailable' };
   let ignored = false;
   if (candidate.kind === 'micu') {
     const name = candidate.context?.providerName ?? candidate.config?.label ?? 'Micu';
-    if (limitActive(readCodexQuota(candidate.context, candidate.model))) return { reason: 'provider-limit' };
+    const providerLimit = readCodexQuota(candidate.context, candidate.model);
+    if (limitActive(providerLimit)) return { reason: 'provider-limit', until: providerLimit.resets_at ? new Date(providerLimit.resets_at * 1000) : undefined };
     const spend = providerSpend(name);
     const limit = codexFallbackConfig(config).dailyBudgetUsd;
     const overBudget = spend >= limit;
     const unpriced = !config.codexPricing?.[candidate.model];
     if (overBudget || unpriced) {
-      if (!ignoreBudget) return { reason: overBudget ? `budget ${spend.toFixed(4)} >= ${limit}` : 'price-unknown' };
+      if (!ignoreBudget) return { reason: overBudget ? `budget ${spend.toFixed(4)} >= ${limit}` : 'price-unknown',
+        ...(overBudget ? { until: new Date(nextLocalMidnightSingapore()) } : {}) };
       ignored = true;
     }
   }
@@ -2261,7 +2491,7 @@ function nextCandidate(reason, { includeCurrent = false, skipKinds = [] } = {}) 
     if (skipKinds.includes(candidate.kind)) continue;
     const block = candidateBlock(candidate, { claim: true });
     if (block.reason) {
-      const line = `${circuitLabel(candidate)} (${block.reason})`;
+      const line = `${candidate.kind === 'claude' ? 'claude' : circuitLabel(candidate)} (${block.reason})`;
       log(`skip route: ${line}`);
       skippedRoutes.push(line);
       continue;
@@ -2279,7 +2509,6 @@ function nextCandidate(reason, { includeCurrent = false, skipKinds = [] } = {}) 
 
 // 当前路由失败后是否还有别的去处：后续候选可用，或允许交给 Claude。
 function hasAlternativeRoute(skipKinds = []) {
-  if (!noClaude) return true;
   for (let index = routeIndex + 1; index < routeCandidates.length; index++) {
     const candidate = routeCandidates[index];
     if (!skipKinds.includes(candidate.kind) && !candidateBlock(candidate).reason) return true;
@@ -2478,7 +2707,7 @@ function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -2685,8 +2914,13 @@ async function finishReport(text, tokens, actualModel = model, actualEffort = ef
 function fallback(reason) {
   usedFallback = true;
   log(`fallback: ${reason}`);
-  const oneLine = String(reason).replace(/\s+/g, ' ').trim();
-  if (!noClaude) return runClaude(oneLine);
+  let oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  if (!noClaude) {
+    const gate = claudeGate(claudeMode, { refresh: true });
+    if (gate.allowed) return runClaude(oneLine);
+    oneLine += `；Claude 不可用: ${gate.reason}`;
+    log(`fallback: claude ${gate.reason}`);
+  }
   const output = `FALLBACK
 tier: ${tier}
 reason: ${oneLine}
@@ -2785,22 +3019,31 @@ async function tryResetCredit(state, { started }) {
   if (!official || !settings.auto || resetCreditAttempted || state?.source === 'forced-test' || !state?.type) return false;
   resetCreditAttempted = true;
   try {
-    const details = await queryRateLimitDetails(config);
-    const decision = resetCreditDecision(state, details, settings);
-    if (!decision.use) { log(`reset credit: skipped (${decision.reason})`); return false; }
-    const { credit, type } = decision;
-    const prefix = credit.id.slice(0, 8);
-    const expires = credit.expiresAt ? new Date(credit.expiresAt * 1000).toISOString() : 'never';
-    const idempotencyKey = crypto.randomUUID();
-    let result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
-    if (!result.outcome) result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
-    const success = ['reset', 'alreadyRedeemed'].includes(result.outcome);
-    const confirmed = success && resetConfirmed(details.snapshot, result.snapshot, type, state.reserve ? state.thresholds : null);
-    log(`reset credit: ${result.outcome ?? `failed (${result.error})`} ${prefix} expires ${expires}`);
-    resetCreditRecord = { outcome: result.outcome ?? 'failed', credit: prefix, expires_at: expires, confirmed };
-    if (result.outcome) notify('reset credit', `${result.outcome}: ${prefix} (${decision.reason})${confirmed ? '' : '; 未确认重置，转备用路由'}`);
-    if (!confirmed) return false;
-    clearCodexLimit(snapshotState(result.snapshot, 'app-server', readCodexLimit() ?? (state.reserve ? null : state)));
+    // 判断与调用在 route.lock 内完成：第二个并发派发拿到锁后重新读取额度，已被重置则直接用官方额度。
+    const outcome = await withRouteLock(async () => {
+      const details = await queryRateLimitDetails(config);
+      const decision = resetCreditDecision(state, details, settings);
+      if (!decision.use) {
+        log(`reset credit: skipped (${decision.reason})`);
+        return decision.reason === 'not limited' && details?.snapshot ? { alreadyReset: details.snapshot } : null;
+      }
+      const { credit, type } = decision;
+      const prefix = credit.id.slice(0, 8);
+      const expires = credit.expiresAt ? new Date(credit.expiresAt * 1000).toISOString() : 'never';
+      const idempotencyKey = crypto.randomUUID();
+      let result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
+      if (!result.outcome) result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
+      const success = ['reset', 'alreadyRedeemed'].includes(result.outcome);
+      const confirmed = success && resetConfirmed(details.snapshot, result.snapshot, type, state.reserve ? state.thresholds : null);
+      log(`reset credit: ${result.outcome ?? `failed (${result.error})`} ${prefix} expires ${expires}`);
+      resetCreditRecord = { outcome: result.outcome ?? 'failed', credit: prefix, expires_at: expires, confirmed };
+      if (result.outcome) notify('reset credit', `${result.outcome}: ${prefix} (${decision.reason})${confirmed ? '' : '; 未确认重置，转备用路由'}`);
+      return confirmed ? { snapshot: result.snapshot } : null;
+    });
+    if (!outcome) return false;
+    if (outcome.alreadyReset) log('reset credit: 额度已被另一个派发重置，直接使用官方额度');
+    const snapshot = outcome.snapshot ?? outcome.alreadyReset;
+    clearCodexLimit(snapshotState(snapshot, 'app-server', readCodexLimit() ?? (state.reserve ? null : state)));
     codexLimitReason = null;
     if (started) {
       if (resumeArg !== null) rebuildPromptFromResume();
@@ -2820,7 +3063,11 @@ async function takeOverCodex(state, { started = true } = {}) {
   if (await tryResetCredit(state, { started })) return;
   codexLimitReason = `codex ${dispatchContext.codex?.billingType === 'api' ? 'API 服务商 ' : ''}${state.type} ${state.reserve ? '额度保留线' : '限额'}${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : '，恢复时间未知'}`;
   if (routeFailureHandled({ category: state.type === 'weekly' ? '官方周' : '官方 5h', state, resets_at: state.resets_at }, codexLimitReason)) return;
-  if (noClaude) return limitStop(state);
+  return exhausted(state);
+}
+
+// 把本次任务交给 Claude（路由顺序里的 Claude 候选、紧急通道）。
+function handOffToClaude(reason) {
   usedFallback = true;
   if (!rebuildPromptFromResume()) {
     return failResume('Codex 限额，找不到原任务说明；请用日志 id 续跑并保留 prompt 文件');
@@ -2828,7 +3075,93 @@ async function takeOverCodex(state, { started = true } = {}) {
   if (recoveryFlow) attemptPhase = 'claude fallback';
   session = null;
   codexResume = false;
-  return runClaude(codexLimitReason);
+  return runClaude(reason);
+}
+
+// 各路由的恢复时间：官方限额（state）+ 候选的跳过原因。at 为毫秒时间戳或 null（未知）。
+function routeRecoveries(state) {
+  const items = [];
+  if (state?.resets_at) items.push({ route: 'codex 官方', at: state.resets_at * 1000, reason: `${state.type ?? 'unknown'} ${state.reserve ? '额度保留线' : '限额'}` });
+  for (const candidate of routeCandidates) {
+    if (candidate.kind === 'official' && state) continue;
+    const block = candidateBlock(candidate);
+    if (!block.reason) continue;
+    const name = candidate.kind === 'claude' ? 'claude' : circuitLabel(candidate);
+    if (!items.some((item) => item.route === name)) items.push({ route: name, at: block.until ? block.until.getTime() : null, reason: block.reason });
+  }
+  return items;
+}
+
+// 额度耗尽：--urgent 动用 Claude 应急保留；否则通知，最早恢复在 maxAutoWaitMinutes 内则等待后重新路由，否则输出 LIMIT。
+function exhausted(state, why = null) {
+  if (noClaude) {
+    if (state) return limitStop(state);
+    return fallback(`所有 Codex 路由处于冷却或不可用: ${skippedRoutes.join('; ')}`);
+  }
+  if (urgent && claudeMode === 'normal') {
+    const gate = claudeGate('urgent', { refresh: true });
+    if (gate.allowed) {
+      claudeMode = 'urgent';
+      log(`urgent: 全部路由不可用，动用 Claude 应急保留 (${gate.reason})`);
+      return handOffToClaude('全部路由不可用，--urgent 动用 Claude 应急保留');
+    }
+    log(`urgent: Claude 应急保留不可用 (${gate.reason})`);
+  }
+  const items = routeRecoveries(state);
+  const known = items.filter((item) => item.at !== null);
+  const earliest = known.length ? known.reduce((best, item) => item.at < best.at ? item : best) : null;
+  const summary = items.map((item) => `${item.route}: ${item.reason}${item.at ? ` 至 ${fmtLocal(new Date(item.at))}` : ''}`).join('; ');
+  notifyOnce('exhausted', `额度耗尽：${summary || '无可用路由'}`);
+  const maxWait = claudePacingConfig(config).maxAutoWaitMinutes * 60_000;
+  const override = process.env.AGENT_ROUTE_WAIT_MS !== undefined ? Number(process.env.AGENT_ROUTE_WAIT_MS) : null;
+  if (earliest && earliest.at - Date.now() <= maxWait && waitCount < 3) {
+    waitCount++;
+    const delay = override ?? Math.max(1000, earliest.at - Date.now() + 1000);
+    log(`wait: ${Math.ceil((earliest.at - Date.now()) / 60_000)} until ${new Date(earliest.at).toISOString()} (${earliest.route}: ${earliest.reason})`);
+    setTimeout(() => { restartRouting().catch((error) => failResume(`等待后重新路由失败: ${error.message}`)); }, delay);
+    return undefined;
+  }
+  return exhaustedStop(state, items, earliest);
+}
+
+function exhaustedStop(state, items, earliest) {
+  const claudeItem = items.find((item) => item.route === 'claude');
+  const settings = claudePacingConfig(config);
+  const iso = (at) => at ? new Date(at).toISOString() : 'unknown';
+  log(`limit: exhausted ${items.map((item) => `${item.route}=${iso(item.at)}`).join(' ')}`);
+  const reason = `所有路由不可用: ${items.map((item) => `${item.route} ${item.reason}${item.at ? `，${fmtLocal(new Date(item.at))} 恢复` : ''}`).join('；') || '无可用路由'}`;
+  const output = `LIMIT
+tier: ${tier}
+reason: ${reason}
+resets: ${state?.resets_at ? new Date(state.resets_at * 1000).toISOString() : iso(earliest?.at)}
+${claudeItem ? `claude-resets: ${iso(claudeItem.at)}\n` : ''}earliest: ${iso(earliest?.at)}
+${items.map((item) => `route: ${item.route} | ${item.reason} | ${iso(item.at)}`).join('\n')}
+urgent: 加 --urgent 可动用 Claude 应急保留（周用量上限 ${settings.urgentMaxPercent}%）
+write: ${write}
+cwd: ${cwd}
+prompt-file: ${fullPromptPath}
+log: ${logPath}
+${resumeArg !== null ? `resumed: ${resumeArg}\n` : ''}`;
+  recordFinish('limit', 15, output, codexTokens);
+  process.stdout.write(output, () => process.exit(15));
+}
+
+// 等待结束后从头重新选路（熔断、限额、用量线都重新判断）。
+async function restartRouting() {
+  routeIndex = -1;
+  skippedRoutes.length = 0;
+  routeSwitches = 0;
+  capacityRetried = false;
+  claudeGateCache.clear();
+  allRoutesBlocked = false;
+  if (nextCandidate('等待后重新路由')) {
+    if (activeRouteKind === 'claude') return handOffToClaude('等待后重新路由');
+  } else {
+    routeIndex = 0;
+    setActiveRoute(routeCandidates[0]);
+    allRoutesBlocked = true;
+  }
+  return dispatchRoute();
 }
 
 // Claude Code #79500：限额可在 exit 0 的 is_error=true/result 中返回；也兼容 exit 1。
@@ -2905,7 +3238,12 @@ function switchRoute(reason, state = null, options = {}) {
   if (state && activeRouteKind === 'official' && (state.type === '5h' || state.type === 'weekly' || state.type === 'unknown')) {
     codexLimitReason = `codex ${state.type} 限额${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : ''}`;
   }
-  if (next.kind === 'micu') usedFallback = true;
+  if (next.kind === 'micu') {
+    usedFallback = true;
+    notifyOnce('micu-switch', `官方 Codex 不可用（${oneLine}），本次改用 ${next.context?.providerName ?? 'Micu'}`,
+      { repeatMinutes: claudePacingConfig(config).notifyRepeatMinutes });
+  }
+  if (next.kind === 'claude') { handOffToClaude(codexLimitReason ?? oneLine); return true; }
   if (resumeArg !== null) rebuildPromptFromResume();
   session = null;
   codexResume = false;
@@ -2988,12 +3326,12 @@ log: ${logPath}
 
   if (!refreshProgramConfig(config, 'claude', false)) return failClaude(missingProgram('claude'));
 
-  const quota = claudeQuota(config, dispatchContext.claude, true);
-  if (quota.snapshot) log(`claude weekly: ${JSON.stringify(quota.snapshot)}`);
-  if (quota.limit) {
+  const gate = claudeGate(claudeMode, { refresh: true });
+  if (!gate.allowed) {
     const state = readCodexQuota(dispatchContext.codex, model);
-    if (limitActive(state)) return limitStop(state, quota.limit, claudeModel, claudeEffort);
-    return failClaude(`Claude 周用量 ${quota.limit.used_percent}% ≥ ${config.claudeWeeklyThreshold ?? 80}%，冷却至 ${fmtLocal(new Date(quota.limit.resets_at * 1000))}`);
+    const blocked = { resets_at: gate.retryAt ? gate.retryAt / 1000 : null };
+    if (limitActive(state)) return limitStop(state, blocked, claudeModel, claudeEffort);
+    return failClaude(`Claude 节奏限制: ${gate.reason}${gate.retryAt ? `，${fmtLocal(new Date(gate.retryAt))} 恢复` : ''}`);
   }
   log(`exec: ${[claudeBin, ...args].map((a) => JSON.stringify(a)).join(' ')}`);
 
@@ -3039,6 +3377,8 @@ log: ${logPath}
     try { data = JSON.parse(stdout); } catch { /* 非 JSON 失败信息仍参与限额识别 */ }
     const claudeLimit = detectClaudeLimit(data, `${stdout}\n${stderr}`, code);
     if (claudeLimit) {
+      if (activeRouteKind === 'claude' && !forceClaude && claudeMode === 'normal' &&
+        switchRoute(`Claude 用量限额${claudeLimit.resets_at ? `至 ${fmtLocal(new Date(claudeLimit.resets_at * 1000))}` : ''}`)) return;
       const state = readCodexQuota(dispatchContext.codex, model);
       if (limitActive(state)) return limitStop(state, claudeLimit, claudeModel, claudeEffort);
       return failClaude(`Claude 用量限额，${claudeLimit.resets_at ? fmtLocal(new Date(claudeLimit.resets_at * 1000)) : '恢复时间未知'}`);
@@ -3085,8 +3425,14 @@ if (providerChange && !resumeError && dispatchContext[executor].billingType !== 
 if (resumeError) failResume(resumeError);
 else if (dispatchContext.enabled && !forceClaude && executor !== 'claude' && dispatchContext.codex.billingType === 'unknown') stopUnknownRoute('codex');
 else if (forceClaude) runClaude('主 agent 指定 --claude，未调用 Codex');
-else if (resumeArg !== null && executor === 'claude') runClaude('跟随原 Claude 执行方续跑', !providerResumeRebuilt);
-else {
+else if (resumeArg !== null && executor === 'claude') { claudeMode = 'urgent'; runClaude('跟随原 Claude 执行方续跑', !providerResumeRebuilt); }
+else await dispatchRoute();
+
+async function dispatchRoute() {
+  if (activeRouteKind === 'claude' && !allRoutesBlocked) {
+    if (claudeFirst && routeIndex === 0) return runClaude('最后 36 小时且 Claude 周额度先于 Codex 重置，先用 Claude');
+    return handOffToClaude(`前序路由不可用: ${skippedRoutes.join('; ')}`);
+  }
   const forcedLimit = process.env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT === '1' && activeRouteKind === 'official'
     ? { type: '5h', resets_at: (Date.now() + 3_600_000) / 1000, source: 'forced-test' } : null;
   const officialSubscription = activeRouteKind === 'official' && (!dispatchContext.codex || dispatchContext.codex.billingType === 'subscription');
@@ -3096,7 +3442,7 @@ else {
   if (limitActive(state)) takeOverCodex(state, { started: false });
   else {
     if (state?.type) clearCodexQuota(dispatchContext.codex, model, state);
-    if (allRoutesBlocked) fallback(`所有 Codex 路由处于冷却或不可用: ${skippedRoutes.join('; ')}`);
+    if (allRoutesBlocked) exhausted(null);
     else runCodex();
   }
 }
@@ -3208,7 +3554,12 @@ function runCodex(spawnRetried = false) {
       // 无论成败都按 rollout 的请求级 token_count 记账；口径不符或缺单价时记 unknown。
       const pricing = estimateProviderCost(model, telemetry.tokenUsage, config, activeCodexContext.config?.priceMultiplier ?? 1,
         telemetry.tokenUsageInvalid);
-      if (pricing !== null) addProviderSpend(activeCodexContext.providerName ?? 'Micu', pricing);
+      if (pricing !== null) {
+        const label = activeCodexContext.providerName ?? 'Micu';
+        addProviderSpend(label, pricing);
+        const limit = codexFallbackConfig(config).dailyBudgetUsd;
+        if (providerSpend(label) >= limit) notifyOnce('micu-budget', `${label} 当日花费 $${providerSpend(label).toFixed(2)} 已达上限 $${limit}`);
+      }
       log(`spend: ${pricing === null ? 'unknown' : pricing.toFixed(6)} usd`);
     }
     if (timedOut) return failCodex(`超时（>${config.codexTimeoutMinutes ?? 90} 分钟）`,

@@ -31,6 +31,17 @@ if (args[0] === '-p' || args[0] === 'auth') {
     process.stdout.write(JSON.stringify({ apiProvider: 'firstParty', configDirectory: configDir, ...status }));
     process.exit(status.loggedIn ? 0 : 1);
   }
+  if (args.includes('stream-json')) {
+    // 用量探测：stub-claude-usage.json 的 { five_hour, seven_day } 原样放进 rate_limit_event.unifiedWindows；缺失时不发事件。
+    let usage = null;
+    try { usage = JSON.parse(fs.readFileSync(path.join(isolation.home, 'stub-claude-usage.json'), 'utf8')); } catch {}
+    fs.appendFileSync(path.join(isolation.home, 'stub-claude-probes.jsonl'), JSON.stringify({ args: args.slice(0, 4), configDir }) + '\n');
+    const events = [{ type: 'system', subtype: 'init' },
+      ...(usage ? [{ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows: usage } }] : []),
+      { type: 'result', subtype: 'success', is_error: false, result: 'ok' }];
+    process.stdout.write(events.map((event) => JSON.stringify(event)).join('\n') + '\n', () => process.exit(0));
+    await new Promise(() => {});
+  }
   const option = (key) => args[args.indexOf(key) + 1];
   const agents = JSON.parse(fs.readFileSync(option('--agents'), 'utf8'));
   let settings = {};
