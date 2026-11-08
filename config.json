@@ -48,26 +48,56 @@
   },
   "claudeWeeklyThreshold": 80,
   "codexFallback": {
-    "Micu": {
-      "ccSwitchId": "b1461721-a885-478c-80b4-6631c3134bb7",
-      "label": "Micu",
-      "models": {
-        "tier1": [
-          {
-            "model": "gpt-6.1-sol"
-          }
-        ],
-        "tier2": [
-          {
-            "model": "gpt-6.1-sol",
-            "effort": "medium"
-          }
-        ]
-      },
-      "retryOfficialMinutes": 15,
-      "capacityBackoffSeconds": 30,
-      "dailyBudgetUsd": 5
+    "providers": [
+      {
+        "ccSwitchId": "b1461721-a885-478c-80b4-6631c3134bb7",
+        "label": "Micu",
+        "priceMultiplier": 0.0833333,
+        "models": {
+          "tier1": [
+            {
+              "model": "gpt-6.1-sol"
+            }
+          ],
+          "tier2": [
+            {
+              "model": "gpt-6.1-sol",
+              "effort": "medium"
+            }
+          ]
+        }
+      }
+    ],
+    "retryOfficialMinutes": 15,
+    "capacityBackoffSeconds": 30,
+    "dailyBudgetUsd": 5
+  },
+  "codexPricing": {
+    "gpt-6.1-sol": {
+      "input": 2,
+      "cachedInput": 0.1,
+      "output": 10,
+      "longContext": {
+        "thresholdTokens": 272000,
+        "input": 4,
+        "cachedInput": 0.2,
+        "output": 15
+      }
     }
+  },
+  "codexCircuit": {
+    "thresholds": {
+      "capacity": 2,
+      "server": 2,
+      "auth": 1
+    },
+    "openMinutes": {
+      "capacity": 10,
+      "server": 15,
+      "auth": 60
+    },
+    "maxOpenMinutes": 120,
+    "maxRouteSwitches": 3
   },
   "claudePacing": {
     "windowHours": 36,

@@ -18,7 +18,7 @@ catch { die('缺少隔离环境'); }
 if (process.env.HOME !== isolation.home ||
   (process.env.CODEX_HOME ?? path.join(process.env.HOME, '.codex')) !== isolation.codexHome ||
   !fs.realpathSync(process.cwd()).startsWith(isolation.root + path.sep)) die('selftest 目录未隔离');
-fs.appendFileSync(path.join(isolation.home, 'stub-invocations.jsonl'), JSON.stringify({ command: args[0], args, agentRouteDepth: process.env.AGENT_ROUTE_DEPTH ?? null }) + '\n');
+fs.appendFileSync(path.join(isolation.home, 'stub-invocations.jsonl'), JSON.stringify({ command: args[0], args, agentRouteDepth: process.env.AGENT_ROUTE_DEPTH ?? null, providerKey: process.env.AGENT_ROUTE_PROVIDER_KEY ?? null }) + '\n');
 if (args[0] === '-p' || args[0] === 'auth') {
   const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(isolation.home, '.claude');
   if (!path.resolve(configDir).startsWith(isolation.home + path.sep) ||
@@ -144,10 +144,14 @@ if (!['complete', 'partial', 'unknown', 'tracked-write', 'ignored-write', 'pycac
   'limit-session', 'limit-weekly', 'limit-reached', 'limit-partial', 'limit-both', 'limit-both-zero', 'limit-both-api',
   'complete-snapshot', 'metadata-healthy-error', 'premium-only', 'api-complete-snapshot', 'api-429-snapshot',
   'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both',
-  'stream-events', 'stream-many', 'false-diagnostics', 'structured-capacity', 'stall-events', 'stall-high', 'stall-missing'].includes(scenario) && !failFirst) {
+  'stream-events', 'stream-many', 'false-diagnostics', 'structured-capacity', 'stall-events', 'stall-high', 'stall-missing', 'micu-fallback'].includes(scenario) && !/^route:[a-z0-9@]+:[a-z0-9]+$/.test(scenario ?? '') && !failFirst) {
   die(`未知场景: ${scenario ?? '(无)'}`);
 }
 const currentSession = session ?? randomUUID();
+// route:<官方行为>:<Micu 行为>，行为后可加 @模型片段，仅对该模型生效；ok 表示成功。
+const routeMatch = scenario?.match(/^route:([a-z0-9@]+):([a-z0-9]+)$/);
+const micu = process.env.AGENT_ROUTE_ACTIVE_PROVIDER === 'micu' ||
+  args.some((arg) => /model_provider=["']?agent_route_micu/.test(arg)) || Boolean(process.env.AGENT_ROUTE_PROVIDER_KEY);
 if (!claude && scenario === 'stream-events') {
   fs.writeSync(1, JSON.stringify({ type: 'error', message: 'Reconnecting 1/5' }) + '\n');
   fs.writeSync(2, 'stream disconnected; Retry 1/5\nAT CAPACITY; retry later\nat capacity\nReConnec');
@@ -240,13 +244,47 @@ if (!claude) {
     process.exit(1);
   }
 }
-if (!claude && (scenario.startsWith('limit') || ['metadata-healthy-error', 'premium-only'].includes(scenario))) {
+if (!claude && (scenario.startsWith('limit') || scenario === 'micu-fallback' && !micu || ['metadata-healthy-error', 'premium-only'].includes(scenario))) {
   if (scenario === 'limit-partial') fs.appendFileSync(path.join(cwd, 'tracked.txt'), 'partial codex change\n');
   const t = new Date(Date.now() + 2 * 3_600_000 + 60_000);
   const at = `${t.getHours() % 12 || 12}:${String(t.getMinutes()).padStart(2, '0')} ${t.getHours() < 12 ? 'AM' : 'PM'}`;
   const tail = scenario === 'limit' ? ` or try again at ${at}.` : '.';
   fs.writeSync(2, `session id: ${currentSession}\nERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits${tail}\n`);
   process.exit(1);
+}
+if (!claude && routeMatch) {
+  const [kind, only] = (micu ? routeMatch[2] : routeMatch[1]).split('@');
+  const modelArg = args[args.indexOf('-m') + 1] ?? '';
+  const tomorrow = new Date(Date.now() + 2 * 3_600_000 + 60_000);
+  const at = `${tomorrow.getHours() % 12 || 12}:${String(tomorrow.getMinutes()).padStart(2, '0')} ${tomorrow.getHours() < 12 ? 'AM' : 'PM'}`;
+  const failures = {
+    capacity: 'ERROR: Selected model is at capacity. Please try a different model.',
+    server: 'ERROR: unexpected status 503 Service Unavailable: upstream unavailable',
+    retry: 'ERROR: unexpected status 503 Service Unavailable\nRetry-After: 1800',
+    auth: 'ERROR: unexpected status 401 Unauthorized',
+    model: 'ERROR: unsupported model',
+    limit: `ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at ${at}.`,
+    quota: 'ERROR: insufficient_quota',
+    rate: 'HTTP 429 Too Many Requests\nRetry-After: 120',
+    other: 'ERROR: connect ECONNREFUSED',
+  };
+  if (kind !== 'ok' && (!only || modelArg.includes(only))) {
+    if (!failures[kind]) die(`未知失败类型: ${kind}`);
+    fs.writeSync(2, `session id: ${currentSession}\n${failures[kind]}\n`);
+    process.exit(1);
+  }
+}
+if (!claude && (scenario === 'micu-fallback' || routeMatch) && micu) {
+  const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const timestamp = new Date().toISOString();
+  let usage = {};
+  try { usage = JSON.parse(fs.readFileSync(path.join(process.env.HOME, 'stub-token-usage.json'), 'utf8')); } catch {}
+  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), JSON.stringify({ timestamp,
+    type: 'event_msg', payload: { type: 'token_count', info: {
+      total_token_usage: { input_tokens: 100, output_tokens: 30, total_tokens: 130, ...(usage.total ?? {}) },
+      last_token_usage: { input_tokens: 100, cached_input_tokens: 20, cache_write_input_tokens: 5, output_tokens: 30, reasoning_output_tokens: 10, ...(usage.last ?? {}) },
+    } } }) + '\n');
 }
 const repair = prompt.includes('自动返工：上轮 verify 失败。');
 const round = repair ? (previous?.round ?? 0) + 1 : 0;

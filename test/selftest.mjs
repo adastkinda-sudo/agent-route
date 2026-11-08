@@ -223,6 +223,49 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     const providerStates = () => fs.existsSync(providerLimitPath) ? JSON.parse(fs.readFileSync(providerLimitPath, 'utf8')).providers : {};
     const cooldownPath = path.join(home, 'state', 'cooldown.json');
     const invocationRows = () => fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    const circuitPath = path.join(home, 'state', 'circuit.json');
+    const unavailablePath = path.join(home, 'state', 'model-unavailable.json');
+    const tokenUsagePath = path.join(home, 'stub-token-usage.json');
+    const circuitState = () => fs.existsSync(circuitPath) ? JSON.parse(fs.readFileSync(circuitPath, 'utf8')) : {};
+    const clearCircuit = () => fs.rmSync(circuitPath, { force: true });
+    const expireCircuit = () => {
+      const data = circuitState();
+      for (const entry of Object.values(data)) if (entry.state === 'open') entry.opened_at -= entry.open_seconds + 5;
+      writeJSON(circuitPath, data);
+    };
+    const allLogs = (result) => {
+      const base = result.record.log_id.replace(/-attempt\d+$/, '');
+      return fs.readdirSync(path.join(home, 'logs')).filter((name) => name.startsWith(base) && name.endsWith('.log')).sort()
+        .map((name) => fs.readFileSync(path.join(home, 'logs', name), 'utf8')).join('\n');
+    };
+    const execCalls = (from) => invocationRows().slice(from).filter((row) => row.args[0] === 'exec');
+    const modelOf = (row) => row.args[row.args.indexOf('-m') + 1];
+    const isMicu = (row) => row.args.some((arg) => arg.includes('model_provider="agent_route_micu"'));
+    const withMicuRoutes = (test, { models = ['gpt-6.1-sol'] } = {}) => withRoutedFixture(async () => {
+      const saved = { fallback: structuredClone(routeConfig.codexFallback), circuit: structuredClone(routeConfig.codexCircuit),
+        pricing: structuredClone(routeConfig.codexPricing), models: env.AGENT_ROUTE_MICU_MODELS_JSON, force: env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT };
+      const reset = () => {
+        for (const file of [circuitPath, unavailablePath, tokenUsagePath, path.join(home, 'state', 'provider-spend.json')]) fs.rmSync(file, { force: true });
+      };
+      try {
+        useSubscription();
+        routeConfig.codexFallback = { providers: [{ ccSwitchId: 'database-codex', label: 'Micu', priceMultiplier: 0.0833333,
+          models: { tier1: [{ model: 'gpt-6.1-sol' }], tier2: [{ model: 'gpt-6.1-sol', effort: 'medium' }] } }],
+          retryOfficialMinutes: 15, capacityBackoffSeconds: 0, dailyBudgetUsd: 5 };
+        env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify(models);
+        delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+        reset();
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        await test();
+      } finally {
+        routeConfig.codexFallback = saved.fallback;
+        routeConfig.codexCircuit = saved.circuit;
+        routeConfig.codexPricing = saved.pricing;
+        if (saved.models === undefined) delete env.AGENT_ROUTE_MICU_MODELS_JSON; else env.AGENT_ROUTE_MICU_MODELS_JSON = saved.models;
+        if (saved.force === undefined) delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT; else env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = saved.force;
+        reset();
+      }
+    });
     const claudeCalls = () => {
       try { return fs.readFileSync(path.join(home, 'stub-claude-invocations.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); }
       catch { return []; }
@@ -1669,7 +1712,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           'API 状态含订阅 query_available/snapshot');
         noRouteSecrets(fs.readFileSync(providerLimitPath, 'utf8'));
       })],
-      [73, 'CC Switch 用例 9：429/余额被动限额，401/模型/网络错误普通冷却，status/LIMIT 区分模式', () => withRoutedFixture(async () => {
+      [73, 'CC Switch 用例 9：429/余额被动限额，401 唯一路由只计数，网络冷却，模型不可用单独标记', () => withRoutedFixture(async () => {
+        const unavailablePath = path.join(home, 'state', 'model-unavailable.json');
         for (const [scenario, type, seconds, resetSource] of [
           ['api-429', 'rate-limit', 120, 'retry-after'], ['api-429-date', 'rate-limit', 180, 'retry-after'],
           ['api-429-reset', 'rate-limit', 240, 'reset'], ['api-quota', 'quota', (config.limitCooldownMinutes ?? 60) * 60, 'fallback'],
@@ -1677,6 +1721,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         ]) {
           fs.rmSync(providerLimitPath, { force: true });
           fs.rmSync(cooldownPath, { force: true });
+          fs.rmSync(unavailablePath, { force: true });
+          fs.rmSync(path.join(home, 'state', 'circuit.json'), { force: true });
           seedLimit();
           const before = fs.readFileSync(limitPath, 'utf8');
           const result = run(scenario, [], false, { preserveCooldown: true });
@@ -1687,6 +1733,13 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
             check(states.length === 1 && states[0].type === type && states[0].reset_source === resetSource &&
               Math.abs(states[0].resets_at - Date.now() / 1000 - seconds) < 5 && result.stdout.includes('Codex API 服务商限额') &&
               !result.stdout.includes('Codex 用量限额') && !fs.existsSync(cooldownPath), `${scenario} 被动状态或 LIMIT 不符`);
+          } else if (scenario === 'api-model') {
+            check(states.length === 0 && !fs.existsSync(cooldownPath) && Object.keys(JSON.parse(fs.readFileSync(unavailablePath, 'utf8'))).length === 1,
+              `${scenario} 未单独写入模型不可用状态`);
+          } else if (scenario === 'api-401') {
+            const circuit = Object.values(JSON.parse(fs.readFileSync(path.join(home, 'state', 'circuit.json'), 'utf8')));
+            check(states.length === 0 && !fs.existsSync(cooldownPath) && circuit.length === 1 && circuit[0].state === 'closed' &&
+              circuit[0].consecutive_failures === 1, `${scenario} 唯一路由应只计数、不冷却`);
           } else check(states.length === 0 && Object.keys(JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))).length === 1,
             `${scenario} 被误当限额或未写普通冷却`);
         }
@@ -2237,6 +2290,242 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(result.record.reconnect === 2 && result.record.capacity === 1 &&
           result.log.includes('failure class: capacity') && result.log.includes('source: rollout'),
           '结构化错误未优先分类或计数');
+      })],
+      [94, '官方额度转 Micu：参数、实际路由与密钥隔离', () => withRoutedFixture(async () => {
+        const savedFallback = JSON.parse(JSON.stringify(routeConfig.codexFallback));
+        const savedModels = env.AGENT_ROUTE_MICU_MODELS_JSON;
+        const savedForceLimit = env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+        try {
+          useSubscription();
+          routeConfig.codexFallback = { providers: [{ ccSwitchId: 'database-codex', label: 'Micu', priceMultiplier: 0.0833333,
+            models: { tier1: [{ model: 'gpt-6.1-sol' }], tier2: [{ model: 'gpt-6.1-sol', effort: 'medium' }] } }],
+            retryOfficialMinutes: 15, capacityBackoffSeconds: 0, dailyBudgetUsd: 5 };
+          env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify(['gpt-6.1-sol']);
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+          const result = run('micu-fallback');
+          exitIs(result, 0);
+          const call = invocationRows().at(-1);
+          check(result.record.providers.codex.providerId === 'database-codex' && result.record.providers.codex.route === 'Micu' &&
+            call.args.includes('model_provider="agent_route_micu"') && !result.log.includes(routeKey) &&
+            !result.log.includes(routeURL) && !JSON.stringify(result.record).includes(routeKey) &&
+            !JSON.stringify(result.record).includes(routeURL) &&
+            JSON.parse(fs.readFileSync(path.join(home, 'state', 'provider-spend.json'), 'utf8'))[new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date())].Micu > 0,
+            'Micu 路由参数、实际供应商、密钥隔离或花费账本不符');
+          env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = '1';
+          const forced = run('complete');
+          exitIs(forced, 0);
+          check(forced.record.providers.codex.providerId === 'database-codex' && forced.record.providers.codex.route === 'Micu',
+            '强制官方限额未转入 Micu');
+        } finally {
+          routeConfig.codexFallback = savedFallback;
+          if (savedModels === undefined) delete env.AGENT_ROUTE_MICU_MODELS_JSON;
+          else env.AGENT_ROUTE_MICU_MODELS_JSON = savedModels;
+          if (savedForceLimit === undefined) delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+          else env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = savedForceLimit;
+        }
+      })],
+      [95, 'Codex 路由：capacity 退避重试、熔断、探测恢复与并发探测', () => withMicuRoutes(async () => {
+        const start = invocationRows().length;
+        const first = run('route:capacity:ok');
+        exitIs(first, 0);
+        const calls = execCalls(start);
+        check(calls.length === 3 && calls.slice(0, 2).every((row) => !isMicu(row) && modelOf(row) === 'gpt-6.1-sol') &&
+          isMicu(calls[2]) && calls[2].providerKey === routeKey && calls.slice(0, 2).every((row) => row.providerKey === null),
+          'capacity 应官方重试一次后转 Micu，且密钥只给 Micu 子进程');
+        check(allLogs(first).includes('capacity retry') && /circuit: official\/gpt-6\.1-sol closed→open/.test(allLogs(first)) &&
+          first.record.providers.codex.route === 'Micu' && first.record.routes.length === 2 && first.record.routes[1].route === 'Micu',
+          'capacity 日志或 history 路由不符');
+        const entry = Object.values(circuitState())[0];
+        check(Object.keys(circuitState()).length === 1 && entry.state === 'open' && entry.consecutive_failures === 2 &&
+          entry.open_seconds === 600 && !fs.existsSync(cooldownPath), 'capacity 应打开 10 分钟熔断且不写 cooldown');
+        const before = invocationRows().length;
+        const skipped = run('route:capacity:ok');
+        exitIs(skipped, 0);
+        const skippedCalls = execCalls(before);
+        check(skippedCalls.length === 1 && isMicu(skippedCalls[0]) && allLogs(skipped).includes('skip route: official/gpt-6.1-sol (circuit open)'),
+          '熔断期间应直接跳过官方');
+        const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: 8000 });
+        check(status.stdout.includes('circuit official/gpt-6.1-sol: open') && status.stdout.includes('Micu spend today:'),
+          'status 缺少熔断状态或 Micu 花费');
+        noRouteSecrets(status.stdout + status.stderr);
+        expireCircuit();
+        const mark = invocationRows().length;
+        const probe = run('route:ok:ok');
+        exitIs(probe, 0);
+        check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]) && probe.record.providers.codex.route === 'official' &&
+          allLogs(probe).includes('open→half_open') && allLogs(probe).includes('half_open→closed') &&
+          Object.values(circuitState())[0].state === 'closed' && Object.values(circuitState())[0].consecutive_failures === 0,
+          '到期后应放行一次官方探测，成功即关闭');
+        const back = run('route:ok:ok');
+        check(!isMicu(execCalls(start).at(-1)) && back.record.providers.codex.route === 'official', '恢复后应继续使用官方');
+        // 探测失败：重新打开并翻倍。
+        run('route:capacity:ok');
+        run('route:capacity:ok');
+        expireCircuit();
+        const failed = run('route:capacity:ok');
+        exitIs(failed, 0);
+        check(allLogs(failed).includes('half_open→open') && Object.values(circuitState())[0].state === 'open' &&
+          Object.values(circuitState())[0].open_seconds === 1200, '探测失败应重新打开并把时长翻倍');
+        // 其他进程持有探测名额时视为 Open；失效的探测名额会被回收。
+        const key = Object.keys(circuitState())[0];
+        for (const [pid, expectOfficial] of [[process.pid, false], [999999, true]]) {
+          const data = circuitState();
+          data[key] = { ...data[key], state: 'half_open', probe: { pid, started_at: Date.now() / 1000 }, opened_at: Date.now() / 1000 - 5000 };
+          writeJSON(circuitPath, data);
+          const marker = invocationRows().length;
+          exitIs(run('route:ok:ok'), 0);
+          check(!isMicu(execCalls(marker)[0]) === expectOfficial, `探测名额持有者 ${pid} 的处理不符`);
+        }
+      })],
+      [96, 'Codex 路由：tier2 官方模型顺序、5xx 阈值、认证、Retry-After、模型不支持与路由上限', () => withMicuRoutes(async () => {
+        let mark = invocationRows().length;
+        const luna = run('route:capacity@terra:ok', [], false, { tier: 'tier2' });
+        exitIs(luna, 0);
+        let calls = execCalls(mark);
+        check(calls.length === 3 && modelOf(calls[0]) === 'gpt-6.1-terra' && modelOf(calls[1]) === 'gpt-6.1-terra' &&
+          modelOf(calls[2]) === 'gpt-6-luna' && calls.every((row) => !isMicu(row)), 'tier2 应 terra 重试一次后换 luna');
+        clearCircuit();
+        mark = invocationRows().length;
+        const micu = run('route:capacity:ok', [], false, { tier: 'tier2' });
+        exitIs(micu, 0);
+        calls = execCalls(mark);
+        check(calls.map(modelOf).join() === 'gpt-6.1-terra,gpt-6.1-terra,gpt-6-luna,gpt-6-luna,gpt-6.1-sol' && isMicu(calls[4]) &&
+          calls[4].args.includes('model_reasoning_effort="medium"') && micu.record.routes.map((row) => row.route).join() === 'official,official,Micu',
+          'tier2 官方两个模型都 capacity 后应转 Micu sol/medium');
+        clearCircuit();
+        // 5xx：阈值 2，第一次只计数但本次仍转 Micu。
+        exitIs(run('route:server:ok'), 0);
+        let entry = Object.values(circuitState())[0];
+        check(entry.state === 'closed' && entry.consecutive_failures === 1 && !fs.existsSync(cooldownPath), '5xx 首次只应计数');
+        exitIs(run('route:server:ok'), 0);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'open' && entry.open_seconds === 900, '5xx 连续两次应打开 15 分钟熔断');
+        clearCircuit();
+        exitIs(run('route:auth:ok'), 0);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'open' && entry.open_seconds === 3600, '认证错误应立即打开 60 分钟熔断');
+        clearCircuit();
+        // Retry-After 优先于类别时长。
+        exitIs(run('route:retry:ok'), 0);
+        exitIs(run('route:retry:ok'), 0);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'open' && entry.open_seconds === 1800, '应使用服务端 Retry-After 作为冷却时长');
+        clearCircuit();
+        // 模型不支持：标记 24 小时，不进熔断器也不写冷却。
+        mark = invocationRows().length;
+        exitIs(run('route:model:ok'), 0);
+        const unavailable = JSON.parse(fs.readFileSync(unavailablePath, 'utf8'));
+        check(Object.keys(unavailable).length === 1 && Math.abs(Object.values(unavailable)[0] - Date.now() - 86_400_000) < 10_000 &&
+          Object.keys(circuitState()).length === 0 && !fs.existsSync(cooldownPath) && execCalls(mark).length === 2,
+          '模型不支持应只标记 24 小时并换下一路由');
+        mark = invocationRows().length;
+        const afterUnsupported = run('route:ok:ok');
+        check(execCalls(mark).length === 1 && isMicu(execCalls(mark)[0]) &&
+          allLogs(afterUnsupported).includes('skip route: official/gpt-6.1-sol (model-unavailable)'), '已标记不支持的模型应被跳过');
+        fs.rmSync(unavailablePath, { force: true });
+        // 路由切换上限。
+        routeConfig.codexCircuit = { ...routeConfig.codexCircuit, maxRouteSwitches: 1 };
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        mark = invocationRows().length;
+        const capped = run('route:capacity:ok', [], false, { tier: 'tier2' });
+        exitIs(capped, 10);
+        check(execCalls(mark).length === 4 && execCalls(mark).every((row) => !isMicu(row)), '超过 maxRouteSwitches 后应输出 FALLBACK 且不再试 Micu');
+        routeConfig.codexCircuit = { ...routeConfig.codexCircuit, maxRouteSwitches: 3 };
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        clearCircuit();
+        // 唯一路由：Micu 不可用且 --no-claude 时只计数；允许 Claude 时才打开熔断。
+        env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify([]);
+        exitIs(run('route:auth:ok'), 10);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'closed' && entry.consecutive_failures === 1 && !fs.existsSync(cooldownPath), '唯一路由失败应只计数');
+        exitIs(run('route:auth:ok', [], true), 0);
+        check(Object.values(circuitState())[0].state === 'open', '允许 Claude 时认证失败应打开熔断');
+      })],
+      [97, 'Codex 路由：Micu 限额、花费账本、超预算与 --ignore-budget', () => withMicuRoutes(async () => {
+        const spendFile = path.join(home, 'state', 'provider-spend.json');
+        const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date());
+        let mark = invocationRows().length;
+        exitIs(run('route:limit:ok'), 0);
+        check(execCalls(mark).length === 2 && !isMicu(execCalls(mark)[0]) && isMicu(execCalls(mark)[1]), '官方 5h 限额应转 Micu');
+        const expected = (85 * 2 + 20 * 0.1 + 30 * 10) / 1e6 * 0.0833333;
+        const spent = JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu;
+        check(Math.abs(spent - expected) < 1e-9, `花费应按标价 1/12 估算: ${spent} vs ${expected}`);
+        // 长上下文档按请求计价；total_tokens 与 input+output 不符时记为 unknown。
+        fs.rmSync(spendFile, { force: true });
+        writeJSON(tokenUsagePath, { last: { input_tokens: 300000, cached_input_tokens: 100000, cache_write_input_tokens: 0, output_tokens: 1000 },
+          total: { input_tokens: 300000, output_tokens: 1000, total_tokens: 301000 } });
+        exitIs(run('route:limit:ok'), 0);
+        const longSpent = JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu;
+        check(Math.abs(longSpent - (200000 * 4 + 100000 * 0.2 + 1000 * 15) / 1e6 * 0.0833333) < 1e-9, `长上下文价不符: ${longSpent}`);
+        fs.rmSync(spendFile, { force: true });
+        writeJSON(tokenUsagePath, { total: { total_tokens: 999 } });
+        const unknown = run('route:limit:ok');
+        exitIs(unknown, 0);
+        check(allLogs(unknown).includes('spend: unknown') && !fs.existsSync(spendFile), 'token 口径不符应记 unknown 而不是估算');
+        fs.rmSync(tokenUsagePath, { force: true });
+        // 超预算：Micu 被跳过，输出 LIMIT；--ignore-budget 放行并注明。
+        writeJSON(spendFile, { [today]: { Micu: 5 } });
+        mark = invocationRows().length;
+        const over = run('route:limit:ok');
+        exitIs(over, 15);
+        check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]) && allLogs(over).includes('skip route: Micu/gpt-6.1-sol (budget'),
+          '超预算时不应调用 Micu');
+        const ignored = run('route:limit:ok', ['--ignore-budget']);
+        exitIs(ignored, 0);
+        check(ignored.footer.includes('budget ignored') && allLogs(ignored).includes('budget ignored: Micu/gpt-6.1-sol') &&
+          JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu > 5, '--ignore-budget 应放行、注明并照常记账');
+        exitIs(spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--claude', '--ignore-budget', '--cwd', repo],
+          { env, cwd: home, input: 'x\n', encoding: 'utf8', timeout: 8000 }), 2);
+        // 缺单价的模型只在 --ignore-budget 下使用。
+        fs.rmSync(spendFile, { force: true });
+        delete routeConfig.codexPricing['gpt-6.1-sol'];
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        exitIs(run('route:limit:ok'), 15);
+        const unpriced = run('route:limit:ok', ['--ignore-budget']);
+        exitIs(unpriced, 0);
+        check(allLogs(unpriced).includes('spend: unknown') && unpriced.footer.includes('budget ignored'), '缺单价模型应在 --ignore-budget 下记 unknown');
+        // Micu 额度错误与故障。
+        fs.rmSync(spendFile, { force: true });
+        routeConfig.codexPricing = structuredClone(config.codexPricing);
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        mark = invocationRows().length;
+        exitIs(run('route:limit:rate'), 15);
+        check(Object.values(providerStates()).filter(Boolean).length === 1, 'Micu 额度错误应写入 provider-limit');
+        mark = invocationRows().length;
+        exitIs(run('route:limit:ok', [], false, { preserveCooldown: true }), 15);
+        check(execCalls(mark).every((row) => !isMicu(row)), 'Micu 限额期间应被跳过');
+        fs.rmSync(providerLimitPath, { force: true });
+        clearCircuit();
+        exitIs(run('route:limit:server'), 10);
+        check(Object.values(circuitState())[0].state === 'closed' && Object.values(circuitState())[0].consecutive_failures === 1 &&
+          !fs.existsSync(cooldownPath), 'Micu 5xx 且无其他路由时应只计数');
+      })],
+      [98, 'Codex 路由：旧 cooldown 迁移为 Open，clear-cooldown 清空熔断状态', () => withMicuRoutes(async () => {
+        exitIs(run('route:other:ok'), 10);
+        check(Object.keys(JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))).length === 1 && Object.keys(circuitState()).length === 0,
+          '其他失败应沿用 cooldown 写入');
+        const mark = invocationRows().length;
+        const migrated = run('route:ok:ok', [], false, { preserveCooldown: true });
+        exitIs(migrated, 0);
+        check(execCalls(mark).length === 1 && isMicu(execCalls(mark)[0]) && allLogs(migrated).includes('skip route: official/gpt-6.1-sol (circuit open)'),
+          '旧 cooldown 记录应视为 Open 并转 Micu');
+        writeJSON(circuitPath, { stale: { state: 'open', consecutive_failures: 2, opened_at: Date.now() / 1000, open_seconds: 600, probe: null } });
+        writeJSON(unavailablePath, { stale: Date.now() + 1000 });
+        const clear = spawnSync(process.execPath, [SCRIPT_PATH, 'clear-cooldown'], { env, cwd: repo, encoding: 'utf8', timeout: 8000 });
+        exitIs(clear, 0);
+        check(Object.keys(circuitState()).length === 0 && Object.keys(JSON.parse(fs.readFileSync(unavailablePath, 'utf8'))).length === 0 &&
+          Object.keys(JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))).length === 0, 'clear-cooldown 应清空 cooldown、熔断和不支持标记');
+      })],
+      [99, 'Codex 路由：Micu 路由写入 history，续跑时供应商变化会重建任务', () => withMicuRoutes(async () => {
+        const viaMicu = run('route:limit:ok');
+        exitIs(viaMicu, 0);
+        check(viaMicu.record.providers.codex.providerId === 'database-codex' && viaMicu.record.providers.codex.route === 'Micu',
+          'history 应记录实际使用的 Micu 路由');
+        const mark = invocationRows().length;
+        const resumed = run('route:ok:ok', ['--resume', viaMicu.record.log_id]);
+        exitIs(resumed, 0);
+        check(resumed.record.provider_change?.action === 'rebuild' && !isMicu(execCalls(mark)[0]) &&
+          execCalls(mark)[0].args[1] !== 'resume', '续跑回到官方时应重建任务而不是沿用 Micu 会话');
       })],
     );
     for (const [id, name, test] of scenarios) {

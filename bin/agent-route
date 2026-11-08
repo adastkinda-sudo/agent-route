@@ -37,6 +37,10 @@ const HISTORY_FILE = path.join(STATE_DIR, 'history.jsonl');
 const CODEX_LIMIT_FILE = path.join(STATE_DIR, 'codex-limit.json');
 const PROVIDER_LIMIT_FILE = path.join(STATE_DIR, 'provider-limit.json');
 const CLAUDE_LIMIT_FILE = path.join(STATE_DIR, 'claude-limit.json');
+const MICU_MODEL_FILE = path.join(STATE_DIR, 'micu-models.json');
+const PROVIDER_SPEND_FILE = path.join(STATE_DIR, 'provider-spend.json');
+const CIRCUIT_FILE = path.join(STATE_DIR, 'circuit.json');
+const MODEL_UNAVAILABLE_FILE = path.join(STATE_DIR, 'model-unavailable.json');
 let CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 
 const REPORT_FOOTER = `
@@ -67,7 +71,7 @@ const RULES = `执行规则：
 - 你的执行时间有上限（Claude 60 分钟、Codex 90 分钟），超时会被强制结束且没有汇报。预计超过 10 分钟的命令（全量扫描、批量迁移、长测试等）不要前台运行或循环等待：先在小样本上验证，再用 nohup 脱离运行并把输出写进日志，然后立即汇报"部分完成"，在遗留问题里写明完整命令、日志路径、预计耗时和结束后要核对的内容，由主 agent 等待结果。多个长命令不要并行争抢同一批文件。临时文件不要写进 /tmp，写在任务说明给出的目录或 --cwd 下已被 git 忽略的位置。`;
 
 const USAGE = `usage:
-  agent-route <tier1|tier2> [--resume ID] [--write] [--no-claude | --claude] [--monitor] [--full-output] [--effort LEVEL] [--exclude PATH]... [--cwd DIR] [--prompt-file FILE] [--verify COMMAND]... [--fix-rounds N] [--progress-doc PATH] [--label TEXT] [--commit MSG]
+  agent-route <tier1|tier2> [--resume ID] [--write] [--no-claude | --claude] [--monitor] [--full-output] [--ignore-budget] [--effort LEVEL] [--exclude PATH]... [--cwd DIR] [--prompt-file FILE] [--verify COMMAND]... [--fix-rounds N] [--progress-doc PATH] [--label TEXT] [--commit MSG]
   (无 --prompt-file 时读 stdin)
   agent-route status
   agent-route clear-cooldown
@@ -170,6 +174,159 @@ function readVersion() {
 function activeUntil(data, model) {
   const t = Date.parse(data[model]);
   return Number.isFinite(t) && t > Date.now() ? new Date(t) : null;
+}
+
+function readCircuit() {
+  const data = readJsonFile(CIRCUIT_FILE, {});
+  return data && typeof data === 'object' ? data : {};
+}
+
+function writeCircuit(data) {
+  try { writeJsonAtomic(CIRCUIT_FILE, data); } catch {}
+}
+
+const CIRCUIT_DEFAULTS = {
+  thresholds: { capacity: 2, server: 2, auth: 1 },
+  openMinutes: { capacity: 10, server: 15, auth: 60 },
+  maxOpenMinutes: 120,
+  maxRouteSwitches: 3,
+};
+
+function circuitSettings(source) {
+  const configured = source?.codexCircuit ?? {};
+  return {
+    thresholds: { ...CIRCUIT_DEFAULTS.thresholds, ...configured.thresholds },
+    openMinutes: { ...CIRCUIT_DEFAULTS.openMinutes, ...configured.openMinutes },
+    maxOpenMinutes: configured.maxOpenMinutes ?? CIRCUIT_DEFAULTS.maxOpenMinutes,
+    maxRouteSwitches: configured.maxRouteSwitches ?? CIRCUIT_DEFAULTS.maxRouteSwitches,
+  };
+}
+
+function circuitCategory(category, text = '') {
+  if (category === 'capacity') return 'capacity';
+  if (category !== '供应商故障') return null;
+  return /\b(?:401|403)\b|unauthorized|forbidden/i.test(String(text)) && !/\b5\d\d\b/.test(String(text)) ? 'auth' : 'server';
+}
+
+function circuitClosedEntry() {
+  return { state: 'closed', consecutive_failures: 0, opened_at: null, open_seconds: 0, probe: null };
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
+}
+
+function circuitKeyFor(candidate, routeModel = candidate?.model) {
+  return routeStateKey('codex', candidate?.context, routeModel);
+}
+
+// 读取一条路由的熔断记录；cooldown.json 中仍有效的旧记录按剩余时间视为 Open（只读兼容，不写回）。
+function circuitEntry(key, data = readCircuit()) {
+  let entry = { ...circuitClosedEntry(), ...(data[key] ?? {}) };
+  const cooled = activeUntil(readCooldown(), key);
+  if (cooled && entry.state !== 'open' && entry.state !== 'half_open') {
+    entry = { ...entry, state: 'open', opened_at: Date.now() / 1000, open_seconds: (cooled.getTime() - Date.now()) / 1000, probe: null };
+  }
+  return entry;
+}
+
+function circuitLabel(candidate, routeModel = candidate?.model) {
+  return `${candidate?.kind === 'micu' ? (candidate.context?.providerName ?? 'Micu') : 'official'}/${routeModel}`;
+}
+
+function logCircuit(candidate, from, to, reason, routeModel = candidate?.model) {
+  if (typeof log === 'function' && from !== to) log(`circuit: ${circuitLabel(candidate, routeModel)} ${from}→${to} (${reason})`);
+}
+
+// 判断路由能否使用；claim 为真且处于 HalfOpen 时占用唯一探测名额。
+function circuitGate(candidate, { claim = false, timeoutMinutes = 90 } = {}) {
+  const key = circuitKeyFor(candidate);
+  const data = readCircuit();
+  const entry = circuitEntry(key, data);
+  if (entry.state === 'closed') return { allowed: true, state: 'closed' };
+  const openUntil = Number(entry.opened_at ?? 0) * 1000 + Number(entry.open_seconds ?? 0) * 1000;
+  if (entry.state === 'open' && openUntil > Date.now()) {
+    return { allowed: false, state: 'open', until: new Date(openUntil) };
+  }
+  const probe = entry.probe;
+  const live = probe && pidAlive(probe.pid) && Date.now() / 1000 - Number(probe.started_at ?? 0) < timeoutMinutes * 60;
+  if (live && probe.pid !== process.pid) return { allowed: false, state: 'half_open', probing: true };
+  if (!claim) return { allowed: true, state: 'half_open' };
+  data[key] = { ...entry, state: 'half_open', probe: { pid: process.pid, started_at: Date.now() / 1000 } };
+  writeCircuit(data);
+  logCircuit(candidate, entry.state, 'half_open', '到期放行一次探测');
+  return { allowed: true, state: 'half_open', probe: true };
+}
+
+function retryAfterSeconds(text) {
+  const value = String(text ?? '');
+  const header = value.match(/retry-after\s*[:=]\s*(\d+(?:\.\d+)?)/i)?.[1];
+  if (header) return Number(header);
+  const span = value.match(/(?:try again|retry)\s+(?:in|after)\s+([^\n.]+)/i)?.[1];
+  if (!span) return null;
+  const units = { d: 86_400, h: 3_600, m: 60, s: 1 };
+  let seconds = 0;
+  for (const [, n, u] of span.matchAll(/(\d+)\s*(d|h|m|s)[a-z]*/gi)) seconds += Number(n) * units[u.toLowerCase()];
+  return seconds > 0 ? seconds : null;
+}
+
+// 记录当前路由的一次失败；返回转换后的状态。soleRoute 为真时只计数，不打开熔断。
+function recordCircuitFailure(category, { retryAfter = null, soleRoute = false, text = '' } = {}) {
+  const kind = circuitCategory(category, text);
+  if (!kind || !activeCodexContext) return null;
+  const settings = circuitSettings(config);
+  const candidate = { kind: activeRouteKind, context: activeCodexContext, model };
+  const key = circuitKeyFor(candidate);
+  const data = readCircuit();
+  const entry = circuitEntry(key, data);
+  const failures = Number(entry.consecutive_failures ?? 0) + 1;
+  const retryMinutes = codexFallbackConfig(config).retryOfficialMinutes;
+  const maxSeconds = settings.maxOpenMinutes * 60;
+  const base = Math.min(maxSeconds, retryAfter ?? (settings.openMinutes[kind] ?? retryMinutes) * 60);
+  const probing = entry.state === 'half_open' && entry.probe?.pid === process.pid;
+  if (probing) {
+    data[key] = { ...entry, state: 'open', consecutive_failures: failures, opened_at: Date.now() / 1000,
+      open_seconds: Math.min(maxSeconds, Math.max(base, Number(entry.open_seconds ?? 0) * 2)), probe: null };
+    logCircuit(candidate, 'half_open', 'open', `探测失败: ${category}`);
+  } else if (entry.state === 'open' || entry.state === 'half_open') {
+    data[key] = { ...entry, consecutive_failures: failures };
+  } else if (!soleRoute && failures >= Math.max(1, Number(settings.thresholds[kind] ?? 1))) {
+    data[key] = { ...entry, state: 'open', consecutive_failures: failures, opened_at: Date.now() / 1000, open_seconds: base, probe: null };
+    logCircuit(candidate, 'closed', 'open', `${category} 连续 ${failures} 次`);
+  } else {
+    data[key] = { ...entry, state: 'closed', consecutive_failures: failures, probe: null };
+    if (soleRoute) log(`circuit: ${circuitLabel(candidate)} 唯一可用路由，只计数 ${failures}`);
+  }
+  writeCircuit(data);
+  return data[key].state;
+}
+
+function circuitSuccess() {
+  if (!activeCodexContext) return;
+  const candidate = { kind: activeRouteKind, context: activeCodexContext, model };
+  const key = circuitKeyFor(candidate);
+  const data = readCircuit();
+  const entry = circuitEntry(key, data);
+  if (!data[key] && entry.state === 'closed') return;
+  if (data[key]?.state === 'closed' && !data[key].consecutive_failures) return;
+  data[key] = circuitClosedEntry();
+  writeCircuit(data);
+  logCircuit(candidate, entry.state, 'closed', entry.state === 'half_open' ? '探测成功' : '派发成功');
+}
+
+function modelUnavailable(candidate, routeModel = candidate?.model) {
+  const key = routeStateKey('codex', candidate?.context, routeModel);
+  const until = readJsonFile(MODEL_UNAVAILABLE_FILE, {})[key];
+  return typeof until === 'number' && until > Date.now() ? new Date(until) : null;
+}
+
+function markModelUnavailable(candidate, routeModel = candidate?.model) {
+  if (!candidate?.context) return;
+  const key = routeStateKey('codex', candidate.context, routeModel);
+  const data = readJsonFile(MODEL_UNAVAILABLE_FILE, {});
+  data[key] = Date.now() + 86_400_000;
+  writeJsonAtomic(MODEL_UNAVAILABLE_FILE, data);
 }
 
 // ---------- Codex 账号限额：只保存用量元数据，原子替换 ----------
@@ -303,7 +460,7 @@ function structuredErrorText(value, seen = new Set()) {
 }
 
 async function sessionTelemetry(id, since, includeLimits) {
-  const result = { snapshot: null, stall: 0, stall_seconds: 0, structuredErrors: [] };
+  const result = { snapshot: null, stall: 0, stall_seconds: 0, structuredErrors: [], tokenUsage: [], tokenUsageInvalid: false };
   if (!SESSION_ID.test(id ?? '')) return result;
   const files = (directory) => {
     const found = [];
@@ -347,6 +504,19 @@ async function sessionTelemetry(id, since, includeLimits) {
           }
           if (record.type !== 'event_msg' || record.payload?.type !== 'token_count') continue;
           const info = record.payload.info;
+          const usage = info?.last_token_usage;
+          if (usage && typeof usage === 'object' && (!Number.isFinite(time) || time >= since)) {
+            const tokens = {};
+            for (const key of ['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens']) {
+              const value = numeric(usage[key]);
+              if (value !== null) tokens[key] = value;
+            }
+            if (Object.keys(tokens).length) result.tokenUsage.push(tokens);
+            const total = numeric(info?.total_token_usage?.total_tokens);
+            const input = numeric(usage.input_tokens);
+            const outputTokens = numeric(usage.output_tokens);
+            if (total !== null && input !== null && outputTokens !== null && total !== input + outputTokens) result.tokenUsageInvalid = true;
+          }
           const total = numeric(info?.total_token_usage?.output_tokens);
           const output = total !== null && previousOutput !== null && total >= previousOutput
             ? total - previousOutput : numeric(info?.last_token_usage?.output_tokens);
@@ -711,8 +881,13 @@ function normalizeCodexModels(codex, label) {
 function validateCodexFallback(config) {
   const fallback = config.codexFallback;
   if (!isConfigObject(fallback)) throw new Error('codexFallback 必须是对象');
-  for (const [name, entry] of Object.entries(fallback)) {
-    const label = `codexFallback.${name}`;
+  const providers = Array.isArray(fallback.providers)
+    ? fallback.providers
+    : Object.entries(fallback).filter(([key]) => !['providers', 'retryOfficialMinutes', 'capacityBackoffSeconds', 'dailyBudgetUsd'].includes(key))
+      .map(([label, value]) => ({ label, ...value }));
+  if (!providers.length) throw new Error('codexFallback.providers 必须是非空对象数组');
+  for (const [index, entry] of providers.entries()) {
+    const label = `codexFallback.providers[${index}]`;
     if (!isConfigObject(entry)) throw new Error(`${label} 必须是对象`);
     for (const key of ['ccSwitchId', 'label']) {
       if (!validConfigString(entry[key])) throw new Error(`${label}.${key} 必须是非空字符串`);
@@ -731,9 +906,32 @@ function validateCodexFallback(config) {
         }
       }
     }
-    for (const key of ['retryOfficialMinutes', 'capacityBackoffSeconds', 'dailyBudgetUsd']) {
-      if (typeof entry[key] !== 'number' || !Number.isFinite(entry[key]) || entry[key] < 0) {
-        throw new Error(`${label}.${key} 必须是非负数`);
+    if (entry.priceMultiplier !== undefined &&
+        (typeof entry.priceMultiplier !== 'number' || !Number.isFinite(entry.priceMultiplier) || entry.priceMultiplier < 0)) {
+      throw new Error(`${label}.priceMultiplier 必须是非负数`);
+    }
+  }
+  for (const key of ['retryOfficialMinutes', 'capacityBackoffSeconds', 'dailyBudgetUsd']) {
+    if (typeof fallback[key] !== 'number' || !Number.isFinite(fallback[key]) || fallback[key] < 0) {
+      throw new Error(`codexFallback.${key} 必须是非负数`);
+    }
+  }
+  if (config.codexPricing !== undefined && !isConfigObject(config.codexPricing)) {
+    throw new Error('codexPricing 必须是对象');
+  }
+  for (const [model, pricing] of Object.entries(config.codexPricing ?? {})) {
+    if (!isConfigObject(pricing)) throw new Error(`codexPricing.${model} 必须是对象`);
+    for (const key of ['input', 'cachedInput', 'output']) {
+      if (typeof pricing[key] !== 'number' || !Number.isFinite(pricing[key]) || pricing[key] < 0) {
+        throw new Error(`codexPricing.${model}.${key} 必须是非负数`);
+      }
+    }
+    if (pricing.longContext !== undefined) {
+      if (!isConfigObject(pricing.longContext)) throw new Error(`codexPricing.${model}.longContext 必须是对象`);
+      for (const key of ['thresholdTokens', 'input', 'cachedInput', 'output']) {
+        if (typeof pricing.longContext[key] !== 'number' || !Number.isFinite(pricing.longContext[key]) || pricing.longContext[key] < 0) {
+          throw new Error(`codexPricing.${model}.longContext.${key} 必须是非负数`);
+        }
       }
     }
   }
@@ -763,8 +961,121 @@ function validateConfig(config) {
     normalizeCodexModels(tierConfig.codex, `tiers.${tier}.codex`);
   }
   validateCodexFallback(config);
+  if (config.codexCircuit !== undefined) {
+    if (!isConfigObject(config.codexCircuit)) throw new Error('codexCircuit 必须是对象');
+    for (const group of ['thresholds', 'openMinutes']) {
+      if (!isConfigObject(config.codexCircuit[group])) throw new Error(`codexCircuit.${group} 必须是对象`);
+      for (const key of ['capacity', 'server', 'auth']) {
+        const value = config.codexCircuit[group][key];
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`codexCircuit.${group}.${key} 必须是非负数`);
+      }
+    }
+    for (const key of ['maxOpenMinutes', 'maxRouteSwitches']) {
+      const value = config.codexCircuit[key];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`codexCircuit.${key} 必须是非负数`);
+    }
+  }
   validateClaudePacing(config);
   return config;
+}
+
+function codexFallbackConfig(config) {
+  const fallback = config.codexFallback ?? {};
+  const providers = Array.isArray(fallback.providers)
+    ? fallback.providers
+    : Object.entries(fallback).filter(([key]) => !['providers', 'retryOfficialMinutes', 'capacityBackoffSeconds', 'dailyBudgetUsd'].includes(key))
+      .map(([label, value]) => ({ label, ...value }));
+  return {
+    providers,
+    retryOfficialMinutes: fallback.retryOfficialMinutes ?? 15,
+    capacityBackoffSeconds: fallback.capacityBackoffSeconds ?? 30,
+    dailyBudgetUsd: fallback.dailyBudgetUsd ?? 5,
+  };
+}
+
+function readJsonFile(file, fallback) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : fallback;
+  } catch { return fallback; }
+}
+
+function writeJsonAtomic(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } finally { fs.rmSync(temporary, { force: true }); }
+}
+
+async function micuModels(route) {
+  if (!route?.runtime?.baseUrl) return null;
+  if (process.env.AGENT_ROUTE_MICU_MODELS_JSON) {
+    try {
+      const data = JSON.parse(process.env.AGENT_ROUTE_MICU_MODELS_JSON);
+      return Array.isArray(data) ? data.map(String) : Array.isArray(data?.data) ? data.data.map((row) => String(row.id)).filter(Boolean) : null;
+    } catch { return null; }
+  }
+  const cache = readJsonFile(MICU_MODEL_FILE, {});
+  const key = crypto.createHash('sha256').update(`${route.providerId}:${route.fingerprint}`).digest('hex');
+  const cached = cache[key];
+  if (cached && Array.isArray(cached.models) && Number.isFinite(cached.fetched_at) && Date.now() - cached.fetched_at < 86_400_000) {
+    return cached.models;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${route.runtime.baseUrl.replace(/\/$/, '')}/models`, {
+      method: 'GET', headers: { Authorization: `Bearer ${route.runtime.key ?? ''}` }, signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const models = Array.isArray(data) ? data.map(String) : Array.isArray(data?.data)
+      ? data.data.map((row) => String(row?.id ?? '')).filter(Boolean) : null;
+    if (!models) return null;
+    writeJsonAtomic(MICU_MODEL_FILE, { ...cache, [key]: { fetched_at: Date.now(), models } });
+    return models;
+  } catch { return null; }
+  finally { clearTimeout(timer); }
+}
+
+function todayKey() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date());
+}
+
+function readProviderSpend() {
+  return readJsonFile(PROVIDER_SPEND_FILE, {});
+}
+
+function providerSpend(label) {
+  const state = readProviderSpend();
+  const day = state[todayKey()];
+  return typeof day?.[label] === 'number' && Number.isFinite(day[label]) ? day[label] : 0;
+}
+
+function addProviderSpend(label, amount) {
+  if (!Number.isFinite(amount) || amount < 0) return;
+  const state = readProviderSpend();
+  const day = state[todayKey()] ?? {};
+  day[label] = (typeof day[label] === 'number' ? day[label] : 0) + amount;
+  state[todayKey()] = day;
+  writeJsonAtomic(PROVIDER_SPEND_FILE, state);
+}
+
+function estimateProviderCost(modelName, usage, config, multiplier = 1, invalid = false) {
+  const pricing = config.codexPricing?.[modelName];
+  if (invalid || !pricing || !Array.isArray(usage) || !usage.length) return null;
+  let total = 0;
+  for (const request of usage) {
+    const input = Number(request.input_tokens ?? 0);
+    const cached = Math.min(input, Number(request.cached_input_tokens ?? 0));
+    const cacheWrite = Number(request.cache_write_input_tokens ?? 0);
+    const output = Number(request.output_tokens ?? 0);
+    const long = pricing.longContext && input > Number(pricing.longContext.thresholdTokens ?? Infinity) ? pricing.longContext : pricing;
+    total += (Math.max(0, input - cached) + cacheWrite) * Number(long.input) + cached * Number(long.cachedInput) + output * Number(long.output);
+  }
+  return total / 1_000_000 * multiplier;
 }
 
 function readConfig({ forceProbe = false } = {}) {
@@ -1081,6 +1392,39 @@ async function resolveDispatchContext(config, { home = os.homedir(), env = proce
         context.diagnostics.push(error instanceof RouteReadError ? error.message : 'route-unreadable');
       }
     }
+    // 备用 Codex 服务商只读取其配置快照，不改变 CC Switch 的当前选择。
+    // 密钥与上游地址作为不可枚举运行时字段保存，避免进入 providers/history 的序列化结果。
+    result.codexFallbacks = [];
+    if (!readError && Array.isArray(rows)) {
+      for (const entry of codexFallbackConfig(config).providers) {
+        const row = rows.find((candidate) => candidate.app_type === 'codex' && candidate.id === entry.ccSwitchId);
+        if (!row) continue;
+        try {
+          const rowSettings = JSON.parse(row.settings_config);
+          const parsed = parseRouteToml(rowSettings.config ?? '');
+          const providerId = typeof parsed.model_provider === 'string' ? parsed.model_provider : 'openai';
+          const table = parsed.model_providers?.[providerId];
+          const upstream = codexRoute(parsed, rowSettings.auth ?? {}, {}, true, row.category === 'official');
+          if (!upstream.endpoint) continue;
+          const key = rowSettings.auth?.OPENAI_API_KEY ?? rowSettings.auth?.CODEX_API_KEY ?? null;
+          const runtime = {
+            key: typeof key === 'string' && key ? key : null,
+            baseUrl: upstream.endpoint.key,
+            wireApi: table?.wire_api ?? 'responses',
+            envKey: 'AGENT_ROUTE_PROVIDER_KEY',
+            streamIdleTimeoutMs: config.codexStreamIdleTimeoutMs ?? 0,
+          };
+          const route = { app: 'codex', providerId: row.id, providerName: entry.label ?? row.name,
+            selectedProviderId: row.id, mode: 'direct', actualRoute: 'direct', billingType: 'api',
+            configDir: result.codex.configDir, source: 'cc-switch-fallback', diagnostics: [],
+            fingerprint: crypto.createHash('sha256').update(upstream.endpoint.key).digest('hex') };
+          Object.defineProperty(route, 'runtime', { value: runtime, enumerable: false });
+          const fallbackRoute = { ...route, config: entry };
+          Object.defineProperty(fallbackRoute, 'runtime', { value: runtime, enumerable: false });
+          result.codexFallbacks.push(fallbackRoute);
+        } catch { /* 单个备用供应商不可读时跳过，不影响官方路由 */ }
+      }
+    }
     last = result;
     if ([...watched].every(([file, before]) => stamp(file) === before)) return result;
   }
@@ -1147,7 +1491,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -1273,6 +1617,27 @@ if (cmd === 'status') {
       console.log(`${app} provider: ${provider.providerName ?? 'unknown'} (${provider.providerId ?? 'unknown'}); mode: ${provider.mode}; billing: ${provider.billingType}`);
       if (provider.diagnostics.length) console.log(`${app} diagnostics: ${provider.diagnostics.join(', ')}`);
     }
+    for (const fallback of context.codexFallbacks ?? []) {
+      const label = fallback.providerName ?? 'Micu';
+      const spent = providerSpend(label);
+      const budget = codexFallbackConfig(config).dailyBudgetUsd;
+      console.log(`${label} spend today: ${spent.toFixed(6)} / ${budget} USD`);
+    }
+    const seen = new Set();
+    const describeCircuit = (label, routeContext, routeModel) => {
+      const key = routeStateKey('codex', routeContext, routeModel);
+      if (seen.has(key)) return;
+      seen.add(key);
+      const entry = circuitEntry(key);
+      const remaining = Math.max(0, Math.round(Number(entry.opened_at ?? 0) + Number(entry.open_seconds ?? 0) - Date.now() / 1000));
+      console.log(`circuit ${label}/${routeModel}: ${entry.state}${entry.state === 'open' ? ` ${remaining}s remaining` : ''}; failures: ${entry.consecutive_failures ?? 0}`);
+    };
+    for (const [tier, tierCfg] of Object.entries(config.tiers ?? {})) {
+      for (const routeModel of tierCfg.codex?.models ?? [tierCfg.codex?.model].filter(Boolean)) describeCircuit('official', context.codex, routeModel);
+      for (const fallback of context.codexFallbacks ?? []) {
+        for (const item of fallback.config?.models?.[tier] ?? []) describeCircuit(fallback.providerName ?? 'Micu', fallback, item.model);
+      }
+    }
   }
   const codex = context.codex;
   if (!context.enabled || codex.billingType === 'subscription') {
@@ -1313,6 +1678,8 @@ if (cmd === 'clear-cooldown') {
   const context = await resolveDispatchContext(config);
   if (context.enabled && context.codex.billingType !== 'unknown') CODEX_HOME = context.codex.configDir;
   writeCooldown({});
+  writeCircuit({});
+  writeJsonAtomic(MODEL_UNAVAILABLE_FILE, {});
   for (const [tier, tierCfg] of Object.entries(config.tiers ?? {})) {
     const model = resolveCodexModel(tier, context.codex, tierCfg);
     const state = readCodexQuota(context.codex, model);
@@ -1333,6 +1700,7 @@ if (process.env.AGENT_ROUTE_DEPTH) {
 let write = false;
 let noClaude = false;
 let forceClaude = false;
+let ignoreBudget = false;
 let monitor = false;
 let fullOutput = false;
 let cwdArg = null;
@@ -1351,6 +1719,7 @@ for (let i = 1; i < argv.length; i++) {
   if (a === '--write') write = true;
   else if (a === '--no-claude') noClaude = true;
   else if (a === '--claude') forceClaude = true;
+  else if (a === '--ignore-budget') ignoreBudget = true;
   else if (a === '--monitor') monitor = true;
   else if (a === '--full-output') fullOutput = true;
   else if (['--cwd', '--prompt-file', '--effort', '--exclude', '--resume', '--verify', '--fix-rounds', '--progress-doc', '--label', '--commit'].includes(a)) {
@@ -1427,11 +1796,12 @@ const config = readConfig();
 const dispatchContext = await resolveDispatchContext(config, { cwd });
 if (dispatchContext.enabled && dispatchContext.codex.billingType !== 'unknown') CODEX_HOME = dispatchContext.codex.configDir;
 const tierCfg = config.tiers?.[tier];
-if (forceClaude && (resumeArg !== null || noClaude || monitor)) die('--claude 不能与 --resume、--no-claude 或 --monitor 同用');
+if (forceClaude && (resumeArg !== null || noClaude || monitor || ignoreBudget)) die('--claude 不能与 --resume、--no-claude、--monitor 或 --ignore-budget 同用');
 if (!tierCfg?.codex?.model) { process.stderr.write(`agent-route: config 中缺少 ${tier}.codex\n`); process.exit(2); }
-const model = resolveCodexModel(tier, dispatchContext.codex, tierCfg);
+const officialModels = tierCfg.codex.models ?? [tierCfg.codex.model];
+let model = resolveCodexModel(tier, dispatchContext.codex, tierCfg);
 // 监控的 Codex effort 可独立配置。
-const effort = effortArg ?? (monitor ? (config.monitorEffort ?? tierCfg.codex.effort) : tierCfg.codex.effort);
+let effort = effortArg ?? (monitor ? (config.monitorEffort ?? tierCfg.codex.effort) : tierCfg.codex.effort);
 const cooldownMs = (config.cooldownMinutes ?? 30) * 60_000;
 const timeoutMs = (config.codexTimeoutMinutes ?? 90) * 60_000;
 
@@ -1483,7 +1853,23 @@ let recoveryFlow = false;
 let attemptPhase = null;
 let resumeRetryCount = 0;
 let freshAttemptCount = 0;
-const log = (s) => fs.appendFileSync(logPath, s.endsWith('\n') ? s : s + '\n');
+const officialCodexContext = dispatchContext.codex;
+let activeCodexContext = dispatchContext.codex;
+let activeRouteKind = 'official';
+let routeCandidates = [];
+let routeIndex = 0;
+let capacityRetried = false;
+let budgetIgnoredUsed = false;
+let routeSwitches = 0;
+let lastFailureText = '';
+const skippedRoutes = [];
+const redactions = new Set();
+const routesTried = [];
+const log = (s) => {
+  let text = s.endsWith('\n') ? s : s + '\n';
+  for (const secret of redactions) text = text.split(secret).join('[redacted]');
+  fs.appendFileSync(logPath, text);
+};
 function logCodexFailure(tail, code, telemetry = {}) {
   const classification = classifyCodexFailure(tail, code, telemetry);
   log(`failure class: ${classification.category}`);
@@ -1592,7 +1978,131 @@ function codexStreamIdleArgs() {
     ? `model_providers.${provider}.stream_idle_timeout_ms=${value}`
     : `model_providers={${JSON.stringify(provider)}={stream_idle_timeout_ms=${value}}}`];
 }
+
+function codexRouteArgs() {
+  if (activeRouteKind !== 'micu' || !activeCodexContext?.runtime) return codexStreamIdleArgs();
+  const runtime = activeCodexContext.runtime;
+  const fields = [`name=${JSON.stringify(activeCodexContext.providerName ?? 'Micu')}`,
+    `base_url=${JSON.stringify(runtime.baseUrl)}`, `wire_api=${JSON.stringify(runtime.wireApi ?? 'responses')}`,
+    `env_key=${JSON.stringify(runtime.envKey ?? 'AGENT_ROUTE_PROVIDER_KEY')}`];
+  if (Number.isSafeInteger(runtime.streamIdleTimeoutMs) && runtime.streamIdleTimeoutMs > 0) {
+    fields.push(`stream_idle_timeout_ms=${runtime.streamIdleTimeoutMs}`);
+  }
+  return ['-c', `model_providers.agent_route_micu={${fields.join(',')}}`, '-c', 'model_provider="agent_route_micu"'];
+}
+
+function logExecArgs(bin, args) {
+  const rendered = args.map((arg) => String(arg).replace(/(base_url=)(["']?)(https?:[^"'\s}]+)\2/i, '$1"[redacted]"'));
+  log(`exec: ${bin} ${rendered.join(' ')}`);
+}
+
+function setActiveRoute(candidate, reason = null) {
+  activeRouteKind = candidate.kind;
+  activeCodexContext = candidate.context;
+  dispatchContext.codex = candidate.context;
+  model = candidate.model;
+  effort = candidate.effort;
+  capacityRetried = false;
+  const routeName = candidate.kind === 'micu' ? (candidate.context?.providerName ?? 'Micu') : 'official';
+  const last = routesTried.at(-1);
+  if (!last || last.route !== routeName || last.model !== candidate.model) {
+    routesTried.push({ route: routeName, model: candidate.model, ...(reason ? { reason: String(reason).slice(0, 120) } : {}) });
+  }
+  if (reason) {
+    log(`route: ${candidate.kind} ${candidate.context?.providerName ?? 'Codex'} ${model} (${reason})`);
+    log(`providers: ${JSON.stringify({ codex: routeSafeContext(), claude: safeRouteContext(dispatchContext.claude) })}`);
+  }
+}
+
+async function initializeRouteCandidates() {
+  const candidates = [];
+  const officialEffort = effortArg ?? (monitor ? (config.monitorEffort ?? tierCfg.codex.effort) : tierCfg.codex.effort);
+  const officialList = dispatchContext.codex?.billingType === 'api' && tier === 'tier2'
+    ? [tierCfg.codex.apiModel ?? officialModels[0]] : officialModels;
+  for (const official of officialList) {
+    candidates.push({ kind: 'official', context: officialCodexContext, model: official, effort: officialEffort });
+  }
+  for (const fallback of dispatchContext.codexFallbacks ?? []) {
+    for (const secret of [fallback.runtime?.key, fallback.runtime?.baseUrl]) if (typeof secret === 'string' && secret.length >= 8) redactions.add(secret);
+    if (fallback.providerId === officialCodexContext?.providerId) continue;
+    const models = fallback.config?.models?.[tier] ?? [];
+    const available = await micuModels(fallback);
+    for (const item of models) {
+      if (available && !available.includes(item.model)) {
+        log(`model unavailable: ${fallback.providerName} ${item.model}`);
+        continue;
+      }
+      candidates.push({ kind: 'micu', context: fallback, config: fallback.config,
+        model: item.model, effort: effortArg ?? item.effort ?? officialEffort });
+    }
+  }
+  routeCandidates = candidates;
+  if (!routeCandidates.length) routeCandidates = [{ kind: 'official', context: officialCodexContext, model, effort }];
+  setActiveRoute(routeCandidates[0]);
+}
+
+// 返回 null 表示可用；否则给出跳过原因。ignored 表示仅因软预算被 --ignore-budget 放行。
+function candidateBlock(candidate, { claim = false } = {}) {
+  if (modelUnavailable(candidate, candidate.model)) return { reason: 'model-unavailable' };
+  let ignored = false;
+  if (candidate.kind === 'micu') {
+    const name = candidate.context?.providerName ?? candidate.config?.label ?? 'Micu';
+    if (limitActive(readCodexQuota(candidate.context, candidate.model))) return { reason: 'provider-limit' };
+    const spend = providerSpend(name);
+    const limit = codexFallbackConfig(config).dailyBudgetUsd;
+    const overBudget = spend >= limit;
+    const unpriced = !config.codexPricing?.[candidate.model];
+    if (overBudget || unpriced) {
+      if (!ignoreBudget) return { reason: overBudget ? `budget ${spend.toFixed(4)} >= ${limit}` : 'price-unknown' };
+      ignored = true;
+    }
+  }
+  const gate = circuitGate(candidate, { claim, timeoutMinutes: config.codexTimeoutMinutes ?? 90 });
+  if (!gate.allowed) return { reason: gate.probing ? 'circuit probing' : 'circuit open', until: gate.until };
+  return { reason: null, ignored };
+}
+
+function nextCandidate(reason, { includeCurrent = false, skipKinds = [] } = {}) {
+  const start = includeCurrent ? routeIndex : routeIndex + 1;
+  for (let index = start; index < routeCandidates.length; index++) {
+    const candidate = routeCandidates[index];
+    if (skipKinds.includes(candidate.kind)) continue;
+    const block = candidateBlock(candidate, { claim: true });
+    if (block.reason) {
+      const line = `${circuitLabel(candidate)} (${block.reason})`;
+      log(`skip route: ${line}`);
+      skippedRoutes.push(line);
+      continue;
+    }
+    if (block.ignored) {
+      budgetIgnoredUsed = true;
+      log(`budget ignored: ${candidate.context?.providerName ?? 'Micu'}/${candidate.model}`);
+    }
+    routeIndex = index;
+    setActiveRoute(candidate, reason);
+    return candidate;
+  }
+  return null;
+}
+
+// 当前路由失败后是否还有别的去处：后续候选可用，或允许交给 Claude。
+function hasAlternativeRoute(skipKinds = []) {
+  if (!noClaude) return true;
+  for (let index = routeIndex + 1; index < routeCandidates.length; index++) {
+    const candidate = routeCandidates[index];
+    if (!skipKinds.includes(candidate.kind) && !candidateBlock(candidate).reason) return true;
+  }
+  return false;
+}
+
+function routeSafeContext() {
+  const safe = safeRouteContext(activeCodexContext);
+  if (safe) safe.route = activeRouteKind === 'micu' ? (activeCodexContext?.providerName ?? 'Micu') : 'official';
+  return safe;
+}
+
 beginRound();
+await initializeRouteCandidates();
 
 // ---------- 只读核对：git 状态前后对比 + 执行期间新写入的文件（含 git 忽略的路径） ----------
 const readOnlyCheck = !write && !monitor;
@@ -1776,7 +2286,7 @@ function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -1903,7 +2413,8 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
     executor,
     attempt: attemptPhase,
     ...(providerChange ? { provider_change: providerChange } : {}),
-    ...(dispatchContext.enabled ? { providers: { codex: safeRouteContext(dispatchContext.codex), claude: safeRouteContext(dispatchContext.claude) } } : {}),
+    ...(dispatchContext.enabled ? { providers: { codex: routeSafeContext(), claude: safeRouteContext(dispatchContext.claude) } } : {}),
+    ...(routesTried.length > 1 ? { routes: routesTried } : {}),
   };
   if (verifyResult) log(`verify result: ${JSON.stringify(verifyResult)}`);
   log(`finish: status=${status} tokens=${tokens ?? '?'} elapsed=${elapsed} session=${session ?? '?'} exit_code=${code} stdout_chars=${record.stdout_chars} model=${actualModel} effort=${actualEffort ?? '?'} fallback=${usedFallback} executor=${executor} reconnect=${reconnectCount} capacity=${capacityCount} stall=${codexStall.count} stall_seconds=${codexStall.seconds}${commitHash ? ` commit=${commitHash}` : ''}`);
@@ -1933,6 +2444,7 @@ async function finishReport(text, tokens, actualModel = model, actualEffort = ef
   try { if (fs.statSync(reportPath).size > 0) parts.push('report'); } catch {}
   if (resumeArg !== null) parts.push(`resumed ${resumeArg}`);
   if (providerChange) parts.push(`provider changed (${providerChange.app}); ${providerChange.action}`);
+  if (budgetIgnoredUsed) parts.push('budget ignored');
   if (fixRound) parts.push(`fixed-after ${fixRound}`);
   if (recoveryFlow && attemptPhase !== null) parts.push(`step ${attemptPhase}`);
   const failed = verifyResult?.status === 'FAIL';
@@ -2072,9 +2584,10 @@ function rebuildPromptFromResume() {
 }
 
 function takeOverCodex(state) {
+  codexLimitReason = `codex ${dispatchContext.codex?.billingType === 'api' ? 'API 服务商 ' : ''}${state.type} 限额${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : '，恢复时间未知'}`;
+  if (routeFailureHandled({ category: state.type === 'weekly' ? '官方周' : '官方 5h', state, resets_at: state.resets_at }, codexLimitReason)) return;
   if (noClaude) return limitStop(state);
   usedFallback = true;
-  codexLimitReason = `codex ${dispatchContext.codex?.billingType === 'api' ? 'API 服务商 ' : ''}${state.type} 限额${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : '，恢复时间未知'}`;
   if (!rebuildPromptFromResume()) {
     return failResume('Codex 限额，找不到原任务说明；请用日志 id 续跑并保留 prompt 文件');
   }
@@ -2119,14 +2632,65 @@ function startAttempt(phase) {
   log(`attempt start: ${phase}`);
 }
 
+function routeFailureHandled(classification, reason) {
+  const category = classification?.category ?? classification?.type;
+  if (!category || !['capacity', '供应商故障', '模型不支持', '供应商额度', '官方 5h', '官方周'].includes(category)) return false;
+  if (category === '官方 5h' || category === '官方周') {
+    const state = classification.state ?? readCodexQuota(activeCodexContext, model) ?? { type: category === '官方周' ? 'weekly' : '5h', resets_at: classification.resets_at };
+    return switchRoute('官方额度', state, { skipKinds: ['official'] });
+  }
+  if (category === '供应商额度') {
+    const state = classification.state ?? { type: 'quota', resets_at: classification.resets_at, detected_at: new Date().toISOString(), source: 'api-text' };
+    writeProviderLimit(activeCodexContext, model, state);
+    return switchRoute('供应商额度', state);
+  }
+  if (category === '模型不支持') {
+    markModelUnavailable({ context: activeCodexContext }, model);
+    log(`model unavailable: ${activeCodexContext?.providerName ?? 'Codex'} ${model}`);
+    return switchRoute(category, null);
+  }
+  // capacity / 供应商故障：计入熔断器；退避重试那一次也计数。
+  const failure = { retryAfter: retryAfterSeconds(lastFailureText), soleRoute: !hasAlternativeRoute(), text: lastFailureText };
+  const opened = recordCircuitFailure(category, failure) === 'open';
+  if (category === 'capacity' && !capacityRetried && !opened) {
+    capacityRetried = true;
+    const delay = process.env.AGENT_ROUTE_HOME ? 0 : Math.max(0, codexFallbackConfig(config).capacityBackoffSeconds) * 1000;
+    log(`capacity retry: ${delay / 1000}s`);
+    setTimeout(() => runCodex(), delay);
+    return true;
+  }
+  return switchRoute(category, null);
+}
+
+function switchRoute(reason, state = null, options = {}) {
+  const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  if (routeSwitches >= circuitSettings(config).maxRouteSwitches) return false;
+  const next = nextCandidate(oneLine, options);
+  if (!next) return false;
+  routeSwitches++;
+  if (state && activeRouteKind === 'official' && (state.type === '5h' || state.type === 'weekly' || state.type === 'unknown')) {
+    codexLimitReason = `codex ${state.type} 限额${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : ''}`;
+  }
+  if (next.kind === 'micu') usedFallback = true;
+  if (resumeArg !== null) rebuildPromptFromResume();
+  session = null;
+  codexResume = false;
+  startAttempt(`route ${next.kind}`);
+  runCodex();
+  return true;
+}
+
 // 续跑时 Codex 失败：同 session 重试 1 次 → 新 Codex 线程最多 2 次 → 写冷却并交给 Claude（--no-claude 输出 FALLBACK）。
 function failCodex(reason, failureContext = {}) {
   const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  const classification = failureContext.classification ?? classifyCodexFailure(failureContext.tail ?? reason,
+    failureContext.code ?? 1, failureContext.telemetry ?? {});
   if (!failureContext.classified) {
-    logCodexFailure(failureContext.tail ?? reason, failureContext.code ?? 1, failureContext.telemetry ?? {});
+    logCodexFailure(failureContext.tail ?? reason, failureContext.code ?? 1, { ...(failureContext.telemetry ?? {}), classification });
   }
   if (resumeArg === null) {
-    writeModelCooldown();
+    if (routeFailureHandled(classification, oneLine)) return;
+    if (!['模型不支持', 'capacity', '供应商故障'].includes(classification.category)) writeModelCooldown();
     return fallback(reason);
   }
   recoveryFlow = true;
@@ -2147,7 +2711,8 @@ function failCodex(reason, failureContext = {}) {
     rebuildPromptFromResume();
     return runCodex();
   }
-  writeModelCooldown();
+  if (routeFailureHandled(classification, oneLine)) return;
+  if (!['模型不支持', 'capacity', '供应商故障'].includes(classification.category)) writeModelCooldown();
   session = null;
   codexResume = false;
   startAttempt('claude fallback');
@@ -2259,7 +2824,18 @@ log: ${logPath}
 }
 
 // 模型失败冷却与账号限额分别决策；原 Claude 会话始终使用 Claude 续跑。
-const until = resumeArg === null ? activeUntil(readCooldown(), routeStateKey('codex', dispatchContext.codex, model)) : null;
+// 起始路由：新派发按候选顺序跳过熔断、冷却或不可用的路由；续跑保持原路由，由失败处理再切换。
+let allRoutesBlocked = false;
+if (resumeArg === null) {
+  routeIndex = -1;
+  if (nextCandidate(null)) {
+    if (routeIndex > 0) setActiveRoute(routeCandidates[routeIndex], '前序路由不可用');
+  } else {
+    routeIndex = 0;
+    setActiveRoute(routeCandidates[0]);
+    allRoutesBlocked = true;
+  }
+}
 if (providerChange && !resumeError && dispatchContext[executor].billingType !== 'unknown') {
   if (!rebuildPromptFromResume()) {
     providerChange.action = 'stop';
@@ -2277,12 +2853,14 @@ else if (dispatchContext.enabled && !forceClaude && executor !== 'claude' && dis
 else if (forceClaude) runClaude('主 agent 指定 --claude，未调用 Codex');
 else if (resumeArg !== null && executor === 'claude') runClaude('跟随原 Claude 执行方续跑', !providerResumeRebuilt);
 else {
-  const state = dispatchContext.codex?.billingType === 'api' || noClaude
-    ? readCodexQuota(dispatchContext.codex, model) : await checkCodexLimit(config);
+  const forcedLimit = process.env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT === '1' && activeRouteKind === 'official'
+    ? { type: '5h', resets_at: (Date.now() + 3_600_000) / 1000, source: 'forced-test' } : null;
+  const state = forcedLimit ?? (dispatchContext.codex?.billingType === 'api' || noClaude
+    ? readCodexQuota(dispatchContext.codex, model) : await checkCodexLimit(config));
   if (limitActive(state)) takeOverCodex(state);
   else {
     if (state?.type) clearCodexQuota(dispatchContext.codex, model, state);
-    if (until) fallback(`cooldown until ${until.toISOString()} (${model})`);
+    if (allRoutesBlocked) fallback(`所有 Codex 路由处于冷却或不可用: ${skippedRoutes.join('; ')}`);
     else runCodex();
   }
 }
@@ -2303,14 +2881,21 @@ function runCodex(spawnRetried = false) {
     '-m', model, '-c', `model_reasoning_effort="${effort}"`,
     // 只对派发生效：没有 AGENTS.md 的目录读取 CLAUDE.md，不改 ~/.codex/config.toml
     '-c', 'project_doc_fallback_filenames=["CLAUDE.md"]',
-    ...codexStreamIdleArgs(),
+    ...codexRouteArgs(),
     ...(codexResume ? [] : ['-C', cwd]), '-o', lastMessage, ...(codexResume ? [] : ['-'])];
-  log(`exec: ${codexBin} ${args.join(' ')}`);
+  logExecArgs(codexBin, args);
 
   let child;
   const codexStartedAt = Date.now();
   try {
-    child = spawn(codexBin, args, { cwd, env: { ...process.env, CODEX_HOME, AGENT_ROUTE_DEPTH: '1' }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    const childEnv = { ...process.env, CODEX_HOME, AGENT_ROUTE_DEPTH: '1' };
+    childEnv.AGENT_ROUTE_ACTIVE_PROVIDER = activeRouteKind;
+    if (activeRouteKind === 'micu') {
+      log(`micu credentials: ${activeCodexContext.runtime?.key ? 'present' : 'missing'}`);
+      if (activeCodexContext.runtime?.key) childEnv[activeCodexContext.runtime.envKey ?? 'AGENT_ROUTE_PROVIDER_KEY'] = activeCodexContext.runtime.key;
+      else delete childEnv[activeCodexContext.runtime?.envKey ?? 'AGENT_ROUTE_PROVIDER_KEY'];
+    } else delete childEnv.AGENT_ROUTE_PROVIDER_KEY;
+    child = spawn(codexBin, args, { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
   } catch (e) { cleanup(); return failCodex(`spawn 失败: ${e.message}`); }
   child.stdin.on('error', () => {});
   child.stdin.end(fullPrompt);
@@ -2378,26 +2963,39 @@ function runCodex(spawnRetried = false) {
     const structuredDiagnostics = (telemetry.structuredErrors ?? [])
       .map((entry) => typeof entry === 'string' ? entry : entry?.text).filter(Boolean);
     const failureText = [...structuredDiagnostics, stderrDiagnostics].filter(Boolean).join('\n');
+    lastFailureText = failureText;
     const failureTelemetry = { ...telemetry, billingType: dispatchContext.codex?.billingType,
       stderrDiagnostics,
       limit: dispatchContext.codex?.billingType === 'api' ? readCodexQuota(dispatchContext.codex, model) : readCodexLimit() };
     codexStall = { count: telemetry.stall, seconds: telemetry.stall_seconds };
+    if (activeRouteKind === 'micu') {
+      // 无论成败都按 rollout 的请求级 token_count 记账；口径不符或缺单价时记 unknown。
+      const pricing = estimateProviderCost(model, telemetry.tokenUsage, config, activeCodexContext.config?.priceMultiplier ?? 1,
+        telemetry.tokenUsageInvalid);
+      if (pricing !== null) addProviderSpend(activeCodexContext.providerName ?? 'Micu', pricing);
+      log(`spend: ${pricing === null ? 'unknown' : pricing.toFixed(6)} usd`);
+    }
     if (timedOut) return failCodex(`超时（>${config.codexTimeoutMinutes ?? 90} 分钟）`,
       { tail: '', code, telemetry: { ...failureTelemetry, structuredErrors: [] } });
     if (dispatchContext.codex?.billingType === 'api') {
       if (code !== 0) {
-        logCodexFailure(failureText, code, failureTelemetry);
+        const classification = logCodexFailure(failureText, code, failureTelemetry);
         const state = detectApiLimit(failureText, new Date(), config.limitCooldownMinutes ?? 60);
         if (state) {
+          classification.category = '供应商额度';
+          classification.resets_at = state.resets_at;
+          classification.state = state;
           writeProviderLimit(dispatchContext.codex, model, state);
+          if (routeFailureHandled(classification, state)) return;
           return takeOverCodex(state);
         }
-        return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`, { classified: true });
+        return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`, { classified: true, classification, code, telemetry: failureTelemetry });
       }
       if (!stdout.trim()) return failCodex('codex 最终消息为空',
         { tail: '', code, telemetry: failureTelemetry });
       const previous = readCodexQuota(dispatchContext.codex, model);
       if (previous) clearCodexQuota(dispatchContext.codex, model, previous);
+      circuitSuccess();
       log(`stdout bytes: ${stdout.length}`);
       return finishReport(stdout, codexTokens);
     }
@@ -2406,7 +3004,7 @@ function runCodex(spawnRetried = false) {
     if (state?.type && !state.resets_at) state.resets_at = (Date.now() + (config.limitCooldownMinutes ?? 60) * 60_000) / 1000;
     if (state) writeCodexLimit(state);
     if (code !== 0) {
-      logCodexFailure(failureText, code, { ...failureTelemetry, limit: state ?? failureTelemetry.limit });
+      const classification = logCodexFailure(failureText, code, { ...failureTelemetry, limit: state ?? failureTelemetry.limit });
       const limitUntil = detectLimit(failureText, new Date(), config.limitCooldownMinutes ?? 60);
       if (state?.type || (!snapshot && limitUntil)) {
         state ??= { last_checked_at: null, ...readCodexLimit(), type: /weekly|week limit/i.test(failureText) ? 'weekly' : /5h|5.hour/i.test(failureText) ? '5h' : 'unknown',
@@ -2415,7 +3013,8 @@ function runCodex(spawnRetried = false) {
         writeCodexLimit(state);
         return takeOverCodex(state);
       }
-      return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`, { classified: true });
+      return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`, { classified: true, classification, code,
+        telemetry: { ...failureTelemetry, limit: state ?? failureTelemetry.limit } });
     }
     if (!snapshot) {
       const previous = readCodexLimit();
@@ -2423,6 +3022,7 @@ function runCodex(spawnRetried = false) {
     }
     if (!stdout.trim()) return failCodex('codex 最终消息为空',
       { tail: '', code, telemetry: failureTelemetry });
+    circuitSuccess();
     log(`stdout bytes: ${stdout.length}`);
     finishReport(stdout, codexTokens);
   });
