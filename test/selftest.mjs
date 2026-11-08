@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 export async function selftest({
   SCRIPT_PATH, ROOT, CONFIG_FILE, DEFAULT_STATE_DIR, STATE_DIR,
   REPORT_FOOTER, READ_ONLY_REPORT_FOOTER, RULES, LIMIT_KEY,
-  charCount, resolveDispatchContext, safeRouteContext,
+  charCount, resolveDispatchContext, safeRouteContext, classifyCodexFailure,
 }) {
   const SELFTEST_STATE_ROOT = (() => {
     const relative = path.relative(STATE_DIR, DEFAULT_STATE_DIR);
@@ -380,6 +380,32 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           check(result.stderr.includes('tiers.tier2.codex.models 必须是非空字符串数组'), '非法 models 未给出明确报错');
         } finally { fs.writeFileSync(configPath, savedConfig); }
       }],
+      [0.7, 'Codex 失败逐类分类并解析恢复时间', () => {
+        const fiveHourReset = Math.floor(Date.now() / 1000) + 3600;
+        const weeklyReset = fiveHourReset + 604800;
+        const snapshot = (primary, secondary) => ({
+          primary: { used_percent: primary, resets_at: fiveHourReset, window_minutes: 300 },
+          secondary: { used_percent: secondary, resets_at: weeklyReset, window_minutes: 10080 },
+          rate_limit_reached_type: null,
+        });
+        const cases = [
+          ['You’ve hit your usage limit.', 1, { billingType: 'subscription', snapshot: snapshot(100, 3) }, '官方 5h', fiveHourReset],
+          ['You’ve hit your usage limit.', 1, { billingType: 'subscription', snapshot: snapshot(3, 100) }, '官方周', weeklyReset],
+          ['Selected model is at capacity. Please try a different model.', 1, { billingType: 'subscription' }, 'capacity', null],
+          ['unexpected status 503 Service Unavailable: 当前分组下暂无可用渠道，请稍后重试', 1, { billingType: 'api' }, '供应商故障', null],
+          ['model_not_found: model does not exist', 1, { billingType: 'api' }, '模型不支持', null],
+          ['429 Too Many Requests; retry-after: 45', 1, { billingType: 'api' }, '供应商额度', 'present'],
+          ['stream disconnected while waiting for output', 1, { billingType: 'api' }, '其他', null],
+        ];
+        for (const [tail, code, telemetry, expected, reset] of cases) {
+          const result = classifyCodexFailure(tail, code, telemetry);
+          check(result.type === expected && result.category === expected, `${tail} 分类为 ${result.type}，预期 ${expected}`);
+          if (reset === null) check(result.resets_at === null, `${expected} 不应有恢复时间`);
+          else if (reset === 'present') check(Number.isFinite(result.resets_at) && result.resets_at > Date.now() / 1000,
+            `${expected} 应返回恢复时间`);
+          else check(Math.abs(result.resets_at - reset) < 2, `${expected} 恢复时间未沿用限额快照`);
+        }
+      }],
       [1, '汇报完成', () => {
         complete = run('complete');
         exitIs(complete, 0);
@@ -445,7 +471,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(result.stdout.startsWith('FALLBACK\n') && result.stdout.includes('codex 退出码 1'), '未输出预期 FALLBACK 块');
         const cooldown = JSON.parse(fs.readFileSync(path.join(home, 'state', 'cooldown.json'), 'utf8'));
         check(Date.parse(cooldown[config.tiers.tier1.codex.model]) > Date.now(), '临时 HOME 未写入有效冷却');
-        check(result.record.status === 'fallback' && result.record.fallback === true, 'FALLBACK 缺少 history 状态');
+        check(result.record.status === 'fallback' && result.record.fallback === true && result.log.includes('failure class: 其他'),
+          'FALLBACK 缺少 history 状态或失败分类日志');
       }],
       [9, 'history、stats 与旧日志回填', () => {
         const result = run('complete', ['--write']);

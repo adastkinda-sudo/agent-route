@@ -544,6 +544,42 @@ function detectApiLimit(text, now = new Date(), fallbackMinutes = 60) {
     detected_at: now.toISOString(), source: 'api-text', reset_source: resetSource };
 }
 
+// 将 Codex 失败归一为路由阶段使用的类别；限额识别沿用现有快照和文本检测。
+function classifyCodexFailure(tail, code, telemetry = {}) {
+  const text = String(tail ?? '');
+  const snapshot = telemetry?.snapshot ?? telemetry?.rateLimits?.snapshot ?? null;
+  const snapshotLimit = snapshot ? limitFromSnapshot(snapshot) : null;
+  const knownLimit = telemetry?.limit ?? telemetry?.state ?? telemetry?.quota ?? null;
+  const billingType = telemetry?.billingType ?? (telemetry?.api ? 'api' : 'subscription');
+  const resetSeconds = (value) => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (value instanceof Date && Number.isFinite(value.getTime())) return value.getTime() / 1000;
+    return null;
+  };
+  const result = (category, resetsAt = null) => ({ category, type: category, resets_at: resetSeconds(resetsAt) });
+
+  if (code !== 0 && /at capacity/i.test(text)) return result('capacity');
+  if (/model[\s_-]*(?:not[\s_-]*found|does not exist)|does not exist|unsupported model|unknown model/i.test(text)) {
+    return result('模型不支持');
+  }
+
+  const apiLimit = detectApiLimit(text);
+  if (billingType === 'api' && apiLimit) return result('供应商额度', apiLimit.resets_at);
+  if (/\b5\d\d\b|\b(?:401|403)\b|unauthorized|internal server error|service unavailable/i.test(text)) {
+    return result('供应商故障');
+  }
+
+  const officialLimitText = /weekly|week limit|7.?day/i.test(text) ? 'weekly' :
+    /5\s*h|5.?hour|primary/i.test(text) ? '5h' : null;
+  const officialLimitType = knownLimit?.type ?? snapshotLimit?.type ?? officialLimitText;
+  const officialReset = knownLimit?.resets_at ?? snapshotLimit?.resets_at ??
+    (detectLimit(text) ?? null);
+  if (billingType !== 'api' && (officialLimitType === 'weekly' || officialLimitType === '5h' || detectLimit(text))) {
+    return result(officialLimitType === 'weekly' ? '官方周' : '官方 5h', officialReset);
+  }
+  return result('其他');
+}
+
 function executable(file) {
   if (typeof file !== 'string' || !file.startsWith('/')) return false;
   try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); }
@@ -1079,7 +1115,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -1155,7 +1191,7 @@ function stats(args) {
 export const selftestRuntime = {
   SCRIPT_PATH, ROOT, CONFIG_FILE, DEFAULT_STATE_DIR, STATE_DIR,
   REPORT_FOOTER, READ_ONLY_REPORT_FOOTER, RULES, LIMIT_KEY,
-  charCount, resolveDispatchContext, safeRouteContext,
+  charCount, resolveDispatchContext, safeRouteContext, classifyCodexFailure,
 };
 
 // ---------- 子命令 ----------
@@ -1416,6 +1452,11 @@ let attemptPhase = null;
 let resumeRetryCount = 0;
 let freshAttemptCount = 0;
 const log = (s) => fs.appendFileSync(logPath, s.endsWith('\n') ? s : s + '\n');
+function logCodexFailure(tail, code, telemetry = {}) {
+  const classification = classifyCodexFailure(tail, code, telemetry);
+  log(`failure class: ${classification.category}`);
+  return classification;
+}
 function beginRound() {
   const suffix = `${fixRound ? `-fix${fixRound}` : ''}${attemptSerial ? `-attempt${attemptSerial}` : ''}`;
   base = path.join(LOG_DIR, `${stamp}-${tier}-${process.pid}${suffix}`);
@@ -1673,7 +1714,7 @@ function compactLog(text) {
   let full;
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -2017,8 +2058,11 @@ function startAttempt(phase) {
 }
 
 // 续跑时 Codex 失败：同 session 重试 1 次 → 新 Codex 线程最多 2 次 → 写冷却并交给 Claude（--no-claude 输出 FALLBACK）。
-function failCodex(reason) {
+function failCodex(reason, failureContext = {}) {
   const oneLine = String(reason).replace(/\s+/g, ' ').trim();
+  if (!failureContext.classified) {
+    logCodexFailure(failureContext.tail ?? reason, failureContext.code ?? 1, failureContext.telemetry ?? {});
+  }
   if (resumeArg === null) {
     writeModelCooldown();
     return fallback(reason);
@@ -2251,10 +2295,12 @@ function runCodex(spawnRetried = false) {
 
   child.on('error', (e) => {
     if (finish()) {
+      const reason = `spawn 失败: ${e.message}`;
       if (!spawnRetried && ['ENOENT', 'EACCES'].includes(e.code) && refreshProgramConfig(config, 'codex', true)) {
+        logCodexFailure(reason, 1, { billingType: dispatchContext.codex?.billingType });
         return runCodex(true);
       }
-      failCodex(`spawn 失败: ${e.message}`);
+      failCodex(reason);
     }
   });
   child.on('close', async (code, signal) => {
@@ -2262,18 +2308,23 @@ function runCodex(spawnRetried = false) {
     log(`exit: code=${code} signal=${signal ?? 'none'} timedOut=${timedOut}`);
     codexTokens = [...tail.matchAll(/tokens used\s+([\d,]+)/g)].pop()?.[1] ?? null;
     const telemetry = await sessionTelemetry(session, codexStartedAt, dispatchContext.codex?.billingType !== 'api');
+    const failureTelemetry = { ...telemetry, billingType: dispatchContext.codex?.billingType,
+      limit: dispatchContext.codex?.billingType === 'api' ? readCodexQuota(dispatchContext.codex, model) : readCodexLimit() };
     codexStall = { count: telemetry.stall, seconds: telemetry.stall_seconds };
-    if (timedOut) return failCodex(`超时（>${config.codexTimeoutMinutes ?? 90} 分钟）`);
+    if (timedOut) return failCodex(`超时（>${config.codexTimeoutMinutes ?? 90} 分钟）`,
+      { tail: '', code, telemetry: failureTelemetry });
     if (dispatchContext.codex?.billingType === 'api') {
       if (code !== 0) {
+        logCodexFailure(tail, code, failureTelemetry);
         const state = detectApiLimit(tail, new Date(), config.limitCooldownMinutes ?? 60);
         if (state) {
           writeProviderLimit(dispatchContext.codex, model, state);
           return takeOverCodex(state);
         }
-        return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`);
+        return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`, { classified: true });
       }
-      if (!stdout.trim()) return failCodex('codex 最终消息为空');
+      if (!stdout.trim()) return failCodex('codex 最终消息为空',
+        { tail: '', code, telemetry: failureTelemetry });
       const previous = readCodexQuota(dispatchContext.codex, model);
       if (previous) clearCodexQuota(dispatchContext.codex, model, previous);
       log(`stdout bytes: ${stdout.length}`);
@@ -2284,6 +2335,7 @@ function runCodex(spawnRetried = false) {
     if (state?.type && !state.resets_at) state.resets_at = (Date.now() + (config.limitCooldownMinutes ?? 60) * 60_000) / 1000;
     if (state) writeCodexLimit(state);
     if (code !== 0) {
+      logCodexFailure(tail, code, { ...failureTelemetry, limit: state ?? failureTelemetry.limit });
       const limitUntil = detectLimit(tail, new Date(), config.limitCooldownMinutes ?? 60);
       if (state?.type || (!snapshot && limitUntil)) {
         state ??= { last_checked_at: null, ...readCodexLimit(), type: /weekly|week limit/i.test(tail) ? 'weekly' : /5h|5.hour/i.test(tail) ? '5h' : 'unknown',
@@ -2292,13 +2344,14 @@ function runCodex(spawnRetried = false) {
         writeCodexLimit(state);
         return takeOverCodex(state);
       }
-      return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`);
+      return failCodex(`codex 退出码 ${code ?? 'signal ' + signal}`, { classified: true });
     }
     if (!snapshot) {
       const previous = readCodexLimit();
       if (previous?.type) clearCodexLimit(previous);
     }
-    if (!stdout.trim()) return failCodex('codex 最终消息为空');
+    if (!stdout.trim()) return failCodex('codex 最终消息为空',
+      { tail: '', code, telemetry: failureTelemetry });
     log(`stdout bytes: ${stdout.length}`);
     finishReport(stdout, codexTokens);
   });
