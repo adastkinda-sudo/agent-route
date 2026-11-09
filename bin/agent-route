@@ -80,6 +80,7 @@ const USAGE = `usage:
   agent-route setup
   agent-route selftest
   agent-route stats [--days N]
+  agent-route stats --failures [--days N] [--version SHA]
   agent-route route <tier1|tier2> --explain
 
 AGENT_ROUTE_HOME 覆盖 config、agents、state 和 logs 的根目录，只供 selftest 使用。
@@ -172,11 +173,23 @@ function fmtLocal(d) {
 function readVersion() {
   try {
     const value = JSON.parse(fs.readFileSync(VERSION_FILE, 'utf8'));
-    if (value && typeof value.commit === 'string' && value.commit &&
-        typeof value.time === 'string' && value.time) return value;
+    if (value && typeof value.commit === 'string' && value.commit) {
+      return { commit: value.commit, time: typeof value.time === 'string' && value.time ? value.time : null };
+    }
   } catch {}
   return null;
 }
+
+const STARTUP_VERSION = readVersion();
+function gitVersion() {
+  try {
+    const result = spawnSync('git', ['-C', path.dirname(SCRIPT_PATH), 'rev-parse', '--short', 'HEAD'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+    if (result.status === 0 && result.stdout.trim()) return result.stdout.trim().slice(0, 7);
+  } catch {}
+  return null;
+}
+const HISTORY_VERSION = STARTUP_VERSION?.commit?.slice(0, 7) ?? gitVersion();
 
 function activeUntil(data, model) {
   const t = Date.parse(data[model]);
@@ -1893,7 +1906,9 @@ function readHistory() {
 
 function appendHistory(record) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.appendFileSync(HISTORY_FILE, redactSecrets(JSON.stringify(record)) + '\n');
+  const entry = Object.prototype.hasOwnProperty.call(record, 'version')
+    ? record : { ...record, version: HISTORY_VERSION };
+  fs.appendFileSync(HISTORY_FILE, redactSecrets(JSON.stringify(entry)) + '\n');
 }
 
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1952,6 +1967,8 @@ function backfillHistory(history) {
       stdout_chars: numeric(values.stdout_chars), resumed_from: field('resumed'), attempt: field('attempt'),
       verify: verifyText ? JSON.parse(verifyText) : null,
       commit: values.commit ?? null, executor: values.executor ?? (/claude/i.test(values.model ?? '') ? 'claude' : 'codex'),
+      failure_class: [...text.matchAll(/^failure class: (.+)$/gm)].at(-1)?.[1] ?? null,
+      version: null,
       ...(field('providers') ? { providers: JSON.parse(field('providers')) } : {}),
       ...(field('provider-change') ? { provider_change: JSON.parse(field('provider-change')) } : {}),
     };
@@ -1961,7 +1978,90 @@ function backfillHistory(history) {
   }
 }
 
+function statsFailures(args) {
+  let days = null;
+  let versionPrefix = null;
+  let seenFailures = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--failures') {
+      if (seenFailures) die('stats --failures 只能指定一次');
+      seenFailures = true;
+    } else if (arg === '--days') {
+      const value = args[++i];
+      if (value === undefined || !/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+        die('stats --failures 的 --days 只接受正整数');
+      }
+      days = Number(value);
+    } else if (arg === '--version') {
+      const value = args[++i];
+      if (value === undefined || !value.trim() || value.startsWith('--')) die('stats --failures 的 --version 需要前缀');
+      versionPrefix = value;
+    } else {
+      die('stats --failures 只接受 --days N 和 --version SHA');
+    }
+  }
+  if (!seenFailures) die('stats --failures 参数必须指定');
+
+  const history = readHistory();
+  backfillHistory(history);
+  const cutoff = days === null ? null : Date.now() - days * 86_400_000;
+  const versionOf = (record) => typeof record.version === 'string' && record.version.trim() ? record.version.trim() : 'unknown';
+  const categoryOf = (record) => {
+    const value = record.failure_class ?? record.failureClass ?? record.failure_category ?? record.failureCategory ?? record.category ??
+      record.classification?.category ?? record.failure;
+    return typeof value === 'string' && value.trim() ? value.trim() : 'unclassified';
+  };
+  const transferred = (record) => record.fallback === true || record.resumed_from !== null && record.resumed_from !== undefined ||
+    record.attempt !== null && record.attempt !== undefined || record.provider_change !== undefined ||
+    Array.isArray(record.routes) && record.routes.length > 1;
+  const isFailure = (record) => record.status !== 'complete' || transferred(record);
+  const selected = history.filter((record) => {
+    if (cutoff !== null && !(Date.parse(record.time) >= cutoff)) return false;
+    if (versionPrefix !== null && !versionOf(record).startsWith(versionPrefix)) return false;
+    return isFailure(record);
+  });
+  const groups = new Map();
+  for (const record of selected) {
+    const key = JSON.stringify([versionOf(record), categoryOf(record)]);
+    groups.set(key, (groups.get(key) ?? 0) + 1);
+  }
+  const rows = [['version', 'failure_class', 'count']];
+  for (const key of [...groups.keys()].sort()) {
+    const [version, category] = JSON.parse(key);
+    rows.push([version, category, String(groups.get(key))]);
+  }
+  const width = (text) => Array.from(text).reduce((sum, char) => sum + (/\p{Script=Han}/u.test(char) ? 2 : 1), 0);
+  const widths = rows[0].map((_, i) => Math.max(...rows.map((row) => width(row[i]))));
+  for (const row of rows) console.log(row.map((cell, i) => cell + ' '.repeat(widths[i] - width(cell))).join('  ').trimEnd());
+
+  const routeFor = (record) => record.executor === 'claude'
+    ? 'Claude' : record.providers?.codex?.route ?? (record.executor === 'codex' ? 'official' : 'unknown');
+  const recent = selected.slice().sort((a, b) => {
+    const at = Date.parse(a.time); const bt = Date.parse(b.time);
+    return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
+  }).slice(0, 10);
+  console.log('recent failures');
+  console.log('time  version  tier  executor/route  category  exit_code  log_id');
+  for (const record of recent) {
+    console.log(`${record.time ?? ''}  ${versionOf(record)}  ${record.tier ?? ''}  ${record.executor ?? 'unknown'}/${routeFor(record)}  ${categoryOf(record)}  ${record.exit_code ?? ''}  ${record.log_id ?? ''}`);
+  }
+
+  const sumField = (field) => {
+    const rows = selected.filter((record) => Object.prototype.hasOwnProperty.call(record, field));
+    const values = rows.map((record) => record[field]).filter((value) => typeof value === 'number' && Number.isFinite(value));
+    return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+  };
+  const stall = [sumField('stall'), sumField('stall_seconds')];
+  const watchdog = sumField('watchdog');
+  const summary = [];
+  if (stall.some((value) => value !== null)) summary.push(`stall ${stall[0] ?? 0}/${stall[1] ?? 0}s`);
+  if (watchdog !== null) summary.push(`watchdog ${watchdog}`);
+  console.log(`summary: ${summary.length ? summary.join('; ') : 'no stall/watchdog fields'}`);
+}
+
 function stats(args) {
+  if (args.includes('--failures')) return statsFailures(args);
   let days = null;
   if (args.length) {
     if (args.length !== 2 || args[0] !== '--days' || !/^[1-9]\d*$/.test(args[1]) || !Number.isSafeInteger(Number(args[1]))) {
@@ -2166,8 +2266,8 @@ if (cmd === 'setup') {
 
 if (cmd === 'status') {
   const config = readConfig();
-  const version = readVersion();
-  console.log(version ? `version: ${version.commit.slice(0, 7)} ${version.time}` : 'version: dev');
+  const version = STARTUP_VERSION;
+  console.log(version ? `version: ${version.commit.slice(0, 7)}${version.time ? ` ${version.time}` : ''}` : 'version: dev');
   console.log(`state dir: ${STATE_DIR}; log dir: ${LOG_DIR}`);
   const context = await resolveDispatchContext(config);
   if (context.enabled && context.codex.billingType !== 'unknown') CODEX_HOME = context.codex.configDir;
@@ -2450,6 +2550,7 @@ let capacityRetried = false;
 let budgetIgnoredUsed = false;
 let routeSwitches = 0;
 let lastFailureText = '';
+let failureClass = null;
 const skippedRoutes = [];
 const redactions = new Set();
 const routesTried = [];
@@ -2519,6 +2620,7 @@ let resetCreditAttempted = false;
 let resetCreditRecord = null;
 function logCodexFailure(tail, code, telemetry = {}) {
   const classification = classifyCodexFailure(tail, code, telemetry);
+  failureClass = classification.category ?? failureClass;
   log(`failure class: ${classification.category}`);
   log(`source: ${classification.source}`);
   return classification;
@@ -3113,6 +3215,7 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
     verify: verifyResult,
     commit: commitHash,
     executor,
+    failure_class: failureClass,
     attempt: attemptPhase,
     ...(providerChange ? { provider_change: providerChange } : {}),
     ...(dispatchContext.enabled ? { providers: { codex: routeSafeContext(), claude: safeRouteContext(dispatchContext.claude) } } : {}),
@@ -3351,6 +3454,7 @@ async function tryResetCredit(state, { started }) {
 
 async function takeOverCodex(state, { started = true } = {}) {
   if (await tryResetCredit(state, { started })) return;
+  failureClass = state.type === 'weekly' ? '官方周' : '官方 5h';
   codexLimitReason = `codex ${dispatchContext.codex?.billingType === 'api' ? 'API 服务商 ' : ''}${state.type} ${state.reserve ? '额度保留线' : '限额'}${state.resets_at ? `至 ${fmtLocal(new Date(state.resets_at * 1000))}` : '，恢复时间未知'}`;
   if (routeFailureHandled({ category: state.type === 'weekly' ? '官方周' : '官方 5h', state, resets_at: state.resets_at }, codexLimitReason)) return;
   return exhausted(state);
@@ -3491,6 +3595,7 @@ function startAttempt(phase) {
 
 function routeFailureHandled(classification, reason) {
   const category = classification?.category ?? classification?.type;
+  if (category) failureClass = category;
   if (!category || !['capacity', '供应商故障', '模型不支持', '供应商额度', '官方 5h', '官方周'].includes(category)) return false;
   if (category === '官方 5h' || category === '官方周') {
     const state = classification.state ?? readCodexQuota(activeCodexContext, model) ?? { type: category === '官方周' ? 'weekly' : '5h', resets_at: classification.resets_at };
@@ -3547,6 +3652,7 @@ function failCodex(reason, failureContext = {}) {
   const oneLine = redactSecrets(String(reason).replace(/\s+/g, ' ').trim());
   const classification = failureContext.classification ?? classifyCodexFailure(failureContext.tail ?? reason,
     failureContext.code ?? 1, failureContext.telemetry ?? {});
+  failureClass = classification.category ?? failureClass;
   if (!failureContext.classified) {
     logCodexFailure(failureContext.tail ?? reason, failureContext.code ?? 1, { ...(failureContext.telemetry ?? {}), classification });
   }
