@@ -18,7 +18,7 @@ catch { die('缺少隔离环境'); }
 if (process.env.HOME !== isolation.home ||
   (process.env.CODEX_HOME ?? path.join(process.env.HOME, '.codex')) !== isolation.codexHome ||
   !fs.realpathSync(process.cwd()).startsWith(isolation.root + path.sep)) die('selftest 目录未隔离');
-fs.appendFileSync(path.join(isolation.home, 'stub-invocations.jsonl'), JSON.stringify({ command: args[0], args, agentRouteDepth: process.env.AGENT_ROUTE_DEPTH ?? null }) + '\n');
+fs.appendFileSync(path.join(isolation.home, 'stub-invocations.jsonl'), JSON.stringify({ command: args[0], args, agentRouteDepth: process.env.AGENT_ROUTE_DEPTH ?? null, providerKey: process.env.AGENT_ROUTE_PROVIDER_KEY ?? null }) + '\n');
 if (args[0] === '-p' || args[0] === 'auth') {
   const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(isolation.home, '.claude');
   if (!path.resolve(configDir).startsWith(isolation.home + path.sep) ||
@@ -30,6 +30,17 @@ if (args[0] === '-p' || args[0] === 'auth') {
     if (status.delayMs) await new Promise((resolve) => setTimeout(resolve, status.delayMs));
     process.stdout.write(JSON.stringify({ apiProvider: 'firstParty', configDirectory: configDir, ...status }));
     process.exit(status.loggedIn ? 0 : 1);
+  }
+  if (args.includes('stream-json')) {
+    // 用量探测：stub-claude-usage.json 的 { five_hour, seven_day } 原样放进 rate_limit_event.unifiedWindows；缺失时不发事件。
+    let usage = null;
+    try { usage = JSON.parse(fs.readFileSync(path.join(isolation.home, 'stub-claude-usage.json'), 'utf8')); } catch {}
+    fs.appendFileSync(path.join(isolation.home, 'stub-claude-probes.jsonl'), JSON.stringify({ args: args.slice(0, 4), configDir }) + '\n');
+    const events = [{ type: 'system', subtype: 'init' },
+      ...(usage ? [{ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows: usage } }] : []),
+      { type: 'result', subtype: 'success', is_error: false, result: 'ok' }];
+    process.stdout.write(events.map((event) => JSON.stringify(event)).join('\n') + '\n', () => process.exit(0));
+    await new Promise(() => {});
   }
   const option = (key) => args[args.indexOf(key) + 1];
   const agents = JSON.parse(fs.readFileSync(option('--agents'), 'utf8'));
@@ -69,12 +80,40 @@ if (args[0] === 'app-server') {
       if (!acknowledged) die('未完成初始化');
       if (settings.mode === 'hang' || settings.mode === 'hang-stubborn') return;
       if (settings.mode === 'unavailable') return reply({ id: request.id, error: { code: -32601, message: 'Method not found' } });
+      const now = Math.floor(Date.now() / 1000);
       const rateLimits = { limitId: settings.mode === 'malformed' ? 'premium' : 'codex',
-        primary: { usedPercent: settings.mode === 'recovered' ? 20 : 100, windowDurationMins: 300,
-          resetsAt: settings.resets_at ?? Math.floor(Date.now() / 1000) + 7200 },
-        secondary: { usedPercent: 3, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 604800 },
+        primary: { usedPercent: settings.primaryUsed ?? (settings.mode === 'recovered' ? 20 : 100), windowDurationMins: 300,
+          resetsAt: settings.resets_at ?? now + 7200 },
+        secondary: { usedPercent: settings.weeklyUsed ?? 3, windowDurationMins: 10080,
+          resetsAt: settings.weeklyResetsAt ?? now + 604800 },
         rateLimitReachedType: null };
-      reply({ id: request.id, result: { rateLimits: { limitId: 'premium' }, rateLimitsByLimitId: { codex: rateLimits } } });
+      const result = { rateLimits: { limitId: 'premium' }, rateLimitsByLimitId: { codex: rateLimits } };
+      // 重置券：credits 为 [{ id, expiresInHours?, ... }]；未配置 credits 时不返回该字段。
+      if (settings.credits) {
+        const credits = settings.credits.map((credit) => ({ id: credit.id, resetType: credit.resetType ?? 'codexRateLimits',
+          status: credit.status ?? 'available', grantedAt: now - 86400, title: 'Full reset (Weekly + 5 hr)',
+          expiresAt: credit.expiresInHours === undefined ? null : now + Math.round(credit.expiresInHours * 3600) }));
+        result.rateLimitResetCredits = { availableCount: credits.filter((credit) => credit.status === 'available').length,
+          credits: settings.creditsDetail === false ? null : credits };
+      }
+      reply({ id: request.id, result });
+    } else if (request.method === 'account/rateLimitResetCredit/consume') {
+      if (!acknowledged) die('未完成初始化');
+      // 真实账号上不得调用 consume；替身只在隔离目录里记录并模拟四种结果。
+      const { idempotencyKey, creditId } = request.params ?? {};
+      if (typeof idempotencyKey !== 'string' || !idempotencyKey) die('consume 缺少 idempotencyKey');
+      fs.appendFileSync(path.join(process.env.HOME, 'stub-app-server.jsonl'), JSON.stringify({ event: 'consume', idempotencyKey, creditId: creditId ?? null }) + '\n');
+      if (settings.consumeMode === 'error') return reply({ id: request.id, error: { code: -32000, message: 'consume failed' } });
+      if (settings.consumeMode === 'hang') return;
+      const outcome = settings.consumeOutcome ?? 'reset';
+      if (outcome === 'reset' && settings.consumeEffect !== 'none') {
+        // 重置生效：两个窗口回到 0，被用掉的券不再可用，official 路由的 limit 场景从此成功。
+        const next = { ...settings, primaryUsed: 0, weeklyUsed: 0, recovered: true,
+          credits: (settings.credits ?? []).filter((credit) => credit.id !== creditId) };
+        fs.writeFileSync(settingsPath, JSON.stringify(next));
+        settings = next;
+      }
+      reply({ id: request.id, result: { outcome } });
     } else die(`未知方法 ${request.method}`);
   });
   await new Promise((resolve) => lines.on('close', () => {
@@ -144,10 +183,15 @@ if (!['complete', 'partial', 'unknown', 'tracked-write', 'ignored-write', 'pycac
   'limit-session', 'limit-weekly', 'limit-reached', 'limit-partial', 'limit-both', 'limit-both-zero', 'limit-both-api',
   'complete-snapshot', 'metadata-healthy-error', 'premium-only', 'api-complete-snapshot', 'api-429-snapshot',
   'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both',
-  'stream-events', 'stream-many', 'stall-events', 'stall-high', 'stall-missing'].includes(scenario) && !failFirst) {
+  'stream-events', 'stream-many', 'false-diagnostics', 'structured-capacity', 'stall-events', 'stall-high', 'stall-missing',
+  'watchdog-stall', 'watchdog-command', 'watchdog-capacity', 'micu-fallback'].includes(scenario) && !/^route:[a-z0-9@]+:[a-z0-9]+$/.test(scenario ?? '') && !failFirst) {
   die(`未知场景: ${scenario ?? '(无)'}`);
 }
 const currentSession = session ?? randomUUID();
+// route:<官方行为>:<Micu 行为>，行为后可加 @模型片段，仅对该模型生效；ok 表示成功。
+const routeMatch = scenario?.match(/^route:([a-z0-9@]+):([a-z0-9]+)$/);
+const micu = process.env.AGENT_ROUTE_ACTIVE_PROVIDER === 'micu' ||
+  args.some((arg) => /model_provider=["']?agent_route_micu/.test(arg)) || Boolean(process.env.AGENT_ROUTE_PROVIDER_KEY);
 if (!claude && scenario === 'stream-events') {
   fs.writeSync(1, JSON.stringify({ type: 'error', message: 'Reconnecting 1/5' }) + '\n');
   fs.writeSync(2, 'stream disconnected; Retry 1/5\nAT CAPACITY; retry later\nat capacity\nReConnec');
@@ -156,6 +200,24 @@ if (!claude && scenario === 'stream-events') {
 }
 if (!claude && scenario === 'stream-many') {
   for (let i = 0; i < 25; i++) fs.writeSync(2, `Reconnecting ${i + 1}/25\n`);
+}
+if (!claude && scenario === 'false-diagnostics') {
+  fs.writeSync(1, 'tool output: Selected model is at capacity. Please try a different model.\n');
+  fs.writeSync(1, 'read README: Reconnecting 1/5\n');
+  process.exit(1);
+}
+if (!claude && scenario === 'structured-capacity') {
+  const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const timestamp = new Date().toISOString();
+  const records = [
+    { timestamp, type: 'event_msg', payload: { type: 'error', message: 'Selected model is at capacity. Please try a different model.' } },
+    { timestamp, type: 'event_msg', payload: { type: 'stream_error', error: { message: 'Reconnecting 1/5' } } },
+    { timestamp, type: 'event_msg', payload: { type: 'task_complete', error: { message: 'stream disconnected' } } },
+  ];
+  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), records.map(JSON.stringify).join('\n') + '\n');
+  fs.writeSync(2, `session id: ${currentSession}\n`);
+  process.exit(1);
 }
 if (!claude && scenario.startsWith('stall-')) {
   const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
@@ -171,6 +233,33 @@ if (!claude && scenario.startsWith('stall-')) {
     event(330, 2001, 1)];
   if (scenario === 'stall-missing') for (const record of records) if (record.payload.type === 'token_count') record.payload.info = null;
   fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), records.map(JSON.stringify).join('\n') + '\n{"unfinished":');
+}
+if (!claude && scenario.startsWith('watchdog-')) {
+  const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const rollout = path.join(directory, `rollout-test-${currentSession}.jsonl`);
+  const counter = path.join(stateDir, `${currentSession}.watchdog-count`);
+  const calls = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0) + 1;
+  fs.writeFileSync(counter, String(calls));
+  const append = (type, payload) => fs.appendFileSync(rollout, JSON.stringify({ timestamp: new Date().toISOString(), type, payload }) + '\n');
+  append('event_msg', { type: 'task_started' });
+  fs.writeSync(2, `session id: ${currentSession}\n`);
+  if (scenario === 'watchdog-command') {
+    append('response_item', { type: 'custom_tool_call', call_id: 'watchdog-command', name: 'shell', input: 'sleep' });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-command', output: 'done' });
+  } else if (scenario === 'watchdog-stall' && calls === 1) {
+    append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-stall', output: 'done' });
+    setInterval(() => {}, 1000);
+    await new Promise(() => {});
+  } else if (scenario === 'watchdog-capacity' && calls <= 2) {
+    append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-capacity', output: 'done' });
+    setInterval(() => {}, 1000);
+    await new Promise(() => {});
+  } else if (scenario === 'watchdog-capacity') {
+    fs.writeSync(2, 'Selected model is at capacity. Please try a different model.\n');
+    process.exit(1);
+  }
 }
 // codex-fail-N：前 N 次 Codex 调用失败（续跑、重试和新线程都计数），之后及 Claude 调用成功。
 if (!claude && failFirst) {
@@ -222,13 +311,53 @@ if (!claude) {
     process.exit(1);
   }
 }
-if (!claude && (scenario.startsWith('limit') || ['metadata-healthy-error', 'premium-only'].includes(scenario))) {
+if (!claude && (scenario.startsWith('limit') || scenario === 'micu-fallback' && !micu || ['metadata-healthy-error', 'premium-only'].includes(scenario))) {
   if (scenario === 'limit-partial') fs.appendFileSync(path.join(cwd, 'tracked.txt'), 'partial codex change\n');
   const t = new Date(Date.now() + 2 * 3_600_000 + 60_000);
   const at = `${t.getHours() % 12 || 12}:${String(t.getMinutes()).padStart(2, '0')} ${t.getHours() < 12 ? 'AM' : 'PM'}`;
   const tail = scenario === 'limit' ? ` or try again at ${at}.` : '.';
   fs.writeSync(2, `session id: ${currentSession}\nERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits${tail}\n`);
   process.exit(1);
+}
+if (!claude && routeMatch) {
+  const [kind, only] = (micu ? routeMatch[2] : routeMatch[1]).split('@');
+  const modelArg = args[args.indexOf('-m') + 1] ?? '';
+  const tomorrow = new Date(Date.now() + 2 * 3_600_000 + 60_000);
+  const at = `${tomorrow.getHours() % 12 || 12}:${String(tomorrow.getMinutes()).padStart(2, '0')} ${tomorrow.getHours() < 12 ? 'AM' : 'PM'}`;
+  const failures = {
+    capacity: 'ERROR: Selected model is at capacity. Please try a different model.',
+    server: 'ERROR: unexpected status 503 Service Unavailable: upstream unavailable',
+    retry: 'ERROR: unexpected status 503 Service Unavailable\nRetry-After: 1800',
+    auth: 'ERROR: unexpected status 401 Unauthorized',
+    model: 'ERROR: unsupported model',
+    limit: `ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at ${at}.`,
+    quota: 'ERROR: insufficient_quota',
+    rate: 'HTTP 429 Too Many Requests\nRetry-After: 120',
+    other: 'ERROR: connect ECONNREFUSED',
+  };
+  let recovered = false;
+  try { recovered = JSON.parse(fs.readFileSync(path.join(process.env.HOME, 'stub-rate-limits.json'), 'utf8')).recovered === true; } catch {}
+  if (kind !== 'ok' && !(kind === 'limit' && !micu && recovered) && (!only || modelArg.includes(only))) {
+    if (!failures[kind]) die(`未知失败类型: ${kind}`);
+    fs.writeSync(2, `session id: ${currentSession}\n${failures[kind]}\n`);
+    process.exit(1);
+  }
+}
+if (!claude && (scenario === 'micu-fallback' || routeMatch) && micu) {
+  const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const timestamp = new Date().toISOString();
+  let usage = {};
+  try { usage = JSON.parse(fs.readFileSync(path.join(process.env.HOME, 'stub-token-usage.json'), 'utf8')); } catch {}
+  const first = { input_tokens: 100, cached_input_tokens: 20, cache_write_input_tokens: 5, output_tokens: 30, reasoning_output_tokens: 10, total_tokens: 130, ...(usage.last ?? {}) };
+  const events = [{ total: { input_tokens: 100, output_tokens: 30, total_tokens: 130, ...(usage.total ?? {}) }, last: first }];
+  // usage.second：同一派发的第二个请求，total_token_usage 为两次累计。
+  if (usage.second) {
+    const sum = (key) => (first[key] ?? 0) + (usage.second[key] ?? 0);
+    events.push({ total: { input_tokens: sum('input_tokens'), output_tokens: sum('output_tokens'), total_tokens: sum('total_tokens') }, last: usage.second });
+  }
+  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), events.map(({ total, last }) => JSON.stringify({ timestamp,
+    type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: total, last_token_usage: last } } })).join('\n') + '\n');
 }
 const repair = prompt.includes('自动返工：上轮 verify 失败。');
 const round = repair ? (previous?.round ?? 0) + 1 : 0;

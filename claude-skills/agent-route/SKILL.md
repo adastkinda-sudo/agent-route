@@ -16,11 +16,15 @@ description: 用 agent-route 派发执行文档中标注了 tier1/tier2/tier3 �
 
 ## 执行方与限额
 
-- 执行方由 agent-route 自动选择：优先 Codex；Codex 出错或处于 5h/周限额时自动改用 Claude，限额结束或提前重置后自动切回 Codex，footer 会注明。主 agent 不需要处理限额，也不用 `--claude`（仅在我要求时使用）。
-- 只有 Codex 和 Claude 都受限时才输出 `LIMIT` 块（退出码 15）：告诉我恢复时间，并用 `nohup` 睡到恢复时间后再续跑。
+- 执行方由 agent-route 自动选择，顺序是 Codex 官方 → Claude 订阅 → Micu。官方 tier2 依次尝试 terra、luna，tier1 使用 sol；Micu 两个 tier 都使用 gpt-6.1-sol。额度恢复或熔断结束后自动回到官方，footer 和 history 会记录实际路由。
+- Claude 正常派发受每日用量线和 5h 上限约束。用量探测来自 `claude -p --output-format stream-json --verbose` 的 `rate_limit_event.rate_limit_info.unifiedWindows`（`five_hour`、`seven_day`）；这些字段属于 Claude Code 的 **@internal** 接口，版本变化可能导致字段缺失或语义改变。读数超过 `staleMinutes`（默认 60 分钟）时普通派发跳过 Claude。
+- `--urgent` 仍按正常顺序选路，只在全部路由不可用时动用 Claude 应急保留，周用量上限默认 95%；`--claude` 直接走 Claude 并使用同一应急上限。`--ignore-budget` 越过 Micu 每日 $5 软上限和缺少单价的限制，不能与 `--claude` 同用。
+- `--resume` 继续原 Claude 任务时按普通每日用量线、余量和 5h 70% 检查；不满足时输出 `LIMIT`，由我确认后再用 `--urgent` 重跑。
+- 官方 Codex 启用 `codexStallWatchdog`（默认 150 秒、最多同 session 续跑 2 次）；rollout 等模型且没有进行中的工具调用时触发，工具调用未返回不触发，Micu 不启用。
+- 全部路由不可用且最早恢复在 `maxAutoWaitMinutes`（默认 30 分钟）内时自动等待后重选；超过该时间输出 `LIMIT` 块（退出码 15），把恢复时间和可用的 `--urgent` 告诉我，由主 agent 单独向用户确认。`--no-claude` 不等待，直接输出 `FALLBACK` 或 `LIMIT`。
 - 输出 `ERROR` 块时，把错误转告我，不自己派 subagent 重试。`ERROR` 提示找不到 claude 或 codex 时，先运行一次 `~/.claude/agent-route/bin/agent-route setup` 重新探测，仍失败再转告我。
 - 退出码 11 表示执行方汇报未完成，按汇报中的原因处理；footer 有 `WARNING` 时先核对是否越权写入。
-- `agent-route status` 可查看当前额度和路由。
+- `agent-route status` 可查看当前额度、Claude 日线与剩余、重置券、熔断和 Micu 花费；`agent-route route tier2 --explain` 只预演选路，不派发、不使用重置券；`agent-route stats --days 7` 可看按路由派发次数、用券次数、Micu 花费和两边周额度剩余。
 
 ## 减少唤醒
 

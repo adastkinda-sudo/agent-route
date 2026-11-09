@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 export async function selftest({
   SCRIPT_PATH, ROOT, CONFIG_FILE, DEFAULT_STATE_DIR, STATE_DIR,
   REPORT_FOOTER, READ_ONLY_REPORT_FOOTER, RULES, LIMIT_KEY,
-  charCount, resolveDispatchContext, safeRouteContext,
+  charCount, resolveDispatchContext, safeRouteContext, classifyCodexFailure,
 }) {
   const SELFTEST_STATE_ROOT = (() => {
     const relative = path.relative(STATE_DIR, DEFAULT_STATE_DIR);
@@ -30,16 +30,20 @@ export async function selftest({
     fs.copyFileSync(CONFIG_FILE, path.join(home, 'config.json'));
     fs.copyFileSync(path.join(ROOT, 'agents.json'), path.join(home, 'agents.json'));
     const config = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+    const officialModel = (tier) => config.tiers[tier].codex.models?.[0] ?? config.tiers[tier].codex.model;
     config.codexBin = path.resolve(path.dirname(SCRIPT_PATH), '../test/codex-stub');
     config.claudeBin = config.codexBin;
     config.logMode = 'summary';
     config.readOnlyExclude = [];
+    // 默认关闭自动用券，避免既有用例的 app-server 调用次数变化；重置券用例自行开启。
+    config.codexResetCredits = { ...config.codexResetCredits, auto: false };
     config.ccSwitch = { enabled: false, deviceDir: path.join(home, '.cc-switch'),
       databasePath: path.join(home, 'cc-data', 'cc-switch.db'), onReadError: 'live-config' };
     fs.accessSync(config.codexBin, fs.constants.X_OK);
     fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(config, null, 2) + '\n');
     const env = { HOME: home, CODEX_HOME: path.join(home, '.codex'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
       XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp'), AGENT_ROUTE_HOME: home,
+      AGENT_ROUTE_NOTIFY_FILE: path.join(home, 'notifications.jsonl'),
       GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CEILING_DIRECTORIES: tmpDir,
       AGENT_ROUTE_FORCE_CODEX_FAIL: '0',
       AGENT_ROUTE_PROBE_JSON: JSON.stringify({ claude: config.claudeBin, codex: config.codexBin }),
@@ -196,7 +200,10 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     const resolveRoutes = (overrides = {}) => resolveDispatchContext(routeConfig, { home, env, cwd: repo, ...overrides });
     const withRoutedFixture = async (test) => {
       await resetRoutes();
-      for (const file of ['cooldown.json', 'codex-limit.json', 'provider-limit.json', 'claude-limit.json']) fs.rmSync(path.join(home, 'state', file), { force: true });
+      for (const file of ['cooldown.json', 'codex-limit.json', 'provider-limit.json', 'claude-limit.json', 'claude-usage.json', 'claude-pacing.json', 'notify-state.json', 'route.lock']) {
+        fs.rmSync(path.join(home, 'state', file), { force: true });
+      }
+      for (const file of ['stub-claude-usage.json', 'stub-claude-probes.jsonl', 'notifications.jsonl', 'stub-rate-limits.json']) fs.rmSync(path.join(home, file), { force: true });
       const previousConfig = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
       fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
       const previousTimeout = dispatchTimeout;
@@ -222,6 +229,49 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     const providerStates = () => fs.existsSync(providerLimitPath) ? JSON.parse(fs.readFileSync(providerLimitPath, 'utf8')).providers : {};
     const cooldownPath = path.join(home, 'state', 'cooldown.json');
     const invocationRows = () => fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    const circuitPath = path.join(home, 'state', 'circuit.json');
+    const unavailablePath = path.join(home, 'state', 'model-unavailable.json');
+    const tokenUsagePath = path.join(home, 'stub-token-usage.json');
+    const circuitState = () => fs.existsSync(circuitPath) ? JSON.parse(fs.readFileSync(circuitPath, 'utf8')) : {};
+    const clearCircuit = () => fs.rmSync(circuitPath, { force: true });
+    const expireCircuit = () => {
+      const data = circuitState();
+      for (const entry of Object.values(data)) if (entry.state === 'open') entry.opened_at -= entry.open_seconds + 5;
+      writeJSON(circuitPath, data);
+    };
+    const allLogs = (result) => {
+      const base = result.record.log_id.replace(/-attempt\d+$/, '');
+      return fs.readdirSync(path.join(home, 'logs')).filter((name) => name.startsWith(base) && name.endsWith('.log')).sort()
+        .map((name) => fs.readFileSync(path.join(home, 'logs', name), 'utf8')).join('\n');
+    };
+    const execCalls = (from) => invocationRows().slice(from).filter((row) => row.args[0] === 'exec');
+    const modelOf = (row) => row.args[row.args.indexOf('-m') + 1];
+    const isMicu = (row) => row.args.some((arg) => arg.includes('model_provider="agent_route_micu"'));
+    const withMicuRoutes = (test, { models = ['gpt-6.1-sol'] } = {}) => withRoutedFixture(async () => {
+      const saved = { fallback: structuredClone(routeConfig.codexFallback), circuit: structuredClone(routeConfig.codexCircuit),
+        pricing: structuredClone(routeConfig.codexPricing), models: env.AGENT_ROUTE_MICU_MODELS_JSON, force: env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT };
+      const reset = () => {
+        for (const file of [circuitPath, unavailablePath, tokenUsagePath, path.join(home, 'state', 'provider-spend.json')]) fs.rmSync(file, { force: true });
+      };
+      try {
+        useSubscription();
+        routeConfig.codexFallback = { providers: [{ ccSwitchId: 'database-codex', label: 'Micu', priceMultiplier: 0.0833333,
+          models: { tier1: [{ model: 'gpt-6.1-sol' }], tier2: [{ model: 'gpt-6.1-sol', effort: 'medium' }] } }],
+          retryOfficialMinutes: 15, capacityBackoffSeconds: 0, dailyBudgetUsd: 5 };
+        env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify(models);
+        delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+        reset();
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        await test();
+      } finally {
+        routeConfig.codexFallback = saved.fallback;
+        routeConfig.codexCircuit = saved.circuit;
+        routeConfig.codexPricing = saved.pricing;
+        if (saved.models === undefined) delete env.AGENT_ROUTE_MICU_MODELS_JSON; else env.AGENT_ROUTE_MICU_MODELS_JSON = saved.models;
+        if (saved.force === undefined) delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT; else env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = saved.force;
+        reset();
+      }
+    });
     const claudeCalls = () => {
       try { return fs.readFileSync(path.join(home, 'stub-claude-invocations.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); }
       catch { return []; }
@@ -235,6 +285,24 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
       writeJSON(path.join(home, '.claude', 'settings.json'), { env: {} });
       writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'claude.ai' });
       if (used !== null) claudeAccount(used);
+    };
+    // 写入 stub 的用量读数（百分比）；week 为 null 表示探测不返回事件。同时清掉已存档读数，避免 5 分钟复用。
+    const claudeUsage = (week, { five = 10, weekDays = 3.5, fiveHours = 3 } = {}) => {
+      const now = Math.floor(Date.now() / 1000);
+      fs.rmSync(path.join(home, 'state', 'claude-usage.json'), { force: true });
+      if (week === null) return fs.rmSync(path.join(home, 'stub-claude-usage.json'), { force: true });
+      writeJSON(path.join(home, 'stub-claude-usage.json'), { five_hour: { utilization: five / 100, resetsAt: now + Math.round(fiveHours * 3600) },
+        seven_day: { utilization: week / 100, resetsAt: now + Math.round(weekDays * 86400) } });
+    };
+    const pacingState = () => {
+      try { return Object.values(JSON.parse(fs.readFileSync(path.join(home, 'state', 'claude-pacing.json'), 'utf8')).accounts ?? {})[0] ?? null; }
+      catch { return null; }
+    };
+    // Codex 与 Claude 都走官方订阅（deviceSettings 每次整体覆盖指针，所以要一起设置）。
+    const useBothSubscriptions = () => {
+      useSubscription();
+      useClaudeSubscription();
+      deviceSettings({ currentProviderCodex: 'official-codex', currentProviderClaude: 'official-claude' });
     };
     const routeSnapshot = () => {
       const files = {};
@@ -347,6 +415,80 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           !fs.existsSync(path.join(configuredRoot, 'state', 'history.jsonl')),
           `stateDir 未共享状态或日志跟随 stateDir: status=${dispatch.status} stderr=${dispatch.stderr.trim()} stdout=${dispatch.stdout.trim()}`);
       }],
+      [0.4, 'Codex models 列表解析并派发首项', () => {
+        const result = run('complete', [], false, { tier: 'tier2' });
+        exitIs(result, 0);
+        const call = invocationRows().at(-1);
+        check(result.record.model === officialModel('tier2') &&
+          call.args[call.args.indexOf('-m') + 1] === officialModel('tier2'), 'models 列表未使用首项');
+      }],
+      [0.5, 'Codex model 单值兼容为单元素列表', () => {
+        const configPath = path.join(home, 'config.json');
+        const savedConfig = fs.readFileSync(configPath, 'utf8');
+        try {
+          const single = JSON.parse(savedConfig);
+          delete single.tiers.tier1.codex.models;
+          single.tiers.tier1.codex.model = 'fixture-single-model';
+          fs.writeFileSync(configPath, JSON.stringify(single));
+          const result = run('complete');
+          exitIs(result, 0);
+          check(result.record.model === 'fixture-single-model', '单值 model 未兼容为列表');
+        } finally { fs.writeFileSync(configPath, savedConfig); }
+      }],
+      [0.6, '非法 Codex 模型配置给出明确报错', () => {
+        const configPath = path.join(home, 'config.json');
+        const savedConfig = fs.readFileSync(configPath, 'utf8');
+        try {
+          const invalid = JSON.parse(savedConfig);
+          invalid.tiers.tier2.codex.models = [];
+          fs.writeFileSync(configPath, JSON.stringify(invalid));
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 5000 });
+          exitIs(result, 2);
+          check(result.stderr.includes('tiers.tier2.codex.models 必须是非空字符串数组'), '非法 models 未给出明确报错');
+        } finally { fs.writeFileSync(configPath, savedConfig); }
+      }],
+      [0.65, '非法 codexResetCredits 配置给出明确报错', () => {
+        const configPath = path.join(home, 'config.json');
+        const savedConfig = fs.readFileSync(configPath, 'utf8');
+        try {
+          for (const [value, message] of [[{ auto: 'yes' }, 'codexResetCredits.auto 必须是布尔值'],
+            [{ minWaitHours: -1 }, 'codexResetCredits.minWaitHours 必须是非负数'],
+            [{ weeklyPercentForExpiring: 120 }, 'codexResetCredits.weeklyPercentForExpiring 必须是 0–100 的数值']]) {
+            const invalid = JSON.parse(savedConfig);
+            invalid.codexResetCredits = value;
+            fs.writeFileSync(configPath, JSON.stringify(invalid));
+            const result = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 5000 });
+            exitIs(result, 2);
+            check(result.stderr.includes(message), `非法 codexResetCredits 未给出明确报错: ${message}`);
+          }
+        } finally { fs.writeFileSync(configPath, savedConfig); }
+      }],
+      [0.7, 'Codex 失败逐类分类并解析恢复时间', () => {
+        const fiveHourReset = Math.floor(Date.now() / 1000) + 3600;
+        const weeklyReset = fiveHourReset + 604800;
+        const snapshot = (primary, secondary) => ({
+          primary: { used_percent: primary, resets_at: fiveHourReset, window_minutes: 300 },
+          secondary: { used_percent: secondary, resets_at: weeklyReset, window_minutes: 10080 },
+          rate_limit_reached_type: null,
+        });
+        const cases = [
+          ['You’ve hit your usage limit.', 1, { billingType: 'subscription', snapshot: snapshot(100, 3) }, '官方 5h', fiveHourReset],
+          ['You’ve hit your usage limit.', 1, { billingType: 'subscription', snapshot: snapshot(3, 100) }, '官方周', weeklyReset],
+          ['Selected model is at capacity. Please try a different model.', 1, { billingType: 'subscription' }, 'capacity', null],
+          ['unexpected status 503 Service Unavailable: 当前分组下暂无可用渠道，请稍后重试', 1, { billingType: 'api' }, '供应商故障', null],
+          ['model_not_found: model does not exist', 1, { billingType: 'api' }, '模型不支持', null],
+          ['429 Too Many Requests; retry-after: 45', 1, { billingType: 'api' }, '供应商额度', 'present'],
+          ['stream disconnected while waiting for output', 1, { billingType: 'api' }, '其他', null],
+        ];
+        for (const [tail, code, telemetry, expected, reset] of cases) {
+          const result = classifyCodexFailure(tail, code, telemetry);
+          check(result.type === expected && result.category === expected, `${tail} 分类为 ${result.type}，预期 ${expected}`);
+          if (reset === null) check(result.resets_at === null, `${expected} 不应有恢复时间`);
+          else if (reset === 'present') check(Number.isFinite(result.resets_at) && result.resets_at > Date.now() / 1000,
+            `${expected} 应返回恢复时间`);
+          else check(Math.abs(result.resets_at - reset) < 2, `${expected} 恢复时间未沿用限额快照`);
+        }
+      }],
       [1, '汇报完成', () => {
         complete = run('complete');
         exitIs(complete, 0);
@@ -412,7 +554,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(result.stdout.startsWith('FALLBACK\n') && result.stdout.includes('codex 退出码 1'), '未输出预期 FALLBACK 块');
         const cooldown = JSON.parse(fs.readFileSync(path.join(home, 'state', 'cooldown.json'), 'utf8'));
         check(Date.parse(cooldown[config.tiers.tier1.codex.model]) > Date.now(), '临时 HOME 未写入有效冷却');
-        check(result.record.status === 'fallback' && result.record.fallback === true, 'FALLBACK 缺少 history 状态');
+        check(result.record.status === 'fallback' && result.record.fallback === true && result.log.includes('failure class: 其他'),
+          'FALLBACK 缺少 history 状态或失败分类日志');
       }],
       [9, 'history、stats 与旧日志回填', () => {
         const result = run('complete', ['--write']);
@@ -1516,7 +1659,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           ]) {
             const result = run(args.includes('--monitor') ? 'monitor' : 'complete', args, false, { tier });
             exitIs(result, 0);
-            const expectedModel = tier === 'tier2' && billing === 'api' ? config.tiers.tier2.codex.apiModel : config.tiers[tier].codex.model;
+            const expectedModel = tier === 'tier2' && billing === 'api' ? config.tiers.tier2.codex.apiModel : officialModel(tier);
             const call = invocationRows().at(-1);
             check(result.record.model === expectedModel && result.record.effort === expectedEffort &&
               call.args[call.args.indexOf('-m') + 1] === expectedModel && call.args.includes(`model_reasoning_effort="${expectedEffort}"`),
@@ -1609,7 +1752,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           'API 状态含订阅 query_available/snapshot');
         noRouteSecrets(fs.readFileSync(providerLimitPath, 'utf8'));
       })],
-      [73, 'CC Switch 用例 9：429/余额被动限额，401/模型/网络错误普通冷却，status/LIMIT 区分模式', () => withRoutedFixture(async () => {
+      [73, 'CC Switch 用例 9：429/余额被动限额，401 唯一路由只计数，网络冷却，模型不可用单独标记', () => withRoutedFixture(async () => {
+        const unavailablePath = path.join(home, 'state', 'model-unavailable.json');
         for (const [scenario, type, seconds, resetSource] of [
           ['api-429', 'rate-limit', 120, 'retry-after'], ['api-429-date', 'rate-limit', 180, 'retry-after'],
           ['api-429-reset', 'rate-limit', 240, 'reset'], ['api-quota', 'quota', (config.limitCooldownMinutes ?? 60) * 60, 'fallback'],
@@ -1617,6 +1761,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         ]) {
           fs.rmSync(providerLimitPath, { force: true });
           fs.rmSync(cooldownPath, { force: true });
+          fs.rmSync(unavailablePath, { force: true });
+          fs.rmSync(path.join(home, 'state', 'circuit.json'), { force: true });
           seedLimit();
           const before = fs.readFileSync(limitPath, 'utf8');
           const result = run(scenario, [], false, { preserveCooldown: true });
@@ -1627,6 +1773,13 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
             check(states.length === 1 && states[0].type === type && states[0].reset_source === resetSource &&
               Math.abs(states[0].resets_at - Date.now() / 1000 - seconds) < 5 && result.stdout.includes('Codex API 服务商限额') &&
               !result.stdout.includes('Codex 用量限额') && !fs.existsSync(cooldownPath), `${scenario} 被动状态或 LIMIT 不符`);
+          } else if (scenario === 'api-model') {
+            check(states.length === 0 && !fs.existsSync(cooldownPath) && Object.keys(JSON.parse(fs.readFileSync(unavailablePath, 'utf8'))).length === 1,
+              `${scenario} 未单独写入模型不可用状态`);
+          } else if (scenario === 'api-401') {
+            const circuit = Object.values(JSON.parse(fs.readFileSync(path.join(home, 'state', 'circuit.json'), 'utf8')));
+            check(states.length === 0 && !fs.existsSync(cooldownPath) && circuit.length === 1 && circuit[0].state === 'closed' &&
+              circuit[0].consecutive_failures === 1, `${scenario} 唯一路由应只计数、不冷却`);
           } else check(states.length === 0 && Object.keys(JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))).length === 1,
             `${scenario} 被误当限额或未写普通冷却`);
         }
@@ -1682,7 +1835,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: 5000 });
         exitIs(status, 0);
         check(status.stdout.includes('billing: subscription') && status.stdout.includes('codex 5h:') &&
-          status.stdout.includes(`codex tier2 model: ${config.tiers.tier2.codex.model}`), '订阅 status 缺少窗口或使用了 API 模型');
+          status.stdout.includes(`codex tier2 model: ${officialModel('tier2')}`), '订阅 status 缺少窗口或使用了 API 模型');
         for (const billing of ['subscription', 'api']) {
           if (billing === 'api') await useApi();
           fs.rmSync(limitPath, { force: true });
@@ -1755,11 +1908,13 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         }
         deviceSettings({ currentProviderClaude: 'official-claude', claudeConfigDir: custom });
         writeJSON(path.join(custom, 'settings.json'), { env: {} });
-        claudeAccount(80, {}, custom);
+        claudeUsage(96);
         const count = claudeCalls().length;
         const blocked = run('complete', ['--claude'], true);
         exitIs(blocked, 12);
-        check(claudeCalls().length === count && blocked.stdout.includes('80%'), '自定义目录周额度未生效');
+        check(claudeCalls().length === count && blocked.stdout.includes('96%') && fs.readFileSync(path.join(home, 'stub-claude-probes.jsonl'), 'utf8').includes(custom),
+          '自定义目录周额度未生效，或探测没有使用自定义配置目录');
+        claudeUsage(null);
         writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'api_key' });
         const unresolved = run('complete', ['--claude'], true);
         exitIs(unresolved, 12);
@@ -1770,7 +1925,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         exitIs(officialApi, 0);
         check(officialApi.record.providers.claude.billingType === 'api' && claudeCalls().at(-1).model === 'sonnet', '官方 API key 错用了订阅模型');
       })],
-      [77, 'Claude 周额度：阈值边界、冷却持久化、到点恢复与账号隔离', () => withRoutedFixture(async () => {
+      [77, 'Claude 每日用量线：U0 跨日记录、余量、5h、最后 36 小时、先刷新先用、过期与 --claude 上限', () => withRoutedFixture(async () => {
         useClaudeSubscription(79);
         const beforeTimeout = claudeCalls().length;
         writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'claude.ai', delayMs: 6000 });
@@ -1783,72 +1938,131 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           writeJSON(path.join(home, 'stub-claude-auth.json'), { loggedIn: true, authMethod: 'claude.ai' });
         }
         exitIs(run('complete', ['--claude'], true), 0);
-        const quotaFile = path.join(home, 'state', 'claude-limit.json');
-        let count = claudeCalls().length;
-        for (const percent of [80, 91]) {
-          claudeAccount(percent);
-          const blocked = run('complete', ['--claude'], true);
-          exitIs(blocked, 12);
-          check(claudeCalls().length === count && blocked.stdout.includes(`${percent}%`) && blocked.stdout.includes('冷却至'), '达到阈值仍调用 Claude');
-        }
-        exitIs(run('complete', ['--write']), 0); // Claude 冷却不改变 Codex 优先。
-        exitIs(run('api-429', ['--write']), 15);
-        const dual = run('complete', ['--write'], true, { preserveCooldown: true });
-        exitIs(dual, 15);
-        check(dual.stdout.includes('Codex API 服务商限额') && dual.stdout.includes('Claude 用量限额') && claudeCalls().length === count,
-          'Claude 周额度冷却没有挡住 Codex 受限后的 fallback');
-        const saved = fs.readFileSync(quotaFile, 'utf8');
-        noRouteSecrets(saved);
-        fs.rmSync(path.join(home, '.claude.json'));
-        exitIs(run('complete', ['--claude'], true), 0); // 无法确认账号时不复用另一个账号的冷却。
-        count++;
-        writeJSON(path.join(home, '.claude.json'), { oauthAccount: { accountUuid: 'SELFTEST_PRIVATE_CLAUDE_ACCOUNT' } });
+        // 每日用量线：官方受限时 Claude 排在 Micu/耗尽处理之前；U0 当天第一次派发时记录。
+        useBothSubscriptions();
+        const pace = (week, options, extra = []) => {
+          const state = seedLimit();
+          appMode('limited', state.resets_at);
+          claudeUsage(week, options);
+          return run('complete', extra, true, { preserveCooldown: true });
+        };
+        // 25% 起、3.5 天剩余：线 = 25 + 60/3.5 ≈ 42.1%。
+        let result = pace(25);
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && result.record.fallback && pacingState()?.u0 === 25 &&
+          /claude pacing\[normal\]: allow daily-line used=25% 5h=10% line=42\.[01]%/.test(result.log), `用量线以内应交给 Claude: ${result.log}`);
+        check(fs.readFileSync(path.join(home, 'stub-claude-probes.jsonl'), 'utf8').trim().split('\n').length >= 1, '没有探测用量');
+        // 同一天 U0 不变：39% + 2% 余量 ≤ 42.1% 通过，41% 超线（log 里 line 仍按 u0=25）。
+        result = pace(39);
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && pacingState().u0 === 25, 'U0 不应在当天更新');
+        result = pace(41);
+        exitIs(result, 15);
+        check(/claude pacing\[normal\]: block daily line 42\.[01]% \(weekly 41% \+ 2% headroom\)/.test(result.log) && pacingState().u0 === 25 &&
+          result.stdout.includes('claude-resets:'), `超出用量线应不交给 Claude: ${result.stdout}`);
+        // 跨日重新记录 U0：把存档日期改成过去，用量 30% 成为新的 U0，线 = 30 + 55/3.5 ≈ 45.7%。
+        const pacingFile = path.join(home, 'state', 'claude-pacing.json');
+        const saved = JSON.parse(fs.readFileSync(pacingFile, 'utf8'));
+        for (const entry of Object.values(saved.accounts)) { entry.day = '2000-01-01'; entry.u0 = 10; }
+        writeJSON(pacingFile, saved);
+        result = pace(30);
+        exitIs(result, 0);
+        check(pacingState().u0 === 30 && pacingState().day !== '2000-01-01' && /line=45\.[67]%/.test(result.log), '跨日后应重新记录 U0');
+        // 周额度重置后（resets_at 变化）也重新记录。
+        const week = pacingState().week_resets_at;
+        result = pace(12, { weekDays: 6.5 });
+        exitIs(result, 0);
+        check(pacingState().u0 === 12 && pacingState().week_resets_at !== week, '周重置后应重新记录 U0');
+        // 5h 达到 70% 不交给 Claude；69% 可以。
+        exitIs(pace(25, { five: 70 }), 15);
+        exitIs(pace(25, { five: 69 }), 0);
+        // 最后 36 小时：不受每日线限制，周用量低于 95% 即可；已用 94% 通过，95% 不通过。
+        result = pace(94, { weekDays: 1.4 });
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && /allow final-window/.test(result.log), '最后 36 小时应只受 95% 保留限制');
+        result = pace(95, { weekDays: 1.4 });
+        exitIs(result, 15);
+        check(/final window weekly 95% >= 95%/.test(result.log), '最后 36 小时 95% 应不交给 Claude');
+        // 数据过期或探测不到：视为没有 Claude 额度。
+        result = pace(null);
+        exitIs(result, 15);
+        check(/block usage-stale/.test(result.log), '没有用量读数应不派 Claude');
+        // --claude：可动用应急保留，上限 95%；超过每日线仍可用；5h 100% 不可用；没有读数时只检查读得到的限额。
+        claudeUsage(90);
+        exitIs(run('complete', ['--claude'], true), 0);
+        claudeUsage(96);
         exitIs(run('complete', ['--claude'], true), 12);
-        check(claudeCalls().length === count, '缓存消失后没有保持同账号冷却');
+        claudeUsage(50, { five: 100 });
+        exitIs(run('complete', ['--claude'], true), 12);
+        claudeUsage(null);
+        exitIs(run('complete', ['--claude'], true), 0);
+        // 最后 36 小时且 Claude 周额度先于 Codex 重置：Claude 排在官方之前；Codex 先重置则仍用 Codex。
+        fs.rmSync(path.join(home, 'state', 'codex-limit.json'), { force: true });
+        writeJSON(path.join(home, 'stub-rate-limits.json'), { primaryUsed: 20, weeklyUsed: 3 });
+        claudeUsage(50, { weekDays: 1.4 });
+        result = run('complete', [], true);
+        exitIs(result, 0);
+        check(result.record.executor === 'claude' && !result.record.fallback && result.log.includes('claude first: final window'), 'Claude 先重置时应先用 Claude');
+        writeJSON(path.join(home, 'stub-rate-limits.json'), { primaryUsed: 20, weeklyUsed: 3, weeklyResetsAt: Math.floor(Date.now() / 1000) + 3600 });
+        claudeUsage(50, { weekDays: 1.4 });
+        result = run('complete', [], true);
+        exitIs(result, 0);
+        check(result.record.executor === 'codex' && !result.log.includes('claude first'), 'Codex 先重置时应先用 Codex');
+        // status 只读显示存档读数和节奏。
         const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: dispatchTimeout });
-        check(status.status === 0 && status.stdout.includes('claude weekly: 91%') &&
-          status.stdout.includes('claude weekly threshold: 80%; cooldown: until'), 'status 未显示周额度冷却');
-        writeJSON(path.join(home, '.claude.json'), { oauthAccount: { accountUuid: 'SELFTEST_PRIVATE_OTHER_ACCOUNT' } });
-        exitIs(run('complete', ['--claude'], true), 0);
-        const states = JSON.parse(saved);
-        for (const state of Object.values(states.accounts)) state.resets_at = Math.floor(Date.now() / 1000) - 1;
-        writeJSON(quotaFile, states);
-        writeJSON(path.join(home, '.claude.json'), { oauthAccount: { accountUuid: 'SELFTEST_PRIVATE_CLAUDE_ACCOUNT' } });
-        exitIs(run('complete', ['--claude'], true), 0);
-        check(Object.values(JSON.parse(fs.readFileSync(quotaFile, 'utf8')).accounts).every((state) => !state), '过期冷却未清除');
-        claudeAccount(91);
-        exitIs(run('complete', ['--claude'], true), 12);
-        claudeAccount(20);
-        exitIs(run('complete', ['--claude'], true), 0);
+        check(status.status === 0 && /claude weekly: 50% resets/.test(status.stdout) && /claude pacing: /.test(status.stdout), `status 缺少 Claude 节奏: ${status.stdout}`);
       })],
-      [78, 'Claude 周额度：缺失/损坏/过期数据退回被动检测，API 不使用订阅缓存', () => withRoutedFixture(async () => {
-        useClaudeSubscription();
-        for (const changes of [null, { fetchedAtMs: Date.now() - 3_600_001 }, { fetchedAtMs: Date.now() + 60_000 },
-          { accountUuid: 'SELFTEST_PRIVATE_OTHER_ACCOUNT' }, { utilization: { seven_day: null } },
-          { utilization: { seven_day: { utilization: '91', resets_at: new Date(Date.now() + 7200_000).toISOString() } } },
-          { utilization: { seven_day: { utilization: 91, resets_at: new Date(Date.now() - 1000).toISOString() } } }]) {
-          if (changes) claudeAccount(91, changes); else fs.rmSync(path.join(home, '.claude.json'), { force: true });
-          exitIs(run('complete', ['--claude'], true), 0);
-        }
-        fs.writeFileSync(path.join(home, '.claude.json'), '{"secret":"SELFTEST_PRIVATE');
+      [78, 'Claude 用量读数：过期存档、探测失败、被动限额检测、API 不使用订阅读数、旧配置项', () => withRoutedFixture(async () => {
+        useBothSubscriptions();
+        // 存档读数在 probeMinutes 内直接复用，不再探测。
+        claudeUsage(40);
         exitIs(run('complete', ['--claude'], true), 0);
+        const probes = () => fs.readFileSync(path.join(home, 'stub-claude-probes.jsonl'), 'utf8').trim().split('\n').length;
+        const probed = probes();
+        exitIs(run('complete', ['--claude'], true), 0);
+        check(probes() === probed, '5 分钟内的存档读数应复用');
+        // 存档超过 staleMinutes 且探测不到：视为没有读数，--claude 仍只检查读得到的限额。
+        const usageFile = path.join(home, 'state', 'claude-usage.json');
+        const stored = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
+        for (const entry of Object.values(stored.accounts)) entry.observed_at = new Date(Date.now() - 2 * 3600_000).toISOString();
+        writeJSON(usageFile, stored);
+        fs.rmSync(path.join(home, 'stub-claude-usage.json'), { force: true });
+        const state = seedLimit();
+        appMode('limited', state.resets_at);
+        const stale = run('complete', [], true, { preserveCooldown: true });
+        exitIs(stale, 15);
+        check(/block usage-stale/.test(stale.log), '超过 60 分钟的存档应视为过期');
+        // 存档 30 分钟前且探测不到：仍可使用存档（周 40% 低于用量线）。
+        for (const entry of Object.values(stored.accounts)) entry.observed_at = new Date(Date.now() - 30 * 60_000).toISOString();
+        writeJSON(usageFile, stored);
+        const fresh = run('complete', [], true, { preserveCooldown: true });
+        exitIs(fresh, 0);
+        check(fresh.record.executor === 'claude', '60 分钟内的存档应可用');
+        // 被动限额检测保持：用量允许但 Claude 实际返回限额时，没有其他路由则 ERROR 或 LIMIT。
+        claudeUsage(40);
         const passive = run('limit-both', ['--claude'], true);
         exitIs(passive, 12);
-        check(passive.stdout.includes('Claude 用量限额'), '周额度不可读时丢失了被动限额检测');
-        claudeAccount(91);
-        exitIs(run('complete', ['--claude'], true), 12);
-        deviceSettings();
-        writeJSON(path.join(home, '.claude', 'settings.json'), claudeSettings());
+        check(passive.stdout.includes('Claude 用量限额'), '丢失了被动限额检测');
+        // API 路径不使用订阅读数，也不探测。
+        deviceSettings({ currentProviderClaude: 'official-claude' });
+        writeJSON(path.join(home, '.claude', 'settings.json'), { env: { ANTHROPIC_API_KEY: routeKey } });
+        claudeUsage(99);
+        const before = probes();
         exitIs(run('complete', ['--claude'], true), 0);
-        const changedConfig = structuredClone(routeConfig);
-        changedConfig.claudeWeeklyThreshold = 95;
-        writeJSON(path.join(home, 'config.json'), changedConfig);
-        useClaudeSubscription(91);
-        exitIs(run('complete', ['--claude'], true), 0);
-        changedConfig.claudeWeeklyThreshold = 0;
-        writeJSON(path.join(home, 'config.json'), changedConfig);
-        claudeAccount(0);
-        exitIs(run('complete', ['--claude'], true), 12);
+        check(probes() === before, 'API 路径不应探测订阅用量');
+        // 旧配置：windowHours / reservePercent 报错，claudeWeeklyThreshold 被忽略并在 status 说明。
+        for (const [key, value] of [['windowHours', 36], ['reservePercent', 90], ['bogus', 1], ['urgentMaxPercent', 101], ['dayStartHour', 24]]) {
+          const bad = structuredClone(routeConfig);
+          bad.claudePacing = { ...bad.claudePacing, [key]: value };
+          writeJSON(path.join(home, 'config.json'), bad);
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: dispatchTimeout });
+          check(result.status === 2 && result.stderr.includes('claudePacing'), `${key} 应报配置错误: ${result.stderr}`);
+        }
+        const legacy = structuredClone(routeConfig);
+        legacy.claudeWeeklyThreshold = 80;
+        writeJSON(path.join(home, 'config.json'), legacy);
+        const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: dispatchTimeout });
+        check(status.status === 0 && status.stdout.includes('claude weekly threshold: ignored'), `旧阈值应被忽略并提示: ${status.stdout}`);
       })],
       [79, 'CC Switch 用例 13：Codex 续跑同服务商继续，变更服务商或 endpoint 后重建并记录', () => withRoutedFixture(async () => {
         let first = run('complete', ['--write']);
@@ -1894,7 +2108,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         exitIs(changed, 0);
         check(changed.record.provider_change?.app === 'claude' && changed.record.session !== first.record.session &&
           claudeCalls().at(-1).session === null && changed.stdout.includes('provider changed (claude); rebuild'), 'Claude 服务商变更未重建或记录');
-        useClaudeSubscription();
+        useClaudeSubscription(20);
+        claudeUsage(20, { five: 10 });
         const subscribed = run('complete', ['--resume', changed.record.log_id, '--write'], true);
         exitIs(subscribed, 0);
         check(subscribed.record.providers.claude.billingType === 'subscription' && claudeCalls().at(-1).session === null &&
@@ -2105,15 +2320,15 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         }
         check(invocationRows().length === before, '非法超时仍调用了执行方');
       })],
-      [88, 'Codex 重连：stdout/stderr、大小写、分块与同一行只计一次', () => withCodexFixture(async () => {
+      [88, 'Codex 重连：stderr、大小写、分块与同一行只计一次', () => withCodexFixture(async () => {
         const result = run('stream-events');
         exitIs(result, 0);
-        check(result.footer.includes('reconnect 4 | capacity 2') && result.record.reconnect === 4 && result.record.capacity === 2,
+        check(result.footer.includes('reconnect 3 | capacity 2') && result.record.reconnect === 3 && result.record.capacity === 2,
           '重连或 capacity 的 footer/history 计数不符');
-        check(result.log.includes('log-mode: summary') && result.log.includes('Reconnecting 1/5') &&
+        check(result.log.includes('log-mode: summary') && !result.log.includes('codex stream: Reconnecting 1/5') &&
           result.log.includes('stream disconnected; Retry 1/5') && result.log.includes('ReConnecting 2/5') &&
-          result.log.split('\n').filter((line) => line.startsWith('codex stream: ')).length === 5,
-          '摘要日志未保留 stdout/stderr 重连行');
+          result.log.split('\n').filter((line) => line.startsWith('codex stream: ')).length === 4,
+          '摘要日志未按 stderr 来源保留重连行');
         const clean = run('complete');
         exitIs(clean, 0);
         check(clean.record.reconnect === 0 && clean.record.capacity === 0 && !/reconnect|capacity|stall/.test(clean.footer),
@@ -2144,6 +2359,26 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           '缺少输出 token 元数据时推测了停顿');
         for (const result of [first, resumed, high, missing]) check(!result.log.includes('SELFTEST_PRIVATE_DIALOGUE'), '停顿统计泄露对话');
       })],
+      [90.5, 'Codex 卡住看门狗：等模型续跑、工具调用等待与次数上限', () => withCodexFixture(async ({ settings, writeConfig }) => {
+        settings.codexStallWatchdog = { enabled: true, seconds: 0.05, maxResumes: 2 };
+        writeConfig();
+        const stalled = run('watchdog-stall', [], false, { timeout: 5000 });
+        exitIs(stalled, 0);
+        check(stalled.record.watchdog === 1 && stalled.record.watchdog_seconds >= 1 && stalled.footer.includes('watchdog 1/1s'),
+          '等模型无响应未触发同 session 看门狗续跑');
+        check(stalled.records.some((row) => row.attempt === 'watchdog 1') &&
+          invocationRows().some((row) => row.command === 'exec' && row.args.includes('resume') && row.args.includes(stalled.record.session)),
+          '看门狗未使用 exec resume 同一 session');
+        const command = run('watchdog-command', [], false, { timeout: 5000 });
+        exitIs(command, 0);
+        check(command.record.watchdog === 0 && !command.footer.includes('watchdog'), '工具调用未返回时错误触发看门狗');
+        const limited = run('watchdog-capacity', [], false, { timeout: 5000 });
+        exitIs(limited, 10);
+        const limitedLogs = allLogs(limited);
+        check(limited.record.watchdog === 2 && limitedLogs.includes('failure class: capacity') &&
+          (limitedLogs.match(/^watchdog \d+\//gm) ?? []).length === 2,
+          '看门狗超过次数上限后未回到原 capacity 失败分类');
+      })],
       [91, 'Codex API 停顿与摘要 history 回填保留诊断字段', () => withRoutedFixture(async () => {
         const before = appCalls().length;
         const result = run('stall-events');
@@ -2160,9 +2395,690 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         exitIs(stats, 0);
         for (const old of saved) {
           const restored = history().find((row) => row.log_id === old.log_id);
-          check(restored && ['reconnect', 'capacity', 'stall', 'stall_seconds'].every((key) => restored[key] === old[key]),
+          check(restored && ['reconnect', 'capacity', 'stall', 'stall_seconds', 'watchdog', 'watchdog_seconds'].every((key) => restored[key] === old[key]),
             '摘要回填丢失重连/停顿字段');
         }
+      })],
+      [92, 'Codex 工具输出中的诊断词不计数或分类', () => withCodexFixture(async () => {
+        const result = run('false-diagnostics');
+        exitIs(result, 10);
+        check(result.record.reconnect === 0 && result.record.capacity === 0 && result.log.includes('failure class: 其他') &&
+          result.log.includes('source: text') && !result.log.includes('failure class: capacity'),
+          '工具输出中的 at capacity/Reconnecting 被计数或分类');
+      })],
+      [93, 'Codex rollout 结构化错误优先分类并计数', () => withCodexFixture(async () => {
+        const result = run('structured-capacity');
+        exitIs(result, 10);
+        check(result.record.reconnect === 2 && result.record.capacity === 1 &&
+          result.log.includes('failure class: capacity') && result.log.includes('source: rollout'),
+          '结构化错误未优先分类或计数');
+      })],
+      [94, '官方额度转 Micu：参数、实际路由与密钥隔离', () => withRoutedFixture(async () => {
+        const savedFallback = JSON.parse(JSON.stringify(routeConfig.codexFallback));
+        const savedModels = env.AGENT_ROUTE_MICU_MODELS_JSON;
+        const savedForceLimit = env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+        try {
+          useSubscription();
+          routeConfig.codexFallback = { providers: [{ ccSwitchId: 'database-codex', label: 'Micu', priceMultiplier: 0.0833333,
+            models: { tier1: [{ model: 'gpt-6.1-sol' }], tier2: [{ model: 'gpt-6.1-sol', effort: 'medium' }] } }],
+            retryOfficialMinutes: 15, capacityBackoffSeconds: 0, dailyBudgetUsd: 5 };
+          env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify(['gpt-6.1-sol']);
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+          const result = run('micu-fallback');
+          exitIs(result, 0);
+          const call = invocationRows().at(-1);
+          check(result.record.providers.codex.providerId === 'database-codex' && result.record.providers.codex.route === 'Micu' &&
+            call.args.includes('model_provider="agent_route_micu"') && !result.log.includes(routeKey) &&
+            !result.log.includes(routeURL) && !JSON.stringify(result.record).includes(routeKey) &&
+            !JSON.stringify(result.record).includes(routeURL) &&
+            JSON.parse(fs.readFileSync(path.join(home, 'state', 'provider-spend.json'), 'utf8'))[new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date())].Micu > 0,
+            'Micu 路由参数、实际供应商、密钥隔离或花费账本不符');
+          env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = '1';
+          const forced = run('complete');
+          exitIs(forced, 0);
+          check(forced.record.providers.codex.providerId === 'database-codex' && forced.record.providers.codex.route === 'Micu',
+            '强制官方限额未转入 Micu');
+        } finally {
+          routeConfig.codexFallback = savedFallback;
+          if (savedModels === undefined) delete env.AGENT_ROUTE_MICU_MODELS_JSON;
+          else env.AGENT_ROUTE_MICU_MODELS_JSON = savedModels;
+          if (savedForceLimit === undefined) delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+          else env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = savedForceLimit;
+        }
+      })],
+      [95, 'Codex 路由：capacity 退避重试、熔断、探测恢复与并发探测', () => withMicuRoutes(async () => {
+        const start = invocationRows().length;
+        const first = run('route:capacity:ok');
+        exitIs(first, 0);
+        const calls = execCalls(start);
+        check(calls.length === 3 && calls.slice(0, 2).every((row) => !isMicu(row) && modelOf(row) === 'gpt-6.1-sol') &&
+          isMicu(calls[2]) && calls[2].providerKey === routeKey && calls.slice(0, 2).every((row) => row.providerKey === null),
+          'capacity 应官方重试一次后转 Micu，且密钥只给 Micu 子进程');
+        check(allLogs(first).includes('capacity retry') && /circuit: official\/gpt-6\.1-sol closed→open/.test(allLogs(first)) &&
+          first.record.providers.codex.route === 'Micu' && first.record.routes.length === 2 && first.record.routes[1].route === 'Micu',
+          'capacity 日志或 history 路由不符');
+        const entry = Object.values(circuitState())[0];
+        check(Object.keys(circuitState()).length === 1 && entry.state === 'open' && entry.consecutive_failures === 2 &&
+          entry.open_seconds === 600 && !fs.existsSync(cooldownPath), 'capacity 应打开 10 分钟熔断且不写 cooldown');
+        const before = invocationRows().length;
+        const skipped = run('route:capacity:ok');
+        exitIs(skipped, 0);
+        const skippedCalls = execCalls(before);
+        check(skippedCalls.length === 1 && isMicu(skippedCalls[0]) && allLogs(skipped).includes('skip route: official/gpt-6.1-sol (circuit open)'),
+          '熔断期间应直接跳过官方');
+        const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: 8000 });
+        check(status.stdout.includes('circuit official/gpt-6.1-sol: open') && status.stdout.includes('Micu spend today:'),
+          'status 缺少熔断状态或 Micu 花费');
+        noRouteSecrets(status.stdout + status.stderr);
+        expireCircuit();
+        const mark = invocationRows().length;
+        const probe = run('route:ok:ok');
+        exitIs(probe, 0);
+        check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]) && probe.record.providers.codex.route === 'official' &&
+          allLogs(probe).includes('open→half_open') && allLogs(probe).includes('half_open→closed') &&
+          Object.values(circuitState())[0].state === 'closed' && Object.values(circuitState())[0].consecutive_failures === 0,
+          '到期后应放行一次官方探测，成功即关闭');
+        const back = run('route:ok:ok');
+        check(!isMicu(execCalls(start).at(-1)) && back.record.providers.codex.route === 'official', '恢复后应继续使用官方');
+        // 探测失败：重新打开并翻倍。
+        run('route:capacity:ok');
+        run('route:capacity:ok');
+        expireCircuit();
+        const failed = run('route:capacity:ok');
+        exitIs(failed, 0);
+        check(allLogs(failed).includes('half_open→open') && Object.values(circuitState())[0].state === 'open' &&
+          Object.values(circuitState())[0].open_seconds === 1200, '探测失败应重新打开并把时长翻倍');
+        // 其他进程持有探测名额时视为 Open；失效的探测名额会被回收。
+        const key = Object.keys(circuitState())[0];
+        for (const [pid, expectOfficial] of [[process.pid, false], [999999, true]]) {
+          const data = circuitState();
+          data[key] = { ...data[key], state: 'half_open', probe: { pid, started_at: Date.now() / 1000 }, opened_at: Date.now() / 1000 - 5000 };
+          writeJSON(circuitPath, data);
+          const marker = invocationRows().length;
+          exitIs(run('route:ok:ok'), 0);
+          check(!isMicu(execCalls(marker)[0]) === expectOfficial, `探测名额持有者 ${pid} 的处理不符`);
+        }
+      })],
+      [96, 'Codex 路由：tier2 官方模型顺序、5xx 阈值、认证、Retry-After、模型不支持与路由上限', () => withMicuRoutes(async () => {
+        let mark = invocationRows().length;
+        const luna = run('route:capacity@terra:ok', [], false, { tier: 'tier2' });
+        exitIs(luna, 0);
+        let calls = execCalls(mark);
+        check(calls.length === 3 && modelOf(calls[0]) === 'gpt-6.1-terra' && modelOf(calls[1]) === 'gpt-6.1-terra' &&
+          modelOf(calls[2]) === 'gpt-6-luna' && calls.every((row) => !isMicu(row)), 'tier2 应 terra 重试一次后换 luna');
+        clearCircuit();
+        mark = invocationRows().length;
+        const micu = run('route:capacity:ok', [], false, { tier: 'tier2' });
+        exitIs(micu, 0);
+        calls = execCalls(mark);
+        check(calls.map(modelOf).join() === 'gpt-6.1-terra,gpt-6.1-terra,gpt-6-luna,gpt-6-luna,gpt-6.1-sol' && isMicu(calls[4]) &&
+          calls[4].args.includes('model_reasoning_effort="medium"') && micu.record.routes.map((row) => row.route).join() === 'official,official,Micu',
+          'tier2 官方两个模型都 capacity 后应转 Micu sol/medium');
+        clearCircuit();
+        // 5xx：阈值 2，第一次只计数但本次仍转 Micu。
+        exitIs(run('route:server:ok'), 0);
+        let entry = Object.values(circuitState())[0];
+        check(entry.state === 'closed' && entry.consecutive_failures === 1 && !fs.existsSync(cooldownPath), '5xx 首次只应计数');
+        exitIs(run('route:server:ok'), 0);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'open' && entry.open_seconds === 900, '5xx 连续两次应打开 15 分钟熔断');
+        clearCircuit();
+        exitIs(run('route:auth:ok'), 0);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'open' && entry.open_seconds === 3600, '认证错误应立即打开 60 分钟熔断');
+        clearCircuit();
+        // Retry-After 优先于类别时长。
+        exitIs(run('route:retry:ok'), 0);
+        exitIs(run('route:retry:ok'), 0);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'open' && entry.open_seconds === 1800, '应使用服务端 Retry-After 作为冷却时长');
+        clearCircuit();
+        // 模型不支持：标记 24 小时，不进熔断器也不写冷却。
+        mark = invocationRows().length;
+        exitIs(run('route:model:ok'), 0);
+        const unavailable = JSON.parse(fs.readFileSync(unavailablePath, 'utf8'));
+        check(Object.keys(unavailable).length === 1 && Math.abs(Object.values(unavailable)[0] - Date.now() - 86_400_000) < 10_000 &&
+          Object.keys(circuitState()).length === 0 && !fs.existsSync(cooldownPath) && execCalls(mark).length === 2,
+          '模型不支持应只标记 24 小时并换下一路由');
+        mark = invocationRows().length;
+        const afterUnsupported = run('route:ok:ok');
+        check(execCalls(mark).length === 1 && isMicu(execCalls(mark)[0]) &&
+          allLogs(afterUnsupported).includes('skip route: official/gpt-6.1-sol (model-unavailable)'), '已标记不支持的模型应被跳过');
+        fs.rmSync(unavailablePath, { force: true });
+        // 路由切换上限。
+        routeConfig.codexCircuit = { ...routeConfig.codexCircuit, maxRouteSwitches: 1 };
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        mark = invocationRows().length;
+        const capped = run('route:capacity:ok', [], false, { tier: 'tier2' });
+        exitIs(capped, 10);
+        check(execCalls(mark).length === 4 && execCalls(mark).every((row) => !isMicu(row)), '超过 maxRouteSwitches 后应输出 FALLBACK 且不再试 Micu');
+        routeConfig.codexCircuit = { ...routeConfig.codexCircuit, maxRouteSwitches: 3 };
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        clearCircuit();
+        // 唯一路由：Micu 不可用且 --no-claude 时只计数；允许 Claude 时才打开熔断。
+        env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify([]);
+        exitIs(run('route:auth:ok'), 10);
+        entry = Object.values(circuitState())[0];
+        check(entry.state === 'closed' && entry.consecutive_failures === 1 && !fs.existsSync(cooldownPath), '唯一路由失败应只计数');
+        exitIs(run('route:auth:ok', [], true), 0);
+        check(Object.values(circuitState())[0].state === 'open', '允许 Claude 时认证失败应打开熔断');
+      })],
+      [97, 'Codex 路由：Micu 限额、花费账本、超预算与 --ignore-budget', () => withMicuRoutes(async () => {
+        const spendFile = path.join(home, 'state', 'provider-spend.json');
+        const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date());
+        let mark = invocationRows().length;
+        exitIs(run('route:limit:ok'), 0);
+        check(execCalls(mark).length === 2 && !isMicu(execCalls(mark)[0]) && isMicu(execCalls(mark)[1]), '官方 5h 限额应转 Micu');
+        const expected = (85 * 2 + 20 * 0.1 + 30 * 10) / 1e6 * 0.0833333;
+        const spent = JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu;
+        check(Math.abs(spent - expected) < 1e-9, `花费应按标价 1/12 估算: ${spent} vs ${expected}`);
+        // 长上下文档按请求计价；total_tokens 与 input+output 不符时记为 unknown。
+        fs.rmSync(spendFile, { force: true });
+        writeJSON(tokenUsagePath, { last: { input_tokens: 300000, cached_input_tokens: 100000, cache_write_input_tokens: 0, output_tokens: 1000, total_tokens: 301000 },
+          total: { input_tokens: 300000, output_tokens: 1000, total_tokens: 301000 } });
+        exitIs(run('route:limit:ok'), 0);
+        const longSpent = JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu;
+        check(Math.abs(longSpent - (200000 * 4 + 100000 * 0.2 + 1000 * 15) / 1e6 * 0.0833333) < 1e-9, `长上下文价不符: ${longSpent}`);
+        // 同一派发多个请求：累计 total_tokens 与单次 input+output 不同，仍应逐个请求计价。
+        fs.rmSync(spendFile, { force: true });
+        writeJSON(tokenUsagePath, { second: { input_tokens: 200, cached_input_tokens: 150, cache_write_input_tokens: 0, output_tokens: 40, reasoning_output_tokens: 0, total_tokens: 240 } });
+        const multi = run('route:limit:ok');
+        exitIs(multi, 0);
+        const multiSpent = JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu;
+        check(Math.abs(multiSpent - (expected + (50 * 2 + 150 * 0.1 + 40 * 10) / 1e6 * 0.0833333)) < 1e-9, `多请求花费不符: ${multiSpent}`);
+        fs.rmSync(spendFile, { force: true });
+        writeJSON(tokenUsagePath, { last: { total_tokens: 999 } });
+        const unknown = run('route:limit:ok');
+        exitIs(unknown, 0);
+        check(allLogs(unknown).includes('spend: unknown') && !fs.existsSync(spendFile), 'token 口径不符应记 unknown 而不是估算');
+        fs.rmSync(tokenUsagePath, { force: true });
+        // 超预算：Micu 被跳过，输出 LIMIT；--ignore-budget 放行并注明。
+        writeJSON(spendFile, { [today]: { Micu: 5 } });
+        mark = invocationRows().length;
+        const over = run('route:limit:ok');
+        exitIs(over, 15);
+        check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]) && allLogs(over).includes('skip route: Micu/gpt-6.1-sol (budget'),
+          '超预算时不应调用 Micu');
+        const ignored = run('route:limit:ok', ['--ignore-budget']);
+        exitIs(ignored, 0);
+        check(ignored.footer.includes('budget ignored') && allLogs(ignored).includes('budget ignored: Micu/gpt-6.1-sol') &&
+          JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu > 5, '--ignore-budget 应放行、注明并照常记账');
+        exitIs(spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--claude', '--ignore-budget', '--cwd', repo],
+          { env, cwd: home, input: 'x\n', encoding: 'utf8', timeout: 8000 }), 2);
+        // 缺单价的模型只在 --ignore-budget 下使用。
+        fs.rmSync(spendFile, { force: true });
+        delete routeConfig.codexPricing['gpt-6.1-sol'];
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        exitIs(run('route:limit:ok'), 15);
+        const unpriced = run('route:limit:ok', ['--ignore-budget']);
+        exitIs(unpriced, 0);
+        check(allLogs(unpriced).includes('spend: unknown') && unpriced.footer.includes('budget ignored'), '缺单价模型应在 --ignore-budget 下记 unknown');
+        // Micu 额度错误与故障。
+        fs.rmSync(spendFile, { force: true });
+        routeConfig.codexPricing = structuredClone(config.codexPricing);
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        mark = invocationRows().length;
+        exitIs(run('route:limit:rate'), 15);
+        check(Object.values(providerStates()).filter(Boolean).length === 1, 'Micu 额度错误应写入 provider-limit');
+        mark = invocationRows().length;
+        exitIs(run('route:limit:ok', [], false, { preserveCooldown: true }), 15);
+        check(execCalls(mark).every((row) => !isMicu(row)), 'Micu 限额期间应被跳过');
+        fs.rmSync(providerLimitPath, { force: true });
+        clearCircuit();
+        exitIs(run('route:limit:server'), 10);
+        check(Object.values(circuitState())[0].state === 'closed' && Object.values(circuitState())[0].consecutive_failures === 1 &&
+          !fs.existsSync(cooldownPath), 'Micu 5xx 且无其他路由时应只计数');
+      })],
+      [98, 'Codex 路由：旧 cooldown 迁移为 Open，clear-cooldown 清空熔断状态', () => withMicuRoutes(async () => {
+        exitIs(run('route:other:ok'), 10);
+        check(Object.keys(JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))).length === 1 && Object.keys(circuitState()).length === 0,
+          '其他失败应沿用 cooldown 写入');
+        const mark = invocationRows().length;
+        const migrated = run('route:ok:ok', [], false, { preserveCooldown: true });
+        exitIs(migrated, 0);
+        check(execCalls(mark).length === 1 && isMicu(execCalls(mark)[0]) && allLogs(migrated).includes('skip route: official/gpt-6.1-sol (circuit open)'),
+          '旧 cooldown 记录应视为 Open 并转 Micu');
+        writeJSON(circuitPath, { stale: { state: 'open', consecutive_failures: 2, opened_at: Date.now() / 1000, open_seconds: 600, probe: null } });
+        writeJSON(unavailablePath, { stale: Date.now() + 1000 });
+        const clear = spawnSync(process.execPath, [SCRIPT_PATH, 'clear-cooldown'], { env, cwd: repo, encoding: 'utf8', timeout: 8000 });
+        exitIs(clear, 0);
+        check(Object.keys(circuitState()).length === 0 && Object.keys(JSON.parse(fs.readFileSync(unavailablePath, 'utf8'))).length === 0 &&
+          Object.keys(JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))).length === 0, 'clear-cooldown 应清空 cooldown、熔断和不支持标记');
+      })],
+      [99, 'Codex 路由：Micu 路由写入 history，续跑时供应商变化会重建任务', () => withMicuRoutes(async () => {
+        const viaMicu = run('route:limit:ok');
+        exitIs(viaMicu, 0);
+        check(viaMicu.record.providers.codex.providerId === 'database-codex' && viaMicu.record.providers.codex.route === 'Micu',
+          'history 应记录实际使用的 Micu 路由');
+        const mark = invocationRows().length;
+        const resumed = run('route:ok:ok', ['--resume', viaMicu.record.log_id]);
+        exitIs(resumed, 0);
+        check(resumed.record.provider_change?.action === 'rebuild' && !isMicu(execCalls(mark)[0]) &&
+          execCalls(mark)[0].args[1] !== 'resume', '续跑回到官方时应重建任务而不是沿用 Micu 会话');
+      })],
+      [100, '重置券：触发条件、选券、二次读取与退回 Micu', () => withMicuRoutes(async () => {
+        const settingsFile = path.join(home, 'stub-rate-limits.json');
+        const notifyFile = path.join(home, 'notifications.jsonl');
+        const hours = (value) => Math.floor(Date.now() / 1000) + Math.round(value * 3600);
+        const stubState = (value) => writeJSON(settingsFile, value);
+        const consumeRows = () => {
+          try { return fs.readFileSync(path.join(home, 'stub-app-server.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.event === 'consume'); }
+          catch { return []; }
+        };
+        const savedCredits = routeConfig.codexResetCredits;
+        routeConfig.codexResetCredits = { ...savedCredits, auto: true };
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        const credits = (...items) => items.map(([id, expiresInHours]) => ({ id, expiresInHours }));
+        const twoCredits = credits(['aaaaaaaa-0000-0000-0000-000000000001', 100], ['bbbbbbbb-0000-0000-0000-000000000002', 10]);
+        const scenario = (state, { tier: runTier, ...options } = {}) => {
+          stubState(state);
+          fs.rmSync(notifyFile, { force: true });
+          const consumed = consumeRows().length;
+          const mark = invocationRows().length;
+          const result = run('route:limit:ok', [], false, options);
+          return { result, consumed: consumeRows().slice(consumed), calls: execCalls(mark), logs: allLogs(result) };
+        };
+        try {
+          // 周限额且离重置超过 24 小时：用最早到期的券，二次读取确认后在官方重跑，不转 Micu。
+          let r = scenario({ primaryUsed: 50, weeklyUsed: 100, credits: twoCredits });
+          exitIs(r.result, 0);
+          check(r.consumed.length === 1 && r.consumed[0].creditId === twoCredits[1].id && /^[0-9a-f-]{36}$/.test(r.consumed[0].idempotencyKey) &&
+            r.calls.length === 2 && r.calls.every((row) => !isMicu(row)) && r.result.record.providers.codex.route === 'official' &&
+            r.logs.includes('reset credit: reset bbbbbbbb expires') && r.result.record.reset_credit.outcome === 'reset' &&
+            r.result.record.reset_credit.credit === 'bbbbbbbb' && r.result.record.reset_credit.confirmed === true &&
+            !JSON.stringify(r.result.record).includes(twoCredits[1].id) && !r.logs.includes(twoCredits[1].id),
+          `周限额应用最早到期的券并在官方重跑: ${JSON.stringify(r.consumed)} ${r.calls.length}`);
+          check(fs.readFileSync(notifyFile, 'utf8').includes('"event":"reset credit"'), '用券应发系统通知');
+          // 5h 限额、周用量 ≥80%、有券 3 天内到期：用券。
+          r = scenario({ primaryUsed: 100, weeklyUsed: 85, credits: credits(['cccccccc-0000-0000-0000-000000000003', 48]) });
+          exitIs(r.result, 0);
+          check(r.consumed.length === 1 && r.calls.length === 2 && r.calls.every((row) => !isMicu(row)), '5h 限额加周用量高加券将到期应用券');
+          // 不满足触发条件：不用券，转 Micu。
+          const none = [
+            ['5h 限额、周用量 85%、券 100 小时后才到期', { primaryUsed: 100, weeklyUsed: 85, credits: credits(['dddddddd-0000-0000-0000-000000000004', 100]) }],
+            ['5h 限额、周用量 50%、券将到期', { primaryUsed: 100, weeklyUsed: 50, credits: credits(['eeeeeeee-0000-0000-0000-000000000005', 10]) }],
+            ['周限额但 12 小时后重置', { primaryUsed: 50, weeklyUsed: 100, weeklyResetsAt: hours(12), credits: twoCredits }],
+            ['没有券', { primaryUsed: 100, weeklyUsed: 100 }],
+            ['券已用完', { primaryUsed: 50, weeklyUsed: 100, credits: [{ id: 'ffffffff-0000-0000-0000-000000000006', status: 'redeemed', expiresInHours: 10 }] }],
+            ['券已过期', { primaryUsed: 50, weeklyUsed: 100, credits: credits(['11111111-0000-0000-0000-000000000007', -1]) }],
+            ['只有数量没有明细', { primaryUsed: 50, weeklyUsed: 100, credits: twoCredits, creditsDetail: false }],
+          ];
+          for (const [name, state] of none) {
+            r = scenario(state);
+            exitIs(r.result, 0);
+            check(r.consumed.length === 0 && r.calls.length === 2 && !isMicu(r.calls[0]) && isMicu(r.calls[1]) &&
+              r.result.record.reset_credit === undefined && r.logs.includes('reset credit: skipped'), `${name}：不应用券而应转 Micu`);
+          }
+          // consume 的各种结果：nothingToReset / noCredit / alreadyRedeemed、用券后仍受限、RPC 错误都转 Micu，且本次不再尝试。
+          for (const [name, extra, outcome] of [
+            ['nothingToReset', { consumeOutcome: 'nothingToReset' }, 'nothingToReset'],
+            ['noCredit', { consumeOutcome: 'noCredit' }, 'noCredit'],
+            ['alreadyRedeemed 但额度未重置', { consumeOutcome: 'alreadyRedeemed' }, 'alreadyRedeemed'],
+            ['reset 后仍受限', { consumeEffect: 'none' }, 'reset'],
+          ]) {
+            r = scenario({ primaryUsed: 50, weeklyUsed: 100, credits: twoCredits, ...extra });
+            exitIs(r.result, 0);
+            check(r.consumed.length === 1 && r.calls.length === 2 && isMicu(r.calls[1]) && r.result.record.reset_credit.outcome === outcome &&
+              r.result.record.reset_credit.confirmed === false && r.logs.includes(`reset credit: ${outcome} bbbbbbbb`),
+            `${name}：应转 Micu 且不重复用券`);
+          }
+          r = scenario({ primaryUsed: 50, weeklyUsed: 100, credits: twoCredits, consumeMode: 'error' });
+          exitIs(r.result, 0);
+          check(r.consumed.length === 2 && r.consumed[0].idempotencyKey === r.consumed[1].idempotencyKey && r.calls.length === 2 && isMicu(r.calls[1]) &&
+            r.result.record.reset_credit.outcome === 'failed', 'consume 失败应沿用同一个 idempotencyKey 重试一次，仍失败则转 Micu');
+          // auto:false 只读取不使用；强制限额开关不使用。
+          routeConfig.codexResetCredits = { ...savedCredits, auto: false };
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+          r = scenario({ primaryUsed: 50, weeklyUsed: 100, credits: twoCredits });
+          exitIs(r.result, 0);
+          check(r.consumed.length === 0 && isMicu(r.calls[1]), 'auto:false 不应用券');
+          routeConfig.codexResetCredits = { ...savedCredits, auto: true };
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+          env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = '1';
+          stubState({ primaryUsed: 50, weeklyUsed: 100, credits: twoCredits });
+          const forcedMark = invocationRows().length;
+          const forcedConsumed = consumeRows().length;
+          const forced = run('complete');
+          delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+          exitIs(forced, 0);
+          check(consumeRows().length === forcedConsumed && execCalls(forcedMark).length === 1 && isMicu(execCalls(forcedMark)[0]), '强制限额开关不应用券');
+          // 派发前已知限额（读取到状态文件）：用券后直接在官方运行，不新开尝试，限额状态被清除。
+          stubState({ primaryUsed: 50, weeklyUsed: 100, credits: twoCredits });
+          seedLimit({ type: 'weekly', source: 'session' });
+          const before = consumeRows().length;
+          const preMark = invocationRows().length;
+          const pre = run('complete', [], false, { preserveCooldown: true });
+          exitIs(pre, 0);
+          check(consumeRows().length === before + 1 && execCalls(preMark).length === 1 && !isMicu(execCalls(preMark)[0]) &&
+            limitState().type === null && pre.record.reset_credit.outcome === 'reset' && !/attempt\d+$/.test(pre.record.log_id),
+          '派发前已知周限额时应先用券再在官方运行');
+          // status 只读显示张数和最早到期时间，不调用 consume。
+          stubState({ credits: twoCredits });
+          const beforeStatus = consumeRows().length;
+          const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 20000 });
+          check(status.status === 0 && /codex reset credits: 2 available; earliest expiry /.test(status.stdout) && consumeRows().length === beforeStatus,
+            `status 应显示可用张数和最早到期时间且不用券: ${status.stdout}`);
+        } finally {
+          routeConfig.codexResetCredits = savedCredits;
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+          delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+          fs.rmSync(settingsFile, { force: true });
+        }
+      })],
+      [101, '官方额度保留线：启用、关闭、读不到、本地覆盖与用券', () => withMicuRoutes(async () => {
+        const settingsFile = path.join(home, 'stub-rate-limits.json');
+        const notifyFile = path.join(home, 'notifications.jsonl');
+        const stubState = (value) => writeJSON(settingsFile, value);
+        const protect = (value) => deviceSettings({ currentProviderCodex: 'official-codex', ...(value === undefined ? {} : { codexQuotaProtection: value }) });
+        const consumeRows = () => {
+          try { return fs.readFileSync(path.join(home, 'stub-app-server.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.event === 'consume'); }
+          catch { return []; }
+        };
+        const scenario = (state) => {
+          stubState(state);
+          fs.rmSync(notifyFile, { force: true });
+          const consumed = consumeRows().length;
+          const mark = invocationRows().length;
+          const result = run('complete');
+          exitIs(result, 0);
+          return { result, consumed: consumeRows().slice(consumed), calls: execCalls(mark), logs: allLogs(result) };
+        };
+        const official = (r, why) => check(r.calls.length === 1 && !isMicu(r.calls[0]) && !r.logs.includes('quota reserve:'), `${why}：应留在官方`);
+        const viaMicu = (r, why, pattern) => check(r.calls.length === 1 && isMicu(r.calls[0]) && pattern.test(r.logs), `${why}：应转 Micu 并记录保留线: ${r.logs}`);
+        const savedCredits = routeConfig.codexResetCredits;
+        const savedReserve = routeConfig.codexQuotaReserve;
+        const save = () => fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        const credits = (...items) => items.map(([id, expiresInHours]) => ({ id, expiresInHours }));
+        try {
+          const enabled = { enabled: true, fiveHourThreshold: 98, weeklyThreshold: 98 };
+          protect(enabled);
+          // 启用：周 / 5h 用量达到阈值转 Micu，恢复时间取对应窗口，低于阈值留在官方。
+          let r = scenario({ primaryUsed: 50, weeklyUsed: 98 });
+          viaMicu(r, '周 98%', /quota reserve: weekly 98% >= 98%/);
+          check(!fs.existsSync(limitPath) || !limitState()?.type, '保留线不应写入限额状态');
+          viaMicu(scenario({ primaryUsed: 98.5, weeklyUsed: 10 }), '5h 98.5%', /quota reserve: 5h 98.5% >= 98%/);
+          official(scenario({ primaryUsed: 97.9, weeklyUsed: 97.9 }), '低于阈值');
+          // 窗口已过期（resets_at 在过去）不算受限。
+          official(scenario({ primaryUsed: 99, weeklyUsed: 10, resets_at: Math.floor(Date.now() / 1000) - 60 }), '5h 窗口已重置');
+          // 关闭、读不到设置、阈值无效：按 100%。
+          protect({ ...enabled, enabled: false });
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), 'enabled=false');
+          protect(undefined);
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), '设置中没有 codexQuotaProtection');
+          protect('on');
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), 'codexQuotaProtection 不是对象');
+          protect({ ...enabled, enabled: 'yes' });
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), 'enabled 不是布尔值');
+          protect({ enabled: true, fiveHourThreshold: 'x', weeklyThreshold: 0 });
+          official(scenario({ primaryUsed: 99, weeklyUsed: 99 }), '阈值无效');
+          // 本地覆盖：关闭 CC Switch 时单独生效，启用时优先于 CC Switch。
+          protect({ ...enabled, enabled: false });
+          routeConfig.codexQuotaReserve = { weeklyThreshold: 90 };
+          save();
+          viaMicu(scenario({ primaryUsed: 99, weeklyUsed: 91 }), '本地覆盖周 90%', /quota reserve: weekly 91% >= 90%/);
+          official(scenario({ primaryUsed: 99, weeklyUsed: 89 }), '本地覆盖只管周窗口');
+          protect(enabled);
+          routeConfig.codexQuotaReserve = { weeklyThreshold: 99.5, fiveHourThreshold: 50 };
+          save();
+          official(scenario({ primaryUsed: 10, weeklyUsed: 99 }), '本地覆盖放宽 CC Switch 阈值');
+          viaMicu(scenario({ primaryUsed: 55, weeklyUsed: 10 }), '本地覆盖收紧 5h 阈值', /quota reserve: 5h 55% >= 50%/);
+          delete routeConfig.codexQuotaReserve;
+          save();
+          // 无效的本地覆盖配置报错。
+          routeConfig.codexQuotaReserve = { weeklyThreshold: 'x' };
+          save();
+          const invalid = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 20000 });
+          check(invalid.status !== 0 && /codexQuotaReserve\.weeklyThreshold/.test(invalid.stderr + invalid.stdout), `无效的 codexQuotaReserve 应报错: ${invalid.stderr}`);
+          delete routeConfig.codexQuotaReserve;
+          // 用券：保留线触发的周限额离重置超过 24 小时，用券后二次读取确认并在官方重跑。
+          routeConfig.codexResetCredits = { ...savedCredits, auto: true };
+          save();
+          protect(enabled);
+          const twoCredits = credits(['aaaaaaaa-0000-0000-0000-000000000001', 100], ['bbbbbbbb-0000-0000-0000-000000000002', 10]);
+          r = scenario({ primaryUsed: 50, weeklyUsed: 98.5, credits: twoCredits });
+          check(r.consumed.length === 1 && r.consumed[0].creditId === twoCredits[1].id && r.calls.length === 1 && !isMicu(r.calls[0]) &&
+            /quota reserve: weekly 98.5% >= 98%/.test(r.logs) && r.logs.includes('reset credit: reset bbbbbbbb expires') &&
+            r.result.record.reset_credit.outcome === 'reset' && r.result.record.reset_credit.confirmed === true && r.result.record.providers.codex.route === 'official',
+          `保留线周限额应用券并在官方重跑: ${JSON.stringify(r.consumed)} ${r.calls.length}`);
+          check(fs.readFileSync(notifyFile, 'utf8').includes('"event":"reset credit"'), '保留线用券应发系统通知');
+          check(!limitState()?.reserve && !limitState()?.type, '用券后不应残留保留线状态');
+          // 5h 达到保留线、周用量 ≥80%、券 3 天内到期：用券。
+          r = scenario({ primaryUsed: 98, weeklyUsed: 85, credits: credits(['cccccccc-0000-0000-0000-000000000003', 48]) });
+          check(r.consumed.length === 1 && r.calls.length === 1 && !isMicu(r.calls[0]) && /quota reserve: 5h 98% >= 98%/.test(r.logs),
+            '5h 保留线加周用量高加券将到期应用券');
+          // 5h 达到保留线、周用量低：不用券，转 Micu。
+          r = scenario({ primaryUsed: 98, weeklyUsed: 50, credits: credits(['dddddddd-0000-0000-0000-000000000004', 10]) });
+          check(r.consumed.length === 0 && r.calls.length === 1 && isMicu(r.calls[0]) && /reset credit: skipped/.test(r.logs), '5h 保留线周用量低不应用券');
+          // 用券后仍在保留线之上（reset 未生效）：转 Micu，本次不再用券。
+          r = scenario({ primaryUsed: 50, weeklyUsed: 98.5, credits: twoCredits, consumeEffect: 'none' });
+          check(r.consumed.length === 1 && r.calls.length === 1 && isMicu(r.calls[0]) && r.result.record.reset_credit.confirmed === false,
+            '用券后仍受限应转 Micu');
+          // auto:false：达到保留线直接转 Micu，不用券。
+          routeConfig.codexResetCredits = { ...savedCredits, auto: false };
+          save();
+          r = scenario({ primaryUsed: 50, weeklyUsed: 98.5, credits: twoCredits });
+          check(r.consumed.length === 0 && r.calls.length === 1 && isMicu(r.calls[0]), 'auto:false 保留线转 Micu 且不用券');
+          // 派发中途跨过阈值不打断当前任务：官方执行时快照已高于阈值，本次任务仍正常完成。
+          protect(enabled);
+          routeConfig.codexResetCredits = { ...savedCredits, auto: false };
+          save();
+          stubState({ primaryUsed: 10, weeklyUsed: 10 });
+          const mark = invocationRows().length;
+          const midway = run('complete');
+          exitIs(midway, 0);
+          check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]), '阈值以下的派发应在官方完成');
+          // status 显示保留线。
+          const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: home, encoding: 'utf8', timeout: 20000 });
+          check(status.status === 0 && /codex quota reserve: 5h 98%; weekly 98%/.test(status.stdout), `status 应显示保留线: ${status.stdout}`);
+        } finally {
+          routeConfig.codexResetCredits = savedCredits;
+          if (savedReserve === undefined) delete routeConfig.codexQuotaReserve; else routeConfig.codexQuotaReserve = savedReserve;
+          save();
+          fs.rmSync(settingsFile, { force: true });
+          deviceSettings({ currentProviderCodex: 'official-codex' });
+        }
+      })],
+      [102, '路由顺序官方 → Claude → Micu，耗尽时等待、LIMIT、--urgent 与通知', () => withMicuRoutes(async () => {
+        useBothSubscriptions();
+        const notifyFile = path.join(home, 'notifications.jsonl');
+        const events = () => { try { return fs.readFileSync(notifyFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line).event); } catch { return []; } };
+        const limited = (week, options, args = [], scenario = 'complete') => {
+          const state = seedLimit();
+          appMode('limited', state.resets_at);
+          claudeUsage(week, options);
+          fs.rmSync(notifyFile, { force: true });
+          const mark = invocationRows().length;
+          const result = run(scenario, args, true, { preserveCooldown: true });
+          return { result, calls: execCalls(mark), state };
+        };
+        // Claude 在用量线内：官方受限 → Claude，不到 Micu，没有 Micu 通知。
+        let r = limited(25);
+        exitIs(r.result, 0);
+        check(r.result.record.executor === 'claude' && r.calls.length === 0 && !events().includes('micu-switch'), '用量线内应走 Claude 而不是 Micu');
+        check(r.result.record.routes?.map((row) => row.route).join() === 'official,claude', `routes 记录不符: ${JSON.stringify(r.result.record.routes)}`);
+        // 超线：转 Micu，并发一次 micu-switch 通知；120 分钟内同事件不重复。
+        r = limited(41);
+        exitIs(r.result, 0);
+        check(r.result.record.executor === 'codex' && r.calls.length === 1 && isMicu(r.calls[0]) && events().includes('micu-switch'), '超线应转 Micu 并通知');
+        r = limited(41);
+        exitIs(r.result, 0);
+        check(!events().includes('micu-switch') && allLogs(r.result).includes('notify skipped: micu-switch'), `notifyRepeatMinutes 内不应重复通知: ${events()}`);
+        const notifyState = path.join(home, 'state', 'notify-state.json');
+        const aged = JSON.parse(fs.readFileSync(notifyState, 'utf8'));
+        aged['micu-switch'] = new Date(Date.now() - 121 * 60_000 - 86400_000).toISOString();
+        writeJSON(notifyState, aged);
+        r = limited(41);
+        exitIs(r.result, 0);
+        check(events().includes('micu-switch'), '超过间隔后应再次通知');
+        // 周用量进入应急保留区（≥85%）通知。
+        r = limited(86);
+        check(events().includes('claude-reserve'), '应急保留区应通知');
+        // Micu 当日花费达到上限后不可用：Claude 也超线 → 耗尽。
+        const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date());
+        writeJSON(path.join(home, 'state', 'provider-spend.json'), { [day]: { Micu: 6 } });
+        r = limited(41, { fiveHours: 3, five: 10 });
+        // Claude 超线的恢复时间是次日 7:00（本地），Micu 是新加坡次日零点，官方 2 小时：最早的在 30 分钟以外时输出 LIMIT。
+        check([15, 0].includes(r.result.status), `耗尽应 LIMIT 或在 30 分钟内等待恢复: ${r.result.status}`);
+        if (r.result.status === 15) {
+          check(r.result.stdout.startsWith('LIMIT\n') && /^route: codex 官方 \|/m.test(r.result.stdout) && /^route: claude \|/m.test(r.result.stdout) &&
+            /^urgent: .*--urgent/m.test(r.result.stdout) && /^earliest: \d{4}-/m.test(r.result.stdout) && events().includes('exhausted') &&
+            r.calls.length === 0, `LIMIT 输出不符: ${r.result.stdout}`);
+          // --urgent：全部不可用时动用 Claude 应急保留（周 41% < 95%）。
+          r = limited(41, {}, ['--urgent']);
+          exitIs(r.result, 0);
+          check(r.result.record.executor === 'claude' && allLogs(r.result).includes('urgent: 全部路由不可用'), '--urgent 应动用应急保留');
+          // 周用量超过 95% 时 --urgent 也不行。
+          r = limited(96, {}, ['--urgent']);
+          exitIs(r.result, 15);
+          check(allLogs(r.result).includes('urgent: Claude 应急保留不可用'), '95% 以上 --urgent 应不可用');
+        }
+        // 正常顺序下 --urgent 不抢先：用量线内仍走正常顺序，不记 urgent。
+        r = limited(25, {}, ['--urgent']);
+        exitIs(r.result, 0);
+        check(r.result.record.executor === 'claude' && !allLogs(r.result).includes('urgent:'), '--urgent 在正常路由可用时不应动用应急保留');
+        fs.rmSync(path.join(home, 'state', 'provider-spend.json'), { force: true });
+        // 参数冲突。
+        for (const bad of [['--urgent', '--claude'], ['--urgent', '--no-claude'], ['--urgent', '--monitor']]) {
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', ...bad, '--cwd', repo], { env, cwd: home, input: 'x', encoding: 'utf8', timeout: 10000 });
+          check(result.status === 2, `${bad.join(' ')} 应报参数错误`);
+        }
+      })],
+      [103, '耗尽后最早恢复在 30 分钟内：等待并重新路由', () => withRoutedFixture(async () => {
+        useBothSubscriptions();
+        const waitEnv = { ...env, AGENT_ROUTE_WAIT_MS: '2500' };
+        // 官方 2 秒后恢复；Claude 5h 80% 不可用（3 小时后恢复）。等待结束后重新路由回到官方。
+        const state = seedLimit({ resets_at: Math.floor(Date.now() / 1000) + 2 });
+        appMode('limited', state.resets_at);
+        claudeUsage(25, { five: 80 });
+        const input = 'AGENT_ROUTE_SELFTEST:complete\n';
+        const result = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--cwd', repo], { env: waitEnv, cwd: home, input, encoding: 'utf8', timeout: dispatchTimeout });
+        exitIs(result, 0);
+        const record = history().at(-1);
+        const log = fs.readFileSync(path.join(home, 'logs', `${record.log_id}.log`), 'utf8');
+        check(/wait: \d+ until .* \(codex 官方: /.test(log) && record.executor === 'codex' && !log.includes('exhausted ') ,
+          `应等待后回到官方: ${result.stdout} ${log.slice(-600)}`);
+      })],
+      [104, '并发派发只用一张重置券', () => withMicuRoutes(async () => {
+        const settingsFile = path.join(home, 'stub-rate-limits.json');
+        const consumeRows = () => {
+          try { return fs.readFileSync(path.join(home, 'stub-app-server.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.event === 'consume'); }
+          catch { return []; }
+        };
+        const savedCredits = routeConfig.codexResetCredits;
+        routeConfig.codexResetCredits = { ...savedCredits, auto: true };
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        try {
+          writeJSON(settingsFile, { primaryUsed: 50, weeklyUsed: 100, credits: [
+            { id: 'aaaaaaaa-0000-0000-0000-000000000001', expiresInHours: 100 }, { id: 'bbbbbbbb-0000-0000-0000-000000000002', expiresInHours: 10 }] });
+          seedLimit({ type: 'weekly', source: 'session' });
+          const before = consumeRows().length;
+          const count = history().length;
+          const results = await Promise.all(Array.from({ length: 2 }, () => new Promise((resolve) => {
+            const child = spawn(process.execPath, [SCRIPT_PATH, 'tier1', '--no-claude', '--cwd', repo], { env, cwd: home, stdio: ['pipe', 'pipe', 'pipe'] });
+            let out = '';
+            child.stdout.on('data', (chunk) => { out += chunk; });
+            child.on('close', (code) => resolve({ code, out }));
+            child.stdin.end('AGENT_ROUTE_SELFTEST:complete\n');
+          })));
+          check(results.every((row) => row.code === 0), `并发派发应都成功: ${JSON.stringify(results)}`);
+          check(consumeRows().length === before + 1, `两个并发派发应只用一张券: ${consumeRows().length - before} ${JSON.stringify(results)} ${history().slice(count).map((row) => allLogs({ record: row }).slice(-1500)).join('\n=====\n')}`);
+          const rows = history().slice(count);
+          check(rows.length === 2 && rows.every((row) => row.executor === 'codex' && row.providers.codex.route === 'official'), '两个派发都应在官方运行');
+          check(rows.filter((row) => row.reset_credit).length === 1, '只有一个派发记录用券');
+          check(!fs.existsSync(path.join(home, 'state', 'route.lock')), '不应残留 route.lock');
+        } finally {
+          routeConfig.codexResetCredits = savedCredits;
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+          fs.rmSync(settingsFile, { force: true });
+        }
+      })],
+      [105, 'status、route explain 与按路由 stats 只读可观测', () => withMicuRoutes(async () => {
+        const localConfigPath = path.join(home, 'config.local.json');
+        fs.writeFileSync(localConfigPath, JSON.stringify({ codexBin: config.codexBin, claudeBin: config.claudeBin }));
+        const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date());
+        writeJSON(path.join(home, 'state', 'provider-spend.json'), { [today]: { Micu: 1.25 } });
+        writeJSON(path.join(home, 'state', 'codex-limit.json'), { accounts: { 'selftest-account': {
+          snapshot: { secondary: { used_percent: 40, resets_at: Math.floor(Date.now() / 1000) + 3600 } },
+        } } });
+        writeJSON(path.join(home, 'state', 'claude-usage.json'), { accounts: { default: {
+          seven_day: { used_percent: 30, resets_at: Math.floor(Date.now() / 1000) + 7200 },
+        } } });
+        const before = JSON.stringify({
+          state: fs.readdirSync(path.join(home, 'state')).sort().map((name) => [name, fs.readFileSync(path.join(home, 'state', name), 'utf8')]),
+          invocations: fs.existsSync(path.join(home, 'stub-invocations.jsonl')) ? fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8') : '',
+        });
+        const explained = spawnSync(process.execPath, [SCRIPT_PATH, 'route', 'tier2', '--explain'], { env, cwd: home, encoding: 'utf8', timeout: 15000 });
+        exitIs(explained, 0);
+        check(explained.stdout.includes('route explain: tier2') && explained.stdout.includes('order: official -> Claude -> Micu') &&
+          explained.stdout.includes('candidate 1: official/gpt-6.1-terra') && explained.stdout.includes('selected: official/gpt-6.1-terra'),
+        `route explain 输出不符: ${explained.stdout}`);
+        noRouteSecrets(explained.stdout + explained.stderr);
+        const after = JSON.stringify({
+          state: fs.readdirSync(path.join(home, 'state')).sort().map((name) => [name, fs.readFileSync(path.join(home, 'state', name), 'utf8')]),
+          invocations: fs.existsSync(path.join(home, 'stub-invocations.jsonl')) ? fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8') : '',
+        });
+        check(before === after, 'route explain 不应写入状态或派发执行方');
+        fs.writeFileSync(historyPath, [
+          { time: new Date().toISOString(), executor: 'codex', providers: { codex: { route: 'official' } }, reset_credit: { outcome: 'reset' } },
+          { time: new Date().toISOString(), executor: 'codex', providers: { codex: { route: 'Micu' } } },
+          { time: new Date().toISOString(), executor: 'claude' },
+        ].map((row, index) => JSON.stringify({ log_id: `stage5-${index}`, tier: 'tier2', model: 'fixture', effort: 'medium', monitor: false,
+          status: 'complete', ...row })).join('\n') + '\n');
+        const statsResult = spawnSync(process.execPath, [SCRIPT_PATH, 'stats'], { env, cwd: home, encoding: 'utf8', timeout: 15000 });
+        exitIs(statsResult, 0);
+        check(statsResult.stdout.includes('route summary') && /Micu\s+\d+\s+0\s+1\.250000/.test(statsResult.stdout) &&
+          /official\s+\d+\s+1\s+0\.000000/.test(statsResult.stdout) && statsResult.stdout.includes('weekly remaining: Codex 60%') &&
+          statsResult.stdout.includes('Claude 70%'), `stats 路由汇总不符: ${statsResult.stdout}`);
+      })],
+      [105.5, 'Claude 原会话续跑：普通用量线受限时输出 LIMIT', () => withMicuRoutes(async () => {
+        useBothSubscriptions();
+        claudeUsage(20, { five: 10 });
+        const first = run('complete', ['--claude', '--write'], true);
+        exitIs(first, 0);
+        claudeUsage(40, { five: 80 });
+        const before = claudeCalls().length;
+        const resumed = run('complete', ['--resume', first.record.log_id, '--write'], true, { preserveCooldown: true });
+        exitIs(resumed, 15);
+        check(resumed.record.executor === 'claude' && resumed.stdout.startsWith('LIMIT\n') &&
+          resumed.stdout.includes('--resume 需由主 agent 确认后使用 --urgent') && claudeCalls().length === before &&
+          /claude-resets: /.test(resumed.stdout), 'Claude 续跑超用量线未按普通规则输出 LIMIT');
+        const urgentResume = run('complete', ['--resume', first.record.log_id, '--urgent', '--write'], true, { preserveCooldown: true });
+        exitIs(urgentResume, 0);
+        check(urgentResume.record.executor === 'claude' && claudeCalls().at(-1).session === first.record.session,
+          '--urgent 未在确认后恢复原 Claude 会话');
+      })],
+      [106, 'Claude unifiedWindows 字段缺失或格式变化时普通路由降级', () => withMicuRoutes(async () => {
+        useBothSubscriptions();
+        const usagePath = path.join(home, 'stub-claude-usage.json');
+        const writePartialUsage = (fiveHour) => {
+          fs.rmSync(path.join(home, 'state', 'claude-usage.json'), { force: true });
+          const now = Math.floor(Date.now() / 1000);
+          writeJSON(usagePath, { ...(fiveHour === undefined ? {} : { five_hour: fiveHour }),
+            seven_day: { utilization: 0.2, resetsAt: now + 3 * 86400 } });
+        };
+        const limited = () => {
+          const state = seedLimit();
+          appMode('limited', state.resets_at);
+          return state;
+        };
+        // 缺少 five_hour 时，普通派发不能把未知 5h 用量当作 0% 放行；应直接转 Micu。
+        limited();
+        writePartialUsage(undefined);
+        const missing = run('complete', [], true, { preserveCooldown: true });
+        exitIs(missing, 0);
+        check(missing.record.executor === 'codex' && missing.record.providers.codex.route === 'Micu' &&
+          /claude pacing\[normal\]: block usage-stale/.test(allLogs(missing)), '缺少 five_hour 时普通路由未降级');
+        // 应急通道沿用“只检查读得到的限额”：周额度可读时允许 --claude。
+        const urgent = run('complete', ['--claude'], true, { preserveCooldown: true });
+        exitIs(urgent, 0);
+        check(urgent.record.executor === 'claude', '缺少 5h 字段时 --claude 不应阻断应急通道');
+        // 字段格式变化同样降级；weekly 仍可读，但 five_hour 的 utilization 非数值。
+        limited();
+        writePartialUsage({ utilization: '20%', resetsAt: Math.floor(Date.now() / 1000) + 3 * 3600 });
+        const malformed = run('complete', [], true, { preserveCooldown: true });
+        exitIs(malformed, 0);
+        check(malformed.record.executor === 'codex' && malformed.record.providers.codex.route === 'Micu' &&
+          /claude pacing\[normal\]: block usage-stale/.test(allLogs(malformed)), '用量字段格式变化时普通路由未降级');
       })],
     );
     for (const [id, name, test] of scenarios) {

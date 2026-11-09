@@ -12,7 +12,10 @@
     },
     "tier2": {
       "codex": {
-        "model": "gpt-6-luna",
+        "models": [
+          "gpt-6.1-terra",
+          "gpt-6-luna"
+        ],
         "effort": "xhigh",
         "apiModel": "gpt-6.1-sol"
       },
@@ -27,6 +30,11 @@
   "cooldownMinutes": 30,
   "codexTimeoutMinutes": 90,
   "codexStreamIdleTimeoutMs": 120000,
+  "codexStallWatchdog": {
+    "enabled": true,
+    "seconds": 150,
+    "maxResumes": 2
+  },
   "claudeTimeoutMinutes": 60,
   "claudePermissionMode": "auto",
   "logRetentionDays": 7,
@@ -43,5 +51,75 @@
     "enabled": true,
     "onReadError": "live-config"
   },
-  "claudeWeeklyThreshold": 80
+  "codexFallback": {
+    "providers": [
+      {
+        "ccSwitchId": "b1461721-a885-478c-80b4-6631c3134bb7",
+        "label": "Micu",
+        "priceMultiplier": 0.0833333,
+        "models": {
+          "tier1": [
+            {
+              "model": "gpt-6.1-sol"
+            }
+          ],
+          "tier2": [
+            {
+              "model": "gpt-6.1-sol",
+              "effort": "medium"
+            }
+          ]
+        }
+      }
+    ],
+    "retryOfficialMinutes": 15,
+    "capacityBackoffSeconds": 30,
+    "dailyBudgetUsd": 5
+  },
+  "codexPricing": {
+    "gpt-6.1-sol": {
+      "input": 2,
+      "cachedInput": 0.1,
+      "output": 10,
+      "longContext": {
+        "thresholdTokens": 272000,
+        "input": 4,
+        "cachedInput": 0.2,
+        "output": 15
+      }
+    }
+  },
+  "codexCircuit": {
+    "thresholds": {
+      "capacity": 2,
+      "server": 2,
+      "auth": 1
+    },
+    "openMinutes": {
+      "capacity": 10,
+      "server": 15,
+      "auth": 60
+    },
+    "maxOpenMinutes": 120,
+    "maxRouteSwitches": 3
+  },
+  "claudePacing": {
+    "dayStartHour": 7,
+    "emergencyReservePercent": 15,
+    "minDailyHeadroomPercent": 2,
+    "fiveHourMaxPercent": 70,
+    "finalWindowHours": 36,
+    "finalWindowReservePercent": 5,
+    "urgentMaxPercent": 95,
+    "staleMinutes": 60,
+    "probeMinutes": 5,
+    "maxAutoWaitMinutes": 30,
+    "notifyRepeatMinutes": 120
+  },
+  "codexResetCredits": {
+    "auto": true,
+    "minWaitHours": 24,
+    "weeklyPercentForExpiring": 80,
+    "expiringDays": 3
+  }
 }
