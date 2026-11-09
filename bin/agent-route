@@ -106,7 +106,7 @@ provider 取 $CODEX_HOME/config.toml 顶层 model_provider，默认 openai；内
 config 的 logMode 为 "summary" 时，汇报"完成"且没有 WARNING 的派发只保留摘要日志。
 Codex 的 Reconnecting、stream disconnected、retry 行计入 reconnect，at capacity 行计入 capacity；摘要日志最多保留 20 行。
 footer 和 history 记录 reconnect、capacity、rollout 停顿及 watchdog；相邻事件间隔 ≥60 秒且该步输出 token <500 计入 stall N/Xs，仅统计本次执行。
-官方 Codex 等模型超过 codexStallWatchdog.seconds 且没有进行中的工具调用时自动续跑同一 session；footer/history 记录 watchdog 次数与等待秒数。
+官方 Codex 等模型超过 codexStallWatchdog.seconds 且没有进行中的工具调用时自动续跑同一 session；每次续跑后的首次等模型阶段不监视，达到 maxResumes 后停止监视并让 Codex 自身的流空闲超时处理；看门狗主动结束请求不计为失败。
 汇报完成、verify 全部 PASS（或未指定）、没有 WARNING 且偏差和遗留问题均为"无"或未列出时，stdout 折叠为一行摘要并保留只读结论；只读缺少结论时保留完整汇报并告警。--full-output 保留完整汇报，日志始终保留完整汇报，--monitor 不受影响。
 --verify 可多次：汇报完成后在 --cwd 下依次用 /bin/zsh -lc 验证，每条超时 10 分钟；只读核对在验证之前完成。
 --fix-rounds 为非负整数，默认 1，仅有 --verify 时生效；验证失败后同线程返工，0 禁用，只读模式不返工。
@@ -637,12 +637,14 @@ function inspectRolloutForWatchdog(id) {
   let pendingTools = 0;
   let waiting = false;
   let terminal = false;
+  let lastEventType = null;
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let record;
     try { record = JSON.parse(line); } catch { continue; }
     const payload = record?.payload ?? {};
     const type = payload.type;
+    lastEventType = type ?? null;
     if (type === 'task_complete' || type === 'error' || type === 'stream_error') {
       terminal = true;
       waiting = false;
@@ -670,7 +672,7 @@ function inspectRolloutForWatchdog(id) {
       waiting = pendingTools === 0;
     }
   }
-  return { file, fingerprint: `${stat.size}:${stat.mtimeMs}`, waiting: waiting && pendingTools === 0, terminal };
+  return { file, fingerprint: `${stat.size}:${stat.mtimeMs}`, waiting: waiting && pendingTools === 0, terminal, lastEventType };
 }
 
 // 复用同一个 app-server 会话按顺序发送请求；返回每个请求的响应（{result} 或 {error}）。
@@ -2015,7 +2017,9 @@ function statsFailures(args) {
   const transferred = (record) => record.fallback === true || record.resumed_from !== null && record.resumed_from !== undefined ||
     record.attempt !== null && record.attempt !== undefined || record.provider_change !== undefined ||
     Array.isArray(record.routes) && record.routes.length > 1;
-  const isFailure = (record) => record.status !== 'complete' || transferred(record);
+  const hasStatus = (record) => record.status !== null && record.status !== undefined &&
+    !(typeof record.status === 'string' && !record.status.trim());
+  const isFailure = (record) => hasStatus(record) && (record.status !== 'complete' || transferred(record));
   const selected = history.filter((record) => {
     if (cutoff !== null && !(Date.parse(record.time) >= cutoff)) return false;
     if (versionPrefix !== null && !versionOf(record).startsWith(versionPrefix)) return false;
@@ -2672,6 +2676,7 @@ let codexStall = { count: 0, seconds: 0 };
 let codexWatchdog = { count: 0, seconds: 0 };
 let codexWatchdogTriggered = false;
 let codexWatchdogWaitSeconds = 0;
+let codexWatchdogDisabled = false;
 
 function isCodexStderrDiagnostic(line) {
   if (/^(?:error|warning|fatal|http\s+\d{3}|unexpected status|selected model|you[’']ve hit|reconnecting|stream disconnected|retry|at capacity|model(?:[_\s-]*(?:not[_\s-]*found|does not exist|unsupported))|unauthorized|internal server error|service unavailable|status\s+\d{3})\b/i.test(line)) {
@@ -3848,18 +3853,25 @@ async function dispatchRoute() {
 
 function startCodexWatchdog({ killGroup, isFinished }) {
   const settings = codexStallWatchdogConfig(config);
-  if (!settings.enabled || activeRouteKind !== 'official') return null;
+  if (!settings.enabled || activeRouteKind !== 'official' || codexWatchdogDisabled ||
+      codexWatchdog.count >= settings.maxResumes) return null;
   let fingerprint = null;
   let lastActivity = null;
+  let skipInitialWaiting = codexResume;
   const poll = setInterval(() => {
     if (isFinished()) return;
     const state = inspectRolloutForWatchdog(session);
     if (!state || state.terminal) return;
     if (state.fingerprint !== fingerprint) {
+      const changed = fingerprint !== null;
       fingerprint = state.fingerprint;
       lastActivity = Date.now();
+      if (skipInitialWaiting) {
+        if (!changed || state.lastEventType === 'task_started') lastActivity = null;
+        else skipInitialWaiting = false;
+      }
     }
-    if (!state.waiting || lastActivity === null || Date.now() - lastActivity < settings.seconds * 1000) return;
+    if (skipInitialWaiting || !state.waiting || lastActivity === null || Date.now() - lastActivity < settings.seconds * 1000) return;
     codexWatchdogTriggered = true;
     codexWatchdogWaitSeconds = Math.max(1, Math.round((Date.now() - lastActivity) / 1000));
     killGroup('SIGTERM');
@@ -3988,14 +4000,16 @@ function runCodex(spawnRetried = false) {
         codexWatchdog.count++;
         codexWatchdog.seconds += waitSeconds;
         log(`watchdog ${codexWatchdog.count}/${settings.maxResumes}: rollout 无新事件 ${waitSeconds}s，续跑同一 session`);
+        if (codexWatchdog.count >= settings.maxResumes) codexWatchdogDisabled = true;
         codexResume = true;
         startAttempt(`watchdog ${codexWatchdog.count}`);
         return runCodex();
       }
-      codexWatchdog.seconds += waitSeconds;
-      log(`watchdog: reached maxResumes=${settings.maxResumes}; 按原失败分类处理`);
-      const watchdogReason = failureText || `rollout 超过 ${settings.seconds} 秒无新事件`;
-      return failCodex(watchdogReason, { tail: failureText || tail, code, telemetry: failureTelemetry });
+      codexWatchdogDisabled = true;
+      log(`watchdog: reached maxResumes=${settings.maxResumes}; 停止监视并继续等待 Codex`);
+      codexResume = true;
+      startAttempt(`watchdog ${codexWatchdog.count}`);
+      return runCodex();
     }
     if (activeRouteKind === 'micu') {
       // 无论成败都按 rollout 的请求级 token_count 记账；口径不符或缺单价时记 unknown。

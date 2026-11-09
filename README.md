@@ -110,11 +110,11 @@ Micu 每日花费是软上限，默认 `dailyBudgetUsd: 5`。达到上限或模�
 
 全部路由不可用时，脚本计算官方额度、熔断、Micu 次日预算和 Claude 日线的最早恢复时间。最早恢复在 `claudePacing.maxAutoWaitMinutes`（默认 30 分钟）内会自动等待并重新选路；更久则输出 `LIMIT`、退出码 15，主 agent 应单独向用户确认，必要时再用 `--urgent`。`--no-claude` 不等待，直接输出 `FALLBACK` 或 `LIMIT`。
 
-可观测命令：`status` 显示额度、Claude 日线与剩余、重置券、熔断和 Micu 花费；`route <tier1|tier2> --explain` 只预演候选顺序与阻塞原因，不派发、不使用重置券；`stats [--days N]` 除模型分组外显示按路由派发次数、用券次数、Micu 当日花费和两边周额度剩余；`stats --failures [--days N] [--version SHA]` 按版本和失败类别汇总失败，列出最近 10 次失败及停顿、看门狗续跑统计，`--version` 按前缀筛选。
+可观测命令：`status` 显示额度、Claude 日线与剩余、重置券、熔断和 Micu 花费；`route <tier1|tier2> --explain` 只预演候选顺序与阻塞原因，不派发、不使用重置券；`stats [--days N]` 除模型分组外显示按路由派发次数、用券次数、Micu 当日花费和两边周额度剩余；`stats --failures [--days N] [--version SHA]` 按版本和失败类别汇总失败，忽略 status 为空的运行中或中间尝试起始记录，以同一派发的最终 attempt 记录为准，并列出最近 10 次失败及停顿、看门狗续跑统计，`--version` 按前缀筛选。
 
 Codex 续跑失败会先重试同一会话，再携带原任务和新增要求开新线程，最终失败才进入下一条路由；每次尝试写入日志与 history 的 `attempt` 字段。
 
-官方 Codex 默认启用卡住看门狗（`codexStallWatchdog.seconds: 150`、`maxResumes: 2`）。rollout 表明正在等模型且没有进行中的工具调用时，超过阈值会结束当前进程并用同一 session 续跑；Micu 不启用。设置 `enabled: false` 可关闭。
+官方 Codex 默认启用卡住看门狗（`codexStallWatchdog.seconds: 150`、`maxResumes: 2`）。rollout 表明正在等模型且没有进行中的工具调用时，超过阈值会结束当前进程并用同一 session 续跑；每次续跑后的首次等模型阶段不监视，达到续跑上限后停止监视并让 Codex 自身的流空闲超时处理；看门狗主动结束请求不计为失败，也不会触发冷却或转交，续跑后的结果按正常流程处理。Micu 不启用。设置 `enabled: false` 可关闭。
 
 ### 关键配置
 
@@ -131,7 +131,7 @@ Codex 续跑失败会先重试同一会话，再携带原任务和新增要求�
 ~/.claude/agent-route/bin/agent-route clear-cooldown
 ```
 
-`status` 查看版本、目录、额度、冷却与路由；`stats` 按 tier / 模型和最终路由汇总，`--days` 只接受正整数；`stats --failures` 只统计非 complete 记录及发生过转交或续跑的 complete 记录，旧记录缺少版本时显示为 `unknown`；`route <tier> --explain` 只读预演选路；`clear-cooldown` 清空模型冷却及当前 Codex 路由的限额记录。
+`status` 查看版本、目录、额度、冷却与路由；`stats` 按 tier / 模型和最终路由汇总，`--days` 只接受正整数；`stats --failures` 忽略 status 为空的记录，同一派发有后续 attempt 时按最终记录统计，旧记录缺少版本时显示为 `unknown`；`route <tier> --explain` 只读预演选路；`clear-cooldown` 清空模型冷却及当前 Codex 路由的限额记录。
 
 ### 日志与 footer
 
@@ -144,7 +144,7 @@ Codex 续跑失败会先重试同一会话，再携带原任务和新增要求�
 | `reconnect N` | Codex 标准错误和事件流中匹配 `Reconnecting`、`stream disconnected`、`retry` 的行数，不区分大小写；同一行多次匹配只计一次。 |
 | `capacity N` | 匹配 `at capacity` 的行数；一行可同时计入重连与容量统计。两项均为 `0` 时均不显示，否则同时显示。 |
 | `stall N/Xs` | 会话 rollout 中相邻事件间隔至少 60 秒、且对应步骤输出 token 少于 500 的停顿次数与总秒数；只统计本次执行，次数为 `0` 时隐藏，缺少 token 元数据时不推测。 |
-| `watchdog N/Xs` | 官方 rollout 看门狗触发的同 session 续跑次数与触发前累计等待秒数；没有触发时隐藏。工具调用尚未返回时不会触发。 |
+| `watchdog N/Xs` | 官方 rollout 看门狗触发的同 session 续跑次数与触发前累计等待秒数；没有触发时隐藏。每次续跑后的首次等模型阶段不计时，达到上限后停止监视；工具调用尚未返回时不会触发。 |
 
 history 对应字段为 `reconnect`、`capacity`、`stall`、`stall_seconds`、`watchdog`、`watchdog_seconds`。这些是运行诊断计数；footer 的省略表示该项为零，或本次没有可统计的停顿数据。
 

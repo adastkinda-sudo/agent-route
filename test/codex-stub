@@ -184,7 +184,8 @@ if (!['complete', 'partial', 'unknown', 'tracked-write', 'ignored-write', 'pycac
   'complete-snapshot', 'metadata-healthy-error', 'premium-only', 'api-complete-snapshot', 'api-429-snapshot',
   'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both',
   'stream-events', 'stream-many', 'false-diagnostics', 'structured-capacity', 'stall-events', 'stall-high', 'stall-missing',
-  'watchdog-stall', 'watchdog-command', 'watchdog-capacity', 'micu-fallback'].includes(scenario) && !/^route:[a-z0-9@]+:[a-z0-9]+$/.test(scenario ?? '') && !failFirst) {
+  'watchdog-stall', 'watchdog-command', 'watchdog-capacity', 'watchdog-max-complete', 'watchdog-warmup',
+  'micu-fallback'].includes(scenario) && !/^route:[a-z0-9@]+:[a-z0-9]+$/.test(scenario ?? '') && !failFirst) {
   die(`未知场景: ${scenario ?? '(无)'}`);
 }
 const currentSession = session ?? randomUUID();
@@ -252,13 +253,20 @@ if (!claude && scenario.startsWith('watchdog-')) {
     append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-stall', output: 'done' });
     setInterval(() => {}, 1000);
     await new Promise(() => {});
-  } else if (scenario === 'watchdog-capacity' && calls <= 2) {
+  } else if (['watchdog-capacity', 'watchdog-max-complete', 'watchdog-warmup'].includes(scenario) &&
+      calls <= 2) {
     append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-capacity', output: 'done' });
+    if (calls === 2 && ['watchdog-capacity', 'watchdog-max-complete', 'watchdog-warmup'].includes(scenario)) {
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      append('response_item', { type: 'reasoning', text: 'cache warm' });
+    }
     setInterval(() => {}, 1000);
     await new Promise(() => {});
   } else if (scenario === 'watchdog-capacity') {
     fs.writeSync(2, 'Selected model is at capacity. Please try a different model.\n');
     process.exit(1);
+  } else if (scenario === 'watchdog-max-complete') {
+    await new Promise((resolve) => setTimeout(resolve, 180));
   }
 }
 // codex-fail-N：前 N 次 Codex 调用失败（续跑、重试和新线程都计数），之后及 Claude 调用成功。

@@ -629,6 +629,10 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           { log_id: 'failure-stats-3', time: now, version: 'abcdef3', tier: 'tier1', executor: 'codex',
             status: 'complete', exit_code: 0 },
           { log_id: 'failure-stats-4', time: now, tier: 'tier1', executor: 'claude', status: 'partial', exit_code: 11 },
+          { log_id: 'failure-stats-running', time: now, version: 'abcdef1', tier: 'tier1', executor: 'codex',
+            failure_class: 'capacity', status: null, exit_code: null },
+          { log_id: 'failure-stats-running-attempt1', time: now, version: 'abcdef4', tier: 'tier1', executor: 'codex',
+            failure_class: null, status: 'complete', attempt: 'watchdog 1', exit_code: 0 },
         ];
         try {
           fs.writeFileSync(historyPath, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
@@ -637,6 +641,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           exitIs(result, 0);
           check(/version\s+failure_class/.test(result.stdout) && /abcdef1\s+capacity\s+1/.test(result.stdout) &&
             /abcdef2\s+官方 5h\s+1/.test(result.stdout) && /unknown\s+unclassified\s+\d+/.test(result.stdout) &&
+            /abcdef4\s+unclassified\s+1/.test(result.stdout) &&
+            !result.stdout.split('\n').some((line) => line.endsWith('failure-stats-running')) &&
             !result.stdout.includes('abcdef3'), `失败 stats 汇总不符: ${result.stdout}`);
           check(result.stdout.includes('recent failures') && result.stdout.includes('failure-stats-2') &&
             result.stdout.includes('summary: stall 5/75s; watchdog 3'), '失败 stats 明细或诊断汇总不符');
@@ -2404,6 +2410,17 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const command = run('watchdog-command', [], false, { timeout: 5000 });
         exitIs(command, 0);
         check(command.record.watchdog === 0 && !command.footer.includes('watchdog'), '工具调用未返回时错误触发看门狗');
+        clearCircuit();
+        const maxComplete = run('watchdog-max-complete', [], false, { timeout: 5000 });
+        exitIs(maxComplete, 0);
+        check(maxComplete.record.watchdog === 2 && maxComplete.record.status === 'complete' &&
+          !fs.existsSync(cooldownPath) && !fs.existsSync(circuitPath),
+          '达到看门狗续跑上限后未继续等待并正常完成');
+        const warmup = run('watchdog-warmup', [], false, { timeout: 5000 });
+        exitIs(warmup, 0);
+        const warmupLogs = allLogs(warmup);
+        check(warmup.record.watchdog === 2 && (warmupLogs.match(/^watchdog \d+\//gm) ?? []).length === 2,
+          '续跑后的首次等模型仍触发看门狗或后续等待未恢复监视');
         const limited = run('watchdog-capacity', [], false, { timeout: 5000 });
         exitIs(limited, 10);
         const limitedLogs = allLogs(limited);
