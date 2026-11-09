@@ -2574,13 +2574,20 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(Math.abs(spent - expected) < 1e-9, `花费应按标价 1/12 估算: ${spent} vs ${expected}`);
         // 长上下文档按请求计价；total_tokens 与 input+output 不符时记为 unknown。
         fs.rmSync(spendFile, { force: true });
-        writeJSON(tokenUsagePath, { last: { input_tokens: 300000, cached_input_tokens: 100000, cache_write_input_tokens: 0, output_tokens: 1000 },
+        writeJSON(tokenUsagePath, { last: { input_tokens: 300000, cached_input_tokens: 100000, cache_write_input_tokens: 0, output_tokens: 1000, total_tokens: 301000 },
           total: { input_tokens: 300000, output_tokens: 1000, total_tokens: 301000 } });
         exitIs(run('route:limit:ok'), 0);
         const longSpent = JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu;
         check(Math.abs(longSpent - (200000 * 4 + 100000 * 0.2 + 1000 * 15) / 1e6 * 0.0833333) < 1e-9, `长上下文价不符: ${longSpent}`);
+        // 同一派发多个请求：累计 total_tokens 与单次 input+output 不同，仍应逐个请求计价。
         fs.rmSync(spendFile, { force: true });
-        writeJSON(tokenUsagePath, { total: { total_tokens: 999 } });
+        writeJSON(tokenUsagePath, { second: { input_tokens: 200, cached_input_tokens: 150, cache_write_input_tokens: 0, output_tokens: 40, reasoning_output_tokens: 0, total_tokens: 240 } });
+        const multi = run('route:limit:ok');
+        exitIs(multi, 0);
+        const multiSpent = JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu;
+        check(Math.abs(multiSpent - (expected + (50 * 2 + 150 * 0.1 + 40 * 10) / 1e6 * 0.0833333)) < 1e-9, `多请求花费不符: ${multiSpent}`);
+        fs.rmSync(spendFile, { force: true });
+        writeJSON(tokenUsagePath, { last: { total_tokens: 999 } });
         const unknown = run('route:limit:ok');
         exitIs(unknown, 0);
         check(allLogs(unknown).includes('spend: unknown') && !fs.existsSync(spendFile), 'token 口径不符应记 unknown 而不是估算');

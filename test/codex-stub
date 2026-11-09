@@ -349,11 +349,15 @@ if (!claude && (scenario === 'micu-fallback' || routeMatch) && micu) {
   const timestamp = new Date().toISOString();
   let usage = {};
   try { usage = JSON.parse(fs.readFileSync(path.join(process.env.HOME, 'stub-token-usage.json'), 'utf8')); } catch {}
-  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), JSON.stringify({ timestamp,
-    type: 'event_msg', payload: { type: 'token_count', info: {
-      total_token_usage: { input_tokens: 100, output_tokens: 30, total_tokens: 130, ...(usage.total ?? {}) },
-      last_token_usage: { input_tokens: 100, cached_input_tokens: 20, cache_write_input_tokens: 5, output_tokens: 30, reasoning_output_tokens: 10, ...(usage.last ?? {}) },
-    } } }) + '\n');
+  const first = { input_tokens: 100, cached_input_tokens: 20, cache_write_input_tokens: 5, output_tokens: 30, reasoning_output_tokens: 10, total_tokens: 130, ...(usage.last ?? {}) };
+  const events = [{ total: { input_tokens: 100, output_tokens: 30, total_tokens: 130, ...(usage.total ?? {}) }, last: first }];
+  // usage.second：同一派发的第二个请求，total_token_usage 为两次累计。
+  if (usage.second) {
+    const sum = (key) => (first[key] ?? 0) + (usage.second[key] ?? 0);
+    events.push({ total: { input_tokens: sum('input_tokens'), output_tokens: sum('output_tokens'), total_tokens: sum('total_tokens') }, last: usage.second });
+  }
+  fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), events.map(({ total, last }) => JSON.stringify({ timestamp,
+    type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: total, last_token_usage: last } } })).join('\n') + '\n');
 }
 const repair = prompt.includes('自动返工：上轮 verify 失败。');
 const round = repair ? (previous?.round ?? 0) + 1 : 0;

@@ -572,7 +572,8 @@ async function sessionTelemetry(id, since, includeLimits) {
               if (value !== null) tokens[key] = value;
             }
             if (Object.keys(tokens).length) result.tokenUsage.push(tokens);
-            const total = numeric(info?.total_token_usage?.total_tokens);
+            // last_token_usage 是单次请求的用量，只和它自己的 total_tokens 比对；total_token_usage 是累计值。
+            const total = numeric(usage.total_tokens);
             const input = numeric(usage.input_tokens);
             const outputTokens = numeric(usage.output_tokens);
             if (total !== null && input !== null && outputTokens !== null && total !== input + outputTokens) result.tokenUsageInvalid = true;
