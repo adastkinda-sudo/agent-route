@@ -96,7 +96,7 @@ Codex 订阅账号受限时自动交给 Claude；每 5 分钟查询额度，接�
 config 的 codexStreamIdleTimeoutMs 设置 Codex 流空闲超时（毫秒，默认 120000；0 或未设置时不覆盖）。
 provider 取 $CODEX_HOME/config.toml 顶层 model_provider，默认 openai；内置 provider 不覆盖并记入日志，不修改 Codex 配置文件。
 --resume 接受日志 id 或 session UUID；日志 id 沿用原 cwd、要求 tier 一致；UUID 必须同时指定 --cwd。
-续跑按本次 --write 执行，跟随原执行方并绕过模型失败冷却；Codex 账号受限时携带原任务和新增要求交给 Claude 新开执行。
+续跑按本次 --write 执行，跟随原执行方并绕过模型失败冷却；原 Claude 任务续跑仍按普通用量线检查，受限时输出 LIMIT，确认后再用 --urgent。
 续跑时 Codex 执行失败：先用同一 session 再续跑 1 次；仍失败则放弃续跑，携带原任务和新增要求开新 Codex 线程，最多 2 次；
 仍失败则给该模型写冷却并交给 Claude 新开执行（--no-claude 输出 FALLBACK，退出码 10）。每次尝试写入日志和 history 的 attempt 字段。
 参数类续跑错误（tier 不一致、cwd 不存在、找不到原任务或 session）直接输出 ERROR，退出码 12，不重试。
@@ -104,7 +104,8 @@ provider 取 $CODEX_HOME/config.toml 顶层 model_provider，默认 openai；内
 有变化时在 footer 输出 WARNING。--exclude（相对 --cwd，可多次）和 config 的 readOnlyExclude 跳过并发写入的目录。
 config 的 logMode 为 "summary" 时，汇报"完成"且没有 WARNING 的派发只保留摘要日志。
 Codex 的 Reconnecting、stream disconnected、retry 行计入 reconnect，at capacity 行计入 capacity；摘要日志最多保留 20 行。
-footer 和 history 记录 reconnect、capacity 及 rollout 停顿；相邻事件间隔 ≥60 秒且该步输出 token <500 计入 stall N/Xs，仅统计本次执行。
+footer 和 history 记录 reconnect、capacity、rollout 停顿及 watchdog；相邻事件间隔 ≥60 秒且该步输出 token <500 计入 stall N/Xs，仅统计本次执行。
+官方 Codex 等模型超过 codexStallWatchdog.seconds 且没有进行中的工具调用时自动续跑同一 session；footer/history 记录 watchdog 次数与等待秒数。
 汇报完成、verify 全部 PASS（或未指定）、没有 WARNING 且偏差和遗留问题均为"无"或未列出时，stdout 折叠为一行摘要并保留只读结论；只读缺少结论时保留完整汇报并告警。--full-output 保留完整汇报，日志始终保留完整汇报，--monitor 不受影响。
 --verify 可多次：汇报完成后在 --cwd 下依次用 /bin/zsh -lc 验证，每条超时 10 分钟；只读核对在验证之前完成。
 --fix-rounds 为非负整数，默认 1，仅有 --verify 时生效；验证失败后同线程返工，0 禁用，只读模式不返工。
@@ -594,6 +595,70 @@ async function sessionTelemetry(id, since, includeLimits) {
   return result;
 }
 
+// 看门狗只读取 rollout 的事件类型和工具调用状态，不把会话内容写入日志。
+function findSessionRollout(id) {
+  if (!SESSION_ID.test(id ?? '')) return null;
+  const visit = (directory) => {
+    let entries;
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return null; }
+    for (const entry of entries) {
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        const found = visit(file);
+        if (found) return found;
+      } else if (entry.isFile() && entry.name.endsWith(`-${id}.jsonl`)) return file;
+    }
+    return null;
+  };
+  return visit(path.join(CODEX_HOME, 'sessions'));
+}
+
+function inspectRolloutForWatchdog(id) {
+  const file = findSessionRollout(id);
+  if (!file) return null;
+  let stat;
+  try { stat = fs.statSync(file); } catch { return null; }
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return null; }
+  let pendingTools = 0;
+  let waiting = false;
+  let terminal = false;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let record;
+    try { record = JSON.parse(line); } catch { continue; }
+    const payload = record?.payload ?? {};
+    const type = payload.type;
+    if (type === 'task_complete' || type === 'error' || type === 'stream_error') {
+      terminal = true;
+      waiting = false;
+      continue;
+    }
+    if (record.type === 'event_msg' && type === 'task_started') {
+      waiting = true;
+      continue;
+    }
+    if (record.type === 'response_item' && type === 'custom_tool_call') {
+      pendingTools++;
+      waiting = false;
+      continue;
+    }
+    if (record.type === 'response_item' && type === 'custom_tool_call_output') {
+      pendingTools = Math.max(0, pendingTools - 1);
+      waiting = pendingTools === 0;
+      continue;
+    }
+    if (record.type === 'event_msg' && type === 'token_count') {
+      waiting = pendingTools === 0;
+      continue;
+    }
+    if (record.type === 'response_item' && (type === 'reasoning' || type === 'message')) {
+      waiting = pendingTools === 0;
+    }
+  }
+  return { file, fingerprint: `${stat.size}:${stat.mtimeMs}`, waiting: waiting && pendingTools === 0, terminal };
+}
+
 // 复用同一个 app-server 会话按顺序发送请求；返回每个请求的响应（{result} 或 {error}）。
 // initialize 失败返回 null；超时或会话中断时返回已收到的部分响应。
 function appServerRequests(config, requests, { stopOnError = false } = {}) {
@@ -837,6 +902,25 @@ const ROUTE_LOCK_FILE = path.join(STATE_DIR, 'route.lock');
 const CLAUDE_PACING_DEFAULTS = { dayStartHour: 7, emergencyReservePercent: 15, minDailyHeadroomPercent: 2, fiveHourMaxPercent: 70,
   finalWindowHours: 36, finalWindowReservePercent: 5, urgentMaxPercent: 95, staleMinutes: 60, probeMinutes: 5,
   maxAutoWaitMinutes: 30, notifyRepeatMinutes: 120 };
+
+const CODEX_STALL_WATCHDOG_DEFAULTS = { enabled: true, seconds: 150, maxResumes: 2 };
+
+function codexStallWatchdogConfig(config) {
+  return { ...CODEX_STALL_WATCHDOG_DEFAULTS, ...(isConfigObject(config?.codexStallWatchdog) ? config.codexStallWatchdog : {}) };
+}
+
+function validateCodexStallWatchdog(config) {
+  const value = config.codexStallWatchdog;
+  if (value === undefined) return;
+  if (!isConfigObject(value)) throw new Error('codexStallWatchdog 必须是对象');
+  if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw new Error('codexStallWatchdog.enabled 必须是布尔值');
+  if (value.seconds !== undefined && (typeof value.seconds !== 'number' || !Number.isFinite(value.seconds) || value.seconds <= 0)) {
+    throw new Error('codexStallWatchdog.seconds 必须是正数');
+  }
+  if (value.maxResumes !== undefined && (!Number.isSafeInteger(value.maxResumes) || value.maxResumes < 0)) {
+    throw new Error('codexStallWatchdog.maxResumes 必须是非负整数');
+  }
+}
 
 function claudePacingConfig(config) {
   return { ...CLAUDE_PACING_DEFAULTS, ...(isConfigObject(config?.claudePacing) ? config.claudePacing : {}) };
@@ -1304,6 +1388,7 @@ function validateConfig(config) {
   }
   validateCodexResetCredits(config);
   validateCodexQuotaReserve(config);
+  validateCodexStallWatchdog(config);
   validateClaudePacing(config);
   return config;
 }
@@ -1841,7 +1926,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|watchdog|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -1861,6 +1946,7 @@ function backfillHistory(history) {
       tokens: numeric(values.tokens), session: session === '?' ? null : session,
       reconnect: numeric(values.reconnect), capacity: numeric(values.capacity),
       stall: numeric(values.stall), stall_seconds: numeric(values.stall_seconds),
+      watchdog: numeric(values.watchdog), watchdog_seconds: numeric(values.watchdog_seconds),
       log_id: id, cwd, prompt_chars: numeric(field('prompt_chars')),
       stdout_chars: numeric(values.stdout_chars), resumed_from: field('resumed'), attempt: field('attempt'),
       verify: verifyText ? JSON.parse(verifyText) : null,
@@ -2480,6 +2566,9 @@ let capacityCount = 0;
 let reconnectLines = [];
 let stderrDiagnosticLines = [];
 let codexStall = { count: 0, seconds: 0 };
+let codexWatchdog = { count: 0, seconds: 0 };
+let codexWatchdogTriggered = false;
+let codexWatchdogWaitSeconds = 0;
 
 function isCodexStderrDiagnostic(line) {
   if (/^(?:error|warning|fatal|http\s+\d{3}|unexpected status|selected model|you[’']ve hit|reconnecting|stream disconnected|retry|at capacity|model(?:[_\s-]*(?:not[_\s-]*found|does not exist|unsupported))|unauthorized|internal server error|service unavailable|status\s+\d{3})\b/i.test(line)) {
@@ -2896,7 +2985,7 @@ function compactLog(text) {
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const safeText = redactSecrets(text);
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|watchdog|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;
@@ -3018,6 +3107,7 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
     time: new Date(startedAt).toISOString(), tier, model: actualModel, effort: actualEffort,
     monitor, write, fallback: usedFallback, status, exit_code: code, elapsed, tokens: numeric(tokens), session,
     reconnect: reconnectCount, capacity: capacityCount, stall: codexStall.count, stall_seconds: codexStall.seconds,
+    watchdog: codexWatchdog.count, watchdog_seconds: codexWatchdog.seconds,
     log_id: path.basename(base), cwd, prompt_chars: charCount(promptText), stdout_chars: charCount(safeOutput), resumed_from: resumeArg,
     verify: verifyResult,
     commit: commitHash,
@@ -3029,7 +3119,7 @@ function recordFinish(status, code, output, tokens, actualModel = model, actualE
     ...(resetCreditRecord ? { reset_credit: resetCreditRecord } : {}),
   };
   if (verifyResult) log(`verify result: ${JSON.stringify(verifyResult)}`);
-  log(`finish: status=${status} tokens=${tokens ?? '?'} elapsed=${elapsed} session=${session ?? '?'} exit_code=${code} stdout_chars=${record.stdout_chars} model=${actualModel} effort=${actualEffort ?? '?'} fallback=${usedFallback} executor=${executor} reconnect=${reconnectCount} capacity=${capacityCount} stall=${codexStall.count} stall_seconds=${codexStall.seconds}${commitHash ? ` commit=${commitHash}` : ''}`);
+  log(`finish: status=${status} tokens=${tokens ?? '?'} elapsed=${elapsed} session=${session ?? '?'} exit_code=${code} stdout_chars=${record.stdout_chars} model=${actualModel} effort=${actualEffort ?? '?'} fallback=${usedFallback} executor=${executor} reconnect=${reconnectCount} capacity=${capacityCount} stall=${codexStall.count} stall_seconds=${codexStall.seconds} watchdog=${codexWatchdog.count} watchdog_seconds=${codexWatchdog.seconds}${commitHash ? ` commit=${commitHash}` : ''}`);
   appendHistory(record);
   progressRecord = { record, text: safeOutput };
 }
@@ -3056,6 +3146,7 @@ async function finishReport(text, tokens, actualModel = model, actualEffort = ef
     `${count === null ? '?' : `${Math.round(count / 1000)}k`} tok`, status ?? 'n/a', `id ${path.basename(base)}`];
   if (reconnectCount || capacityCount) parts.push(`reconnect ${reconnectCount}`, `capacity ${capacityCount}`);
   if (codexStall.count) parts.push(`stall ${codexStall.count}/${codexStall.seconds}s`);
+  if (codexWatchdog.count) parts.push(`watchdog ${codexWatchdog.count}/${codexWatchdog.seconds}s`);
   if (codexLimitReason && executor === 'claude') parts[0] += `（${codexLimitReason}）`;
   try { if (fs.statSync(reportPath).size > 0) parts.push('report'); } catch {}
   if (resumeArg !== null) parts.push(`resumed ${resumeArg}`);
@@ -3158,14 +3249,15 @@ function writeModelCooldown() {
   });
 }
 
-function limitStop(state, claudeLimit = null, actualModel = model, actualEffort = effort) {
+function limitStop(state, claudeLimit = null, actualModel = model, actualEffort = effort, { claudeOnly = false } = {}) {
   const resets = state?.resets_at ? new Date(state.resets_at * 1000) : null;
   const codexReset = resets ? fmtLocal(resets) : '恢复时间未知';
   const claudeReset = claudeLimit?.resets_at ? fmtLocal(new Date(claudeLimit.resets_at * 1000)) : '恢复时间未知';
   log(`limit: codex ${resets?.toISOString() ?? 'unknown'}${claudeLimit ? ` claude ${claudeReset}` : ''}`);
   const codexLabel = dispatchContext.codex?.billingType === 'api'
     ? `Codex API 服务商限额 (${safeProviderLabel(dispatchContext.codex.providerName) ?? 'unknown'}, ${state?.type ?? 'unknown'})` : 'Codex 用量限额';
-  const reason = claudeLimit ? `${codexLabel}，${codexReset}；Claude 用量限额，${claudeReset}` : `${codexLabel}，${codexReset} 恢复；已指定 --no-claude`;
+  const reason = claudeOnly ? `Claude 用量线限制，${claudeReset}恢复；--resume 需由主 agent 确认后使用 --urgent`
+    : claudeLimit ? `${codexLabel}，${codexReset}；Claude 用量限额，${claudeReset}` : `${codexLabel}，${codexReset} 恢复；已指定 --no-claude`;
   const output = `LIMIT\ntier: ${tier}\nreason: ${reason}\nresets: ${resets?.toISOString() ?? 'unknown'}\n${claudeLimit ? `claude-resets: ${claudeLimit.resets_at ? new Date(claudeLimit.resets_at * 1000).toISOString() : 'unknown'}\n` : ''}write: ${write}\ncwd: ${cwd}\nprompt-file: ${fullPromptPath}\nlog: ${logPath}\n${resumeArg !== null ? `resumed: ${resumeArg}\n` : ''}`;
   recordFinish('limit', 15, output, codexTokens, actualModel, actualEffort);
   emitOutput(output, () => process.exit(15));
@@ -3527,6 +3619,9 @@ log: ${logPath}
   if (!gate.allowed) {
     const state = readCodexQuota(dispatchContext.codex, model);
     const blocked = { resets_at: gate.retryAt ? gate.retryAt / 1000 : null };
+    if (resumeArg !== null && resumeInfo?.executor === 'claude' && claudeMode === 'normal') {
+      return limitStop(null, blocked, claudeModel, claudeEffort, { claudeOnly: true });
+    }
     if (limitActive(state)) return limitStop(state, blocked, claudeModel, claudeEffort);
     return failClaude(`Claude 节奏限制: ${gate.reason}${gate.retryAt ? `，${fmtLocal(new Date(gate.retryAt))} 恢复` : ''}`);
   }
@@ -3622,7 +3717,7 @@ if (providerChange && !resumeError && dispatchContext[executor].billingType !== 
 if (resumeError) failResume(resumeError);
 else if (dispatchContext.enabled && !forceClaude && executor !== 'claude' && dispatchContext.codex.billingType === 'unknown') stopUnknownRoute('codex');
 else if (forceClaude) runClaude('主 agent 指定 --claude，未调用 Codex');
-else if (resumeArg !== null && executor === 'claude') { claudeMode = 'urgent'; runClaude('跟随原 Claude 执行方续跑', !providerResumeRebuilt); }
+else if (resumeArg !== null && executor === 'claude') { claudeMode = urgent ? 'urgent' : 'normal'; runClaude('跟随原 Claude 执行方续跑', !providerResumeRebuilt); }
 else await dispatchRoute();
 
 async function dispatchRoute() {
@@ -3644,9 +3739,33 @@ async function dispatchRoute() {
   }
 }
 
+function startCodexWatchdog({ killGroup, isFinished }) {
+  const settings = codexStallWatchdogConfig(config);
+  if (!settings.enabled || activeRouteKind !== 'official') return null;
+  let fingerprint = null;
+  let lastActivity = null;
+  const poll = setInterval(() => {
+    if (isFinished()) return;
+    const state = inspectRolloutForWatchdog(session);
+    if (!state || state.terminal) return;
+    if (state.fingerprint !== fingerprint) {
+      fingerprint = state.fingerprint;
+      lastActivity = Date.now();
+    }
+    if (!state.waiting || lastActivity === null || Date.now() - lastActivity < settings.seconds * 1000) return;
+    codexWatchdogTriggered = true;
+    codexWatchdogWaitSeconds = Math.max(1, Math.round((Date.now() - lastActivity) / 1000));
+    killGroup('SIGTERM');
+    setTimeout(() => killGroup('SIGKILL'), 5000).unref();
+  }, 100);
+  return poll;
+}
+
 // Codex：codex exec 以本机环境运行（不用沙箱），只读靠 prompt 约束
 function runCodex(spawnRetried = false) {
   executor = 'codex';
+  codexWatchdogTriggered = false;
+  codexWatchdogWaitSeconds = 0;
   if (dispatchContext.enabled && dispatchContext.codex.billingType === 'unknown') return stopUnknownRoute('codex');
   if (process.env.AGENT_ROUTE_FORCE_CODEX_FAIL === '1') return failCodex('forced failure (AGENT_ROUTE_FORCE_CODEX_FAIL=1)');
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-route-'));
@@ -3685,6 +3804,7 @@ function runCodex(spawnRetried = false) {
   let sessionTail = '';
   let timedOut = false;
   let finished = false;
+  let watchdogTimer = null;
   // codex exec 的 stdout/stderr 是过程输出，只进日志；汇报取 -o 文件，token 数取输出末尾的 "tokens used"
   const onOutput = (c) => {
     appendLog(c);
@@ -3714,12 +3834,15 @@ function runCodex(spawnRetried = false) {
     if (finished) return false;
     finished = true;
     clearTimeout(timer);
+    if (watchdogTimer) clearInterval(watchdogTimer);
     for (const lines of outputLines) lines.close();
     try { stdout = fs.readFileSync(lastMessage, 'utf8'); } catch {}
     cleanup();
     for (const s of ['SIGINT', 'SIGTERM']) process.removeListener(s, onSignal);
     return true;
   };
+
+  watchdogTimer = startCodexWatchdog({ killGroup, isFinished: () => finished });
 
   child.on('error', (e) => {
     if (finish()) {
@@ -3750,6 +3873,23 @@ function runCodex(spawnRetried = false) {
       stderrDiagnostics,
       limit: dispatchContext.codex?.billingType === 'api' ? readCodexQuota(dispatchContext.codex, model) : readCodexLimit() };
     codexStall = { count: telemetry.stall, seconds: telemetry.stall_seconds };
+    if (codexWatchdogTriggered) {
+      const waitSeconds = codexWatchdogWaitSeconds;
+      codexWatchdogWaitSeconds = 0;
+      const settings = codexStallWatchdogConfig(config);
+      if (codexWatchdog.count < settings.maxResumes && SESSION_ID.test(session ?? '')) {
+        codexWatchdog.count++;
+        codexWatchdog.seconds += waitSeconds;
+        log(`watchdog ${codexWatchdog.count}/${settings.maxResumes}: rollout 无新事件 ${waitSeconds}s，续跑同一 session`);
+        codexResume = true;
+        startAttempt(`watchdog ${codexWatchdog.count}`);
+        return runCodex();
+      }
+      codexWatchdog.seconds += waitSeconds;
+      log(`watchdog: reached maxResumes=${settings.maxResumes}; 按原失败分类处理`);
+      const watchdogReason = failureText || `rollout 超过 ${settings.seconds} 秒无新事件`;
+      return failCodex(watchdogReason, { tail: failureText || tail, code, telemetry: failureTelemetry });
+    }
     if (activeRouteKind === 'micu') {
       // 无论成败都按 rollout 的请求级 token_count 记账；口径不符或缺单价时记 unknown。
       const pricing = estimateProviderCost(model, telemetry.tokenUsage, config, activeCodexContext.config?.priceMultiplier ?? 1,

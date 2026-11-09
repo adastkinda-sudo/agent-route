@@ -2108,7 +2108,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         exitIs(changed, 0);
         check(changed.record.provider_change?.app === 'claude' && changed.record.session !== first.record.session &&
           claudeCalls().at(-1).session === null && changed.stdout.includes('provider changed (claude); rebuild'), 'Claude 服务商变更未重建或记录');
-        useClaudeSubscription();
+        useClaudeSubscription(20);
+        claudeUsage(20, { five: 10 });
         const subscribed = run('complete', ['--resume', changed.record.log_id, '--write'], true);
         exitIs(subscribed, 0);
         check(subscribed.record.providers.claude.billingType === 'subscription' && claudeCalls().at(-1).session === null &&
@@ -2358,6 +2359,26 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           '缺少输出 token 元数据时推测了停顿');
         for (const result of [first, resumed, high, missing]) check(!result.log.includes('SELFTEST_PRIVATE_DIALOGUE'), '停顿统计泄露对话');
       })],
+      [90.5, 'Codex 卡住看门狗：等模型续跑、工具调用等待与次数上限', () => withCodexFixture(async ({ settings, writeConfig }) => {
+        settings.codexStallWatchdog = { enabled: true, seconds: 0.05, maxResumes: 2 };
+        writeConfig();
+        const stalled = run('watchdog-stall', [], false, { timeout: 5000 });
+        exitIs(stalled, 0);
+        check(stalled.record.watchdog === 1 && stalled.record.watchdog_seconds >= 1 && stalled.footer.includes('watchdog 1/1s'),
+          '等模型无响应未触发同 session 看门狗续跑');
+        check(stalled.records.some((row) => row.attempt === 'watchdog 1') &&
+          invocationRows().some((row) => row.command === 'exec' && row.args.includes('resume') && row.args.includes(stalled.record.session)),
+          '看门狗未使用 exec resume 同一 session');
+        const command = run('watchdog-command', [], false, { timeout: 5000 });
+        exitIs(command, 0);
+        check(command.record.watchdog === 0 && !command.footer.includes('watchdog'), '工具调用未返回时错误触发看门狗');
+        const limited = run('watchdog-capacity', [], false, { timeout: 5000 });
+        exitIs(limited, 10);
+        const limitedLogs = allLogs(limited);
+        check(limited.record.watchdog === 2 && limitedLogs.includes('failure class: capacity') &&
+          (limitedLogs.match(/^watchdog \d+\//gm) ?? []).length === 2,
+          '看门狗超过次数上限后未回到原 capacity 失败分类');
+      })],
       [91, 'Codex API 停顿与摘要 history 回填保留诊断字段', () => withRoutedFixture(async () => {
         const before = appCalls().length;
         const result = run('stall-events');
@@ -2374,7 +2395,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         exitIs(stats, 0);
         for (const old of saved) {
           const restored = history().find((row) => row.log_id === old.log_id);
-          check(restored && ['reconnect', 'capacity', 'stall', 'stall_seconds'].every((key) => restored[key] === old[key]),
+          check(restored && ['reconnect', 'capacity', 'stall', 'stall_seconds', 'watchdog', 'watchdog_seconds'].every((key) => restored[key] === old[key]),
             '摘要回填丢失重连/停顿字段');
         }
       })],
@@ -3001,6 +3022,23 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(statsResult.stdout.includes('route summary') && /Micu\s+\d+\s+0\s+1\.250000/.test(statsResult.stdout) &&
           /official\s+\d+\s+1\s+0\.000000/.test(statsResult.stdout) && statsResult.stdout.includes('weekly remaining: Codex 60%') &&
           statsResult.stdout.includes('Claude 70%'), `stats 路由汇总不符: ${statsResult.stdout}`);
+      })],
+      [105.5, 'Claude 原会话续跑：普通用量线受限时输出 LIMIT', () => withMicuRoutes(async () => {
+        useBothSubscriptions();
+        claudeUsage(20, { five: 10 });
+        const first = run('complete', ['--claude', '--write'], true);
+        exitIs(first, 0);
+        claudeUsage(40, { five: 80 });
+        const before = claudeCalls().length;
+        const resumed = run('complete', ['--resume', first.record.log_id, '--write'], true, { preserveCooldown: true });
+        exitIs(resumed, 15);
+        check(resumed.record.executor === 'claude' && resumed.stdout.startsWith('LIMIT\n') &&
+          resumed.stdout.includes('--resume 需由主 agent 确认后使用 --urgent') && claudeCalls().length === before &&
+          /claude-resets: /.test(resumed.stdout), 'Claude 续跑超用量线未按普通规则输出 LIMIT');
+        const urgentResume = run('complete', ['--resume', first.record.log_id, '--urgent', '--write'], true, { preserveCooldown: true });
+        exitIs(urgentResume, 0);
+        check(urgentResume.record.executor === 'claude' && claudeCalls().at(-1).session === first.record.session,
+          '--urgent 未在确认后恢复原 Claude 会话');
       })],
       [106, 'Claude unifiedWindows 字段缺失或格式变化时普通路由降级', () => withMicuRoutes(async () => {
         useBothSubscriptions();

@@ -30,6 +30,11 @@
   "cooldownMinutes": 30,
   "codexTimeoutMinutes": 90,
   "codexStreamIdleTimeoutMs": 120000,
+  "codexStallWatchdog": {
+    "enabled": true,
+    "seconds": 150,
+    "maxResumes": 2
+  },
   "claudeTimeoutMinutes": 60,
   "claudePermissionMode": "auto",
   "logRetentionDays": 7,

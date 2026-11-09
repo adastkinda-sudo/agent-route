@@ -183,7 +183,8 @@ if (!['complete', 'partial', 'unknown', 'tracked-write', 'ignored-write', 'pycac
   'limit-session', 'limit-weekly', 'limit-reached', 'limit-partial', 'limit-both', 'limit-both-zero', 'limit-both-api',
   'complete-snapshot', 'metadata-healthy-error', 'premium-only', 'api-complete-snapshot', 'api-429-snapshot',
   'api-429', 'api-429-date', 'api-429-reset', 'api-quota', 'api-401', 'api-model', 'api-network', 'api-limit-both',
-  'stream-events', 'stream-many', 'false-diagnostics', 'structured-capacity', 'stall-events', 'stall-high', 'stall-missing', 'micu-fallback'].includes(scenario) && !/^route:[a-z0-9@]+:[a-z0-9]+$/.test(scenario ?? '') && !failFirst) {
+  'stream-events', 'stream-many', 'false-diagnostics', 'structured-capacity', 'stall-events', 'stall-high', 'stall-missing',
+  'watchdog-stall', 'watchdog-command', 'watchdog-capacity', 'micu-fallback'].includes(scenario) && !/^route:[a-z0-9@]+:[a-z0-9]+$/.test(scenario ?? '') && !failFirst) {
   die(`未知场景: ${scenario ?? '(无)'}`);
 }
 const currentSession = session ?? randomUUID();
@@ -232,6 +233,33 @@ if (!claude && scenario.startsWith('stall-')) {
     event(330, 2001, 1)];
   if (scenario === 'stall-missing') for (const record of records) if (record.payload.type === 'token_count') record.payload.info = null;
   fs.writeFileSync(path.join(directory, `rollout-test-${currentSession}.jsonl`), records.map(JSON.stringify).join('\n') + '\n{"unfinished":');
+}
+if (!claude && scenario.startsWith('watchdog-')) {
+  const directory = path.join(process.env.CODEX_HOME, 'sessions', '2099', '01', '01');
+  fs.mkdirSync(directory, { recursive: true });
+  const rollout = path.join(directory, `rollout-test-${currentSession}.jsonl`);
+  const counter = path.join(stateDir, `${currentSession}.watchdog-count`);
+  const calls = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0) + 1;
+  fs.writeFileSync(counter, String(calls));
+  const append = (type, payload) => fs.appendFileSync(rollout, JSON.stringify({ timestamp: new Date().toISOString(), type, payload }) + '\n');
+  append('event_msg', { type: 'task_started' });
+  fs.writeSync(2, `session id: ${currentSession}\n`);
+  if (scenario === 'watchdog-command') {
+    append('response_item', { type: 'custom_tool_call', call_id: 'watchdog-command', name: 'shell', input: 'sleep' });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-command', output: 'done' });
+  } else if (scenario === 'watchdog-stall' && calls === 1) {
+    append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-stall', output: 'done' });
+    setInterval(() => {}, 1000);
+    await new Promise(() => {});
+  } else if (scenario === 'watchdog-capacity' && calls <= 2) {
+    append('response_item', { type: 'custom_tool_call_output', call_id: 'watchdog-capacity', output: 'done' });
+    setInterval(() => {}, 1000);
+    await new Promise(() => {});
+  } else if (scenario === 'watchdog-capacity') {
+    fs.writeSync(2, 'Selected model is at capacity. Please try a different model.\n');
+    process.exit(1);
+  }
 }
 // codex-fail-N：前 N 次 Codex 调用失败（续跑、重试和新线程都计数），之后及 Claude 调用成功。
 if (!claude && failFirst) {

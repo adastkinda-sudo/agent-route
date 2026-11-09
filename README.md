@@ -87,7 +87,7 @@ EOF
 | --- | --- |
 | `--write` | 允许改文件；默认只读，前后核对工作目录变化，发现写入时输出 `WARNING`。 |
 | `--cwd DIR`、`--prompt-file FILE` | 指定工作目录和任务文件；无任务文件时读标准输入，无工作目录时使用当前目录。 |
-| `--resume ID` | 接受日志 id 或会话 UUID；日志 id 默认沿用原目录、要求同一 tier，UUID 必须配合 `--cwd`。跟随原执行方，按本次 `--write` 决定权限。 |
+| `--resume ID` | 接受日志 id 或会话 UUID；日志 id 默认沿用原目录、要求同一 tier，UUID 必须配合 `--cwd`。跟随原执行方，按本次 `--write` 决定权限；原 Claude 任务续跑仍按普通用量线检查，受限时输出 `LIMIT`，确认后再用 `--urgent`。 |
 | `--no-claude` | 禁止自动交给 Claude；Codex 失败时输出 `FALLBACK`，额度受限时输出 `LIMIT`。 |
 | `--claude` | 直接调用 Claude，不能与 `--resume`、`--no-claude`、`--monitor` 同用。 |
 | `--urgent` | 按正常顺序选路；仅当所有路由不可用时动用 Claude 应急保留，周用量上限为 `claudePacing.urgentMaxPercent`（默认 95%）。不能与 `--claude`、`--no-claude`、`--monitor` 同用。 |
@@ -114,12 +114,15 @@ Micu 每日花费是软上限，默认 `dailyBudgetUsd: 5`。达到上限或模�
 
 Codex 续跑失败会先重试同一会话，再携带原任务和新增要求开新线程，最终失败才进入下一条路由；每次尝试写入日志与 history 的 `attempt` 字段。
 
+官方 Codex 默认启用卡住看门狗（`codexStallWatchdog.seconds: 150`、`maxResumes: 2`）。rollout 表明正在等模型且没有进行中的工具调用时，超过阈值会结束当前进程并用同一 session 续跑；Micu 不启用。设置 `enabled: false` 可关闭。
+
 ### 关键配置
 
 - `tiers.*.codex.models` 按顺序列出官方候选；保留 `model` 单值也兼容。`codexFallback.providers[].models` 列出 Micu 候选，`retryOfficialMinutes`、`capacityBackoffSeconds` 和 `dailyBudgetUsd` 控制重试、退避和每日软上限。
 - `codexCircuit` 控制 capacity、服务端故障和认证故障的连续失败阈值、熔断时长及单次派发的最大切换次数；`codexResetCredits.auto` 控制是否自动使用官方额度重置券。
 - `claudePacing` 控制日线起始时间、保留比例、5h 上限、最后 36 小时窗口、`urgentMaxPercent`、过期时间和自动等待上限。未知或过期的 Claude 用量读数不会阻塞 `--claude`，但普通路由会跳过 Claude。
 - `codexPricing` 提供 Micu 花费估算的输入、缓存输入和输出单价；缺少模型单价时只有 `--ignore-budget` 会使用该模型。
+- `codexStallWatchdog` 控制官方 rollout 看门狗的开关、无事件阈值秒数和同一派发最多续跑次数。
 
 ```sh
 ~/.claude/agent-route/bin/agent-route status
@@ -141,8 +144,9 @@ Codex 续跑失败会先重试同一会话，再携带原任务和新增要求�
 | `reconnect N` | Codex 标准错误和事件流中匹配 `Reconnecting`、`stream disconnected`、`retry` 的行数，不区分大小写；同一行多次匹配只计一次。 |
 | `capacity N` | 匹配 `at capacity` 的行数；一行可同时计入重连与容量统计。两项均为 `0` 时均不显示，否则同时显示。 |
 | `stall N/Xs` | 会话 rollout 中相邻事件间隔至少 60 秒、且对应步骤输出 token 少于 500 的停顿次数与总秒数；只统计本次执行，次数为 `0` 时隐藏，缺少 token 元数据时不推测。 |
+| `watchdog N/Xs` | 官方 rollout 看门狗触发的同 session 续跑次数与触发前累计等待秒数；没有触发时隐藏。工具调用尚未返回时不会触发。 |
 
-history 对应字段为 `reconnect`、`capacity`、`stall`、`stall_seconds`。这些是运行诊断计数；footer 的省略表示该项为零，或本次没有可统计的停顿数据。
+history 对应字段为 `reconnect`、`capacity`、`stall`、`stall_seconds`、`watchdog`、`watchdog_seconds`。这些是运行诊断计数；footer 的省略表示该项为零，或本次没有可统计的停顿数据。
 
 ### 退出码
 
