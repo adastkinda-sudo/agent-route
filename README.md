@@ -1,6 +1,19 @@
 # agent-route
 
-按 `tier1` / `tier2` 派发任务，依次尝试 Codex 官方、Claude 订阅和 Micu 临时兜底，并记录汇报、验证结果和运行诊断。
+让 Claude 旗舰模型担任规划者，把执行工作交给 GPT（Codex）等模型作为它的 subagent。agent-route 按 `tier1` / `tier2` 派发任务，依次尝试 Codex 官方、Claude 订阅和第三方服务商兜底，并记录汇报、验证结果和运行诊断。
+
+## 目的与工作方式
+
+旗舰模型的规划、判断能力最强，额度也最贵、最紧张。把大量读代码、改文件、跑命令的执行过程放在主会话里，既消耗旗舰模型的额度，也会让主会话的上下文迅速膨胀，每轮重读的成本越来越高。agent-route 把这两件事分开：
+
+- **规划者：Claude 主会话。** 负责调查、拆分任务、写执行文档、标注每一步的 tier，并在每步完成后核对汇报和验证结果。
+- **执行者：GPT 等模型。** 主会话通过 [agent-route skill](claude-skills/agent-route/SKILL.md) 调用本脚本，把一步任务说明交给 Codex 执行；执行方在独立进程中完成任务，只把结构化汇报、验证结果和简短 footer 返回主会话，完整过程留在 `logs/`。
+- **按任务性质分层。** `tier1` 用于需要思考的任务，`tier2` 用于步骤已写清的机械任务和只读调查，模型与 effort 在 `config.json` 中配置；前端和视觉任务交给 Claude agent [`tier3`](claude-agents/tier3.md)。
+- **自动选路与兜底。** 官方 Codex 额度耗尽、熔断或故障时，按配置转到 Claude 订阅或第三方服务商，并对 Claude 用量做每日节奏控制，避免执行工作挤占规划者的额度。
+- **结果可核对。** 默认只读并核对工作目录变化；`--verify` 在汇报后运行验证命令，失败可同线程返工；`--commit` 只提交本次派发改动的路径；`status`、`stats` 和 `route --explain` 用于查看额度、花费和选路原因。
+- **接入 CC Switch。** 启用 `ccSwitch` 后，以只读方式读取 CC Switch（v4.0.12）的数据库和当前路由：Codex 与 Claude 跟随 CC Switch 当前选择的配置目录和服务商，官方额度保留线沿用 CC Switch 的 `codexQuotaProtection`。兜底服务商从 CC Switch 中读取，由用户在 `codexFallback.providers` 中用 `ccSwitchId` 指定使用哪些服务商，以及各 tier 的候选模型、顺序和价格系数。agent-route 不修改 CC Switch 的选择和配置。
+
+监控和长批处理也走同一套机制：`bin/monitor-loop` 定期运行检查命令，由路由模型判断状态，只把 `ALERT` 转发给主会话。
 
 ## 目录
 
@@ -58,7 +71,7 @@ scripts/promote
 
 `config.json` 的 `codexStreamIdleTimeoutMs` 当前为 `120000`，单位为毫秒，用于普通派发、续跑、重试和监控。可在 `config.local.json` 覆盖为非负整数；设为 `0` 不覆盖，合并后的配置缺少该键时也不覆盖。
 
-`config.json` 的 `codexWebsockets` 当前为 `false`：派发时设置 `supports_websockets=false`，Codex 只用 HTTPS 连接 Responses API，不再经过 WebSocket 重连后回退。设为 `true` 或删除该键时沿用 Codex 自身配置。Micu 兜底路由同样只用 HTTPS。
+`config.json` 的 `codexWebsockets` 当前为 `false`：派发时设置 `supports_websockets=false`，Codex 只用 HTTPS 连接 Responses API，不再经过 WebSocket 重连后回退。设为 `true` 或删除该键时沿用 Codex 自身配置。兜底服务商的路由同样只用 HTTPS。
 
 以上两项都按当前 provider 覆盖。provider 从当前 Codex 配置目录的 `config.toml` 顶层 `model_provider` 读取；未指定时使用 `openai`。配置目录通常为 `$CODEX_HOME`，未设置时为 `~/.codex`，启用 CC Switch 时跟随当前路由的配置目录。对自定义 provider，通过本次命令的 `-c` 设置 `model_providers.<provider>.<键>`；内置 `openai`、`ollama`、`lmstudio` 不允许覆盖，跳过并写入日志。不会修改 Codex 的 `config.toml`，流空闲超时与整个派发的 `codexTimeoutMinutes` 分别控制。
 
@@ -93,7 +106,7 @@ EOF
 | `--no-claude` | 禁止自动交给 Claude；Codex 失败时输出 `FALLBACK`，额度受限时输出 `LIMIT`。 |
 | `--claude` | 直接调用 Claude，不能与 `--resume`、`--no-claude`、`--monitor` 同用。 |
 | `--urgent` | 按正常顺序选路；仅当所有路由不可用时动用 Claude 应急保留，周用量上限为 `claudePacing.urgentMaxPercent`（默认 95%）。不能与 `--claude`、`--no-claude`、`--monitor` 同用。 |
-| `--ignore-budget` | 本次允许使用已达 Micu 每日软上限或缺少单价的模型，花费仍照常记账；不能与 `--claude` 同用。 |
+| `--ignore-budget` | 本次允许使用已达兜底服务商每日软上限或缺少单价的模型，花费仍照常记账；不能与 `--claude` 同用。 |
 | `--effort LEVEL` | 覆盖本次 Codex 的 effort：`none`、`minimal`、`low`、`medium`、`high`、`xhigh`；不影响 Claude。 |
 | `--exclude PATH` | 只读核对时排除相对工作目录的路径，可重复；也支持配置 `readOnlyExclude`。日志与状态目录在工作目录内时自动排除。 |
 | `--verify COMMAND`、`--fix-rounds N` | 汇报完成后在工作目录用 `/bin/zsh -lc` 验证，可重复，每条最多 10 分钟。允许写入时验证失败可同线程返工，默认 1 轮，`0` 禁用；只读不返工。 |
@@ -104,26 +117,26 @@ EOF
 
 ### 路由顺序与限额
 
-普通派发的顺序是 **Codex 官方 → Claude → Micu**。官方 tier2 按 `gpt-6.1-terra`、`gpt-6-luna` 依次尝试，tier1 使用 `gpt-6.1-sol`；Micu 的 tier1/tier2 都使用 `gpt-6.1-sol`，tier2 effort 为 `medium`。官方 5h/周限额、保留线和熔断会跳过相应路由，额度或冷却结束后自动恢复。`status` 显示每条路由的熔断剩余时间和 Micu 当日花费。
+普通派发的顺序是 **Codex 官方 → Claude → 兜底服务商**。官方 Codex 按 `tiers.<tier>.codex.models` 的顺序尝试候选模型；兜底服务商按 `codexFallback.providers` 的顺序和各自的候选模型尝试。官方 5h/周限额、保留线和熔断会跳过相应路由，额度或冷却结束后自动恢复。`status` 显示每条路由的熔断剩余时间和兜底服务商当日花费。
 
-Claude 订阅的正常派发受 `claudePacing` 每日用量线和 5h 上限约束。用量来自一次最小的 `claude -p --output-format stream-json --verbose` 调用中的 `rate_limit_event.rate_limit_info.unifiedWindows`，读取 `five_hour` 和 `seven_day` 的 utilization、resetsAt；这些字段属于 Claude Code 的 **@internal** 数据接口，版本升级可能改名、缺失或改变语义。读数超过 `staleMinutes`（默认 60 分钟）或字段不完整时，普通派发不使用 Claude，并转到 Micu；`--claude` 和耗尽时的 `--urgent` 只在能读取到足够的周限额信息时动用应急保留。
+Claude 订阅的正常派发受 `claudePacing` 每日用量线和 5h 上限约束。用量来自一次最小的 `claude -p --output-format stream-json --verbose` 调用中的 `rate_limit_event.rate_limit_info.unifiedWindows`，读取 `five_hour` 和 `seven_day` 的 utilization、resetsAt；这些字段属于 Claude Code 的 **@internal** 数据接口，版本升级可能改名、缺失或改变语义。读数超过 `staleMinutes`（默认 60 分钟）或字段不完整时，普通派发不使用 Claude，并转到兜底服务商；`--claude` 和耗尽时的 `--urgent` 只在能读取到足够的周限额信息时动用应急保留。
 
-Micu 每日花费是软上限，默认 `dailyBudgetUsd: 5`。达到上限或模型没有 `codexPricing` 单价时，普通派发跳过 Micu；`--ignore-budget` 可越过这两项限制，但仍记录估算花费，无法估算时记为 `unknown`。Micu 的密钥只放在子进程环境变量，日志、history 和状态输出会脱敏。
+兜底服务商的每日花费是软上限，由 `codexFallback.dailyBudgetUsd` 设定。达到上限或模型没有 `codexPricing` 单价时，普通派发跳过该服务商；`--ignore-budget` 可越过这两项限制，但仍记录估算花费，无法估算时记为 `unknown`。兜底服务商的密钥只放在子进程环境变量，日志、history 和状态输出会脱敏。
 
-全部路由不可用时，脚本计算官方额度、熔断、Micu 次日预算和 Claude 日线的最早恢复时间。最早恢复在 `claudePacing.maxAutoWaitMinutes`（默认 30 分钟）内会自动等待并重新选路；更久则输出 `LIMIT`、退出码 15，主 agent 应单独向用户确认，必要时再用 `--urgent`。`--no-claude` 不等待，直接输出 `FALLBACK` 或 `LIMIT`。
+全部路由不可用时，脚本计算官方额度、熔断、兜底服务商次日预算和 Claude 日线的最早恢复时间。最早恢复在 `claudePacing.maxAutoWaitMinutes`（默认 30 分钟）内会自动等待并重新选路；更久则输出 `LIMIT`、退出码 15，主 agent 应单独向用户确认，必要时再用 `--urgent`。`--no-claude` 不等待，直接输出 `FALLBACK` 或 `LIMIT`。
 
-可观测命令：`status` 显示额度、Claude 日线与剩余、重置券、熔断和 Micu 花费；`route <tier1|tier2> --explain` 只预演候选顺序与阻塞原因，不派发、不使用重置券；`stats [--days N]` 除模型分组外显示按路由派发次数、用券次数、Micu 当日花费和两边周额度剩余；`stats --failures [--days N] [--version SHA]` 按版本和失败类别汇总失败，忽略 status 为空的运行中或中间尝试起始记录，以同一派发的最终 attempt 记录为准，并列出最近 10 次失败及停顿、看门狗续跑统计，`--version` 按前缀筛选。
+可观测命令：`status` 显示额度、Claude 日线与剩余、重置券、熔断和兜底服务商花费；`route <tier1|tier2> --explain` 只预演候选顺序与阻塞原因，不派发、不使用重置券；`stats [--days N]` 除模型分组外显示按路由派发次数、用券次数、兜底服务商当日花费和两边周额度剩余；`stats --failures [--days N] [--version SHA]` 按版本和失败类别汇总失败，忽略 status 为空的运行中或中间尝试起始记录，以同一派发的最终 attempt 记录为准，并列出最近 10 次失败及停顿、看门狗续跑统计，`--version` 按前缀筛选。
 
 Codex 续跑失败会先重试同一会话，再携带原任务和新增要求开新线程，最终失败才进入下一条路由；每次尝试写入日志与 history 的 `attempt` 字段。
 
-官方 Codex 默认启用卡住看门狗（`codexStallWatchdog.seconds: 150`、`maxResumes: 2`）。rollout 表明正在等模型且没有进行中的工具调用时，超过阈值会结束当前进程并用同一 session 续跑；每次续跑后的首次等模型阶段不监视，达到续跑上限后停止监视并让 Codex 自身的流空闲超时处理；看门狗主动结束请求不计为失败，也不会触发冷却或转交，续跑后的结果按正常流程处理。Micu 不启用。设置 `enabled: false` 可关闭。
+官方 Codex 默认启用卡住看门狗（`codexStallWatchdog.seconds: 150`、`maxResumes: 2`）。rollout 表明正在等模型且没有进行中的工具调用时，超过阈值会结束当前进程并用同一 session 续跑；每次续跑后的首次等模型阶段不监视，达到续跑上限后停止监视并让 Codex 自身的流空闲超时处理；看门狗主动结束请求不计为失败，也不会触发冷却或转交，续跑后的结果按正常流程处理。兜底服务商不启用。设置 `enabled: false` 可关闭。
 
 ### 关键配置
 
-- `tiers.*.codex.models` 按顺序列出官方候选；保留 `model` 单值也兼容。`codexFallback.providers[].models` 列出 Micu 候选，`retryOfficialMinutes`、`capacityBackoffSeconds` 和 `dailyBudgetUsd` 控制重试、退避和每日软上限。
+- `tiers.*.codex.models` 按顺序列出官方候选；保留 `model` 单值也兼容。`codexFallback.providers[]` 用 `ccSwitchId` 指定 CC Switch 中的兜底服务商，`models` 列出各 tier 的候选，`retryOfficialMinutes`、`capacityBackoffSeconds` 和 `dailyBudgetUsd` 控制重试、退避和每日软上限。
 - `codexCircuit` 控制 capacity、服务端故障和认证故障的连续失败阈值、熔断时长及单次派发的最大切换次数；`codexResetCredits.auto` 控制是否自动使用官方额度重置券。
 - `claudePacing` 控制日线起始时间、保留比例、5h 上限、最后 36 小时窗口、`urgentMaxPercent`、过期时间和自动等待上限。未知或过期的 Claude 用量读数不会阻塞 `--claude`，但普通路由会跳过 Claude。
-- `codexPricing` 提供 Micu 花费估算的输入、缓存输入和输出单价；缺少模型单价时只有 `--ignore-budget` 会使用该模型。
+- `codexPricing` 提供兜底服务商花费估算的输入、缓存输入和输出单价；缺少模型单价时只有 `--ignore-budget` 会使用该模型。
 - `codexStallWatchdog` 控制官方 rollout 看门狗的开关、无事件阈值秒数和同一派发最多续跑次数。
 
 ```sh
