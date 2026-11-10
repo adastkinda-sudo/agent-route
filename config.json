@@ -30,6 +30,7 @@
   "cooldownMinutes": 30,
   "codexTimeoutMinutes": 90,
   "codexStreamIdleTimeoutMs": 120000,
+  "codexWebsockets": false,
   "codexStallWatchdog": {
     "enabled": true,
     "seconds": 150,

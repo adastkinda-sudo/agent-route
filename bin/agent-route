@@ -95,7 +95,8 @@ Codex 订阅账号受限时自动交给 Claude；每 5 分钟查询额度，接�
 --monitor 时 Codex 的 effort 改用 config 的 monitorEffort（monitor-loop 使用），不解析汇报状态。
 --effort 覆盖本次 Codex 的 effort（${'none|minimal|low|medium|high|xhigh'}），不影响 Claude fallback。
 config 的 codexStreamIdleTimeoutMs 设置 Codex 流空闲超时（毫秒，默认 120000；0 或未设置时不覆盖）。
-provider 取 $CODEX_HOME/config.toml 顶层 model_provider，默认 openai；内置 provider 不覆盖并记入日志，不修改 Codex 配置文件。
+config 的 codexWebsockets 为 false（config.json 当前值）时，以 supports_websockets=false 让 Codex 只走 HTTPS；true 或未设置时沿用 Codex 配置。
+以上两项按 $CODEX_HOME/config.toml 顶层 model_provider（默认 openai）覆盖；内置 provider 不覆盖并记入日志，不修改 Codex 配置文件。
 --resume 接受日志 id 或 session UUID；日志 id 沿用原 cwd、要求 tier 一致；UUID 必须同时指定 --cwd。
 续跑按本次 --write 执行，跟随原执行方并绕过模型失败冷却；原 Claude 任务续跑仍按普通用量线检查，受限时输出 LIMIT，确认后再用 --urgent。
 续跑时 Codex 执行失败：先用同一 session 再续跑 1 次；仍失败则放弃续跑，携带原任务和新增要求开新 Codex 线程，最多 2 次；
@@ -1556,6 +1557,9 @@ function readConfig({ forceProbe = false } = {}) {
       (!Number.isSafeInteger(config.codexStreamIdleTimeoutMs) || config.codexStreamIdleTimeoutMs < 0)) {
       throw new Error('codexStreamIdleTimeoutMs 必须是非负整数');
     }
+    if (config.codexWebsockets !== undefined && typeof config.codexWebsockets !== 'boolean') {
+      throw new Error('codexWebsockets 必须是布尔值');
+    }
     return validateConfig(config);
   } catch (e) {
     process.stderr.write(`agent-route: 无法读取 ${CONFIG_FILE}: ${e.message}\n`);
@@ -1944,7 +1948,7 @@ function backfillHistory(history) {
       try { cwd = fs.realpathSync(cwd); } catch { /* 历史目录已删除时保留原路径 */ }
     }
     const lines = text.trimEnd().split('\n');
-    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|watchdog|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
+    const body = lines.findIndex((line) => !/^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|codex websockets|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|watchdog|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(line));
     // 完整日志的 finish 必须在末尾；摘要的 finish 位于 log-mode 前的头部。
     const finishLines = lines[body]?.startsWith('log-mode: summary') ? lines.slice(0, body) : lines.slice(-1);
     const finish = finishLines.filter((line) => line.startsWith('finish: ')).at(-1)?.slice(8) ?? '';
@@ -2722,22 +2726,27 @@ function readCodexProviderId() {
   } catch { return 'openai'; }
 }
 
-function codexStreamIdleArgs() {
-  const value = config.codexStreamIdleTimeoutMs;
-  if (!Number.isSafeInteger(value) || value <= 0) return [];
+// 官方线路的 provider 覆盖：流空闲超时与传输方式。内置 provider 不允许覆盖，只记日志。
+function codexProviderOverrideArgs() {
+  const fields = [];
+  const idle = config.codexStreamIdleTimeoutMs;
+  if (Number.isSafeInteger(idle) && idle > 0) fields.push(['stream_idle_timeout_ms', idle, 'codex stream idle timeout']);
+  if (config.codexWebsockets === false) fields.push(['supports_websockets', false, 'codex websockets']);
+  if (!fields.length) return [];
   const provider = readCodexProviderId();
   if (['openai', 'ollama', 'lmstudio'].includes(provider)) {
-    log(`codex stream idle timeout: provider ${provider} is built-in; not overridden`);
+    for (const [, , label] of fields) log(`${label}: provider ${provider} is built-in; not overridden`);
     return [];
   }
   // Codex 按点拆分 CLI 配置键；特殊 id 改用内联表，保留原 provider 的其他配置。
-  return ['-c', /^[A-Za-z0-9_-]+$/.test(provider)
-    ? `model_providers.${provider}.stream_idle_timeout_ms=${value}`
-    : `model_providers={${JSON.stringify(provider)}={stream_idle_timeout_ms=${value}}}`];
+  if (/^[A-Za-z0-9_-]+$/.test(provider)) {
+    return fields.flatMap(([key, value]) => ['-c', `model_providers.${provider}.${key}=${value}`]);
+  }
+  return ['-c', `model_providers={${JSON.stringify(provider)}={${fields.map(([key, value]) => `${key}=${value}`).join(',')}}}`];
 }
 
 function codexRouteArgs() {
-  if (activeRouteKind !== 'micu' || !activeCodexContext?.runtime) return codexStreamIdleArgs();
+  if (activeRouteKind !== 'micu' || !activeCodexContext?.runtime) return codexProviderOverrideArgs();
   const runtime = activeCodexContext.runtime;
   const fields = [`name=${JSON.stringify(activeCodexContext.providerName ?? 'Micu')}`,
     `base_url=${JSON.stringify(runtime.baseUrl)}`, `wire_api=${JSON.stringify(runtime.wireApi ?? 'responses')}`,
@@ -2745,6 +2754,7 @@ function codexRouteArgs() {
   if (Number.isSafeInteger(runtime.streamIdleTimeoutMs) && runtime.streamIdleTimeoutMs > 0) {
     fields.push(`stream_idle_timeout_ms=${runtime.streamIdleTimeoutMs}`);
   }
+  if (config.codexWebsockets === false) fields.push('supports_websockets=false');
   return ['-c', `model_providers.agent_route_micu={${fields.join(',')}}`, '-c', 'model_provider="agent_route_micu"'];
 }
 
@@ -3093,7 +3103,7 @@ function compactLog(text) {
   try { full = fs.readFileSync(logPath, 'utf8'); } catch { return; }
   const safeText = redactSecrets(text);
   const lines = full.split('\n');
-  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|watchdog|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
+  const header = lines.filter((l) => /^(tier|cwd|write|model|effort|prompt-file|time|monitor|prompt_chars|providers|provider-change|provider-change action|resumed|attempt|attempt start|attempt failure|rebuild failure|failure class|source|session id|exec|fallback|read-only exclude|verify command|verify exit|verify result|codex stream idle timeout|codex websockets|route|skip route|reset credit|quota reserve|notify|notify skipped|claude pacing\[[a-z]+\]|claude first|wait|urgent|limit|circuit|capacity retry|budget ignored|budget|spend|model unavailable|cooldown|watchdog|claude [a-zA-Z_]+|exit|stdout bytes|finish): /.test(l));
   const commands = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i] !== 'exec') continue;

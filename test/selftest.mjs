@@ -2294,7 +2294,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
       const tomlPath = path.join(env.CODEX_HOME, 'config.toml');
       const originalConfig = fs.readFileSync(configPath, 'utf8');
       const originalToml = fs.existsSync(tomlPath) ? fs.readFileSync(tomlPath, 'utf8') : null;
-      const settings = { ...config, codexStreamIdleTimeoutMs: 120000 };
+      const settings = { ...config, codexStreamIdleTimeoutMs: 120000, codexWebsockets: false };
       const writeConfig = () => fs.writeFileSync(configPath, JSON.stringify(settings));
       writeConfig();
       fs.writeFileSync(tomlPath, 'model_provider = "fixture"\n[model_providers.fixture]\nname = "Fixture"\n');
@@ -2306,6 +2306,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
       }
     };
     const idleArgs = (call) => call.args.filter((arg) => arg.includes('stream_idle_timeout_ms'));
+    const wsArgs = (call) => call.args.filter((arg) => arg.includes('supports_websockets'));
     scenarios.push(
       [86, 'Codex 流超时：顶层 provider、续跑、重试、monitor 与带点 id', () => withCodexFixture(async ({ tomlPath }) => {
         const toml = "model_provider = 'fixture' # active provider\n[profiles.other]\nmodel_provider = 'inactive'\n";
@@ -2320,10 +2321,13 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const launched = invocationRows().slice(calls).filter((row) => row.command === 'exec');
         check(launched.length === 5 && launched.every((call) => idleArgs(call).join() ===
           'model_providers.fixture.stream_idle_timeout_ms=120000'), '普通/续跑/重试/monitor 未传入正确超时');
+        check(launched.every((call) => wsArgs(call).join() === 'model_providers.fixture.supports_websockets=false'),
+          '普通/续跑/重试/monitor 未关闭 WebSocket');
         check(fs.readFileSync(tomlPath, 'utf8') === toml, '派发修改了 Codex 配置');
         fs.writeFileSync(tomlPath, routeToml());
         exitIs(run('complete'), 0);
-        check(idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000}}',
+        check(idleArgs(invocationRows().at(-1)).join() ===
+          'model_providers={"up.stream"={stream_idle_timeout_ms=120000,supports_websockets=false}}',
           '带点 provider id 未作为单独 TOML 键传入');
       })],
       [87, 'Codex 流超时：默认与内置 provider 不覆盖，禁用与数值校验', () => withCodexFixture(async ({ settings, writeConfig, tomlPath }) => {
@@ -2332,7 +2336,9 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           else fs.writeFileSync(tomlPath, `model_provider = "${provider}"\n`);
           const result = run('complete');
           exitIs(result, 0);
-          check(idleArgs(invocationRows().at(-1)).length === 0 && result.log.includes(`provider ${provider ?? 'openai'} is built-in`),
+          check(idleArgs(invocationRows().at(-1)).length === 0 && wsArgs(invocationRows().at(-1)).length === 0 &&
+            result.log.includes(`codex stream idle timeout: provider ${provider ?? 'openai'} is built-in`) &&
+            result.log.includes(`codex websockets: provider ${provider ?? 'openai'} is built-in`),
             '内置 provider 被覆盖或摘要日志未保留说明');
         }
         fs.rmSync(tomlPath);
@@ -2347,6 +2353,21 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           check(idleArgs(invocationRows().at(-1)).join() === (value ? `model_providers.fixture.stream_idle_timeout_ms=${value}` : ''),
             '零、未设置或自定义超时未按配置生效');
         }
+        for (const value of [true, undefined, false]) {
+          if (value === undefined) delete settings.codexWebsockets;
+          else settings.codexWebsockets = value;
+          writeConfig();
+          exitIs(run('complete'), 0);
+          check(wsArgs(invocationRows().at(-1)).join() === (value === false ? 'model_providers.fixture.supports_websockets=false' : ''),
+            'codexWebsockets 为 true、未设置或 false 时传参不符');
+        }
+        settings.codexWebsockets = 'false';
+        writeConfig();
+        const badWs = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--cwd', repo, '--no-claude'],
+          { env, input: 'AGENT_ROUTE_SELFTEST:complete\n', encoding: 'utf8', timeout: 5000 });
+        exitIs(badWs, 2);
+        check(badWs.stderr.includes('codexWebsockets 必须是布尔值'), '非法 codexWebsockets 未给出配置诊断');
+        settings.codexWebsockets = false;
         const before = invocationRows().length;
         for (const value of [-1, 1.5, '120000']) {
           settings.codexStreamIdleTimeoutMs = value;
@@ -2433,7 +2454,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const result = run('stall-events');
         exitIs(result, 0);
         check(result.record.stall === 3 && result.record.stall_seconds === 210 && appCalls().length === before &&
-          idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000}}',
+          idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000,supports_websockets=false}}',
           'API 路由未统计停顿或调用了订阅额度接口');
         const stream = run('stream-events');
         exitIs(stream, 0);
@@ -2477,7 +2498,9 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           exitIs(result, 0);
           const call = invocationRows().at(-1);
           check(result.record.providers.codex.providerId === 'database-codex' && result.record.providers.codex.route === 'Micu' &&
-            call.args.includes('model_provider="agent_route_micu"') && !result.log.includes(routeKey) &&
+            call.args.includes('model_provider="agent_route_micu"') &&
+            call.args.some((arg) => arg.startsWith('model_providers.agent_route_micu=') && arg.endsWith(',supports_websockets=false}')) &&
+            !result.log.includes(routeKey) &&
             !result.log.includes(routeURL) && !JSON.stringify(result.record).includes(routeKey) &&
             !JSON.stringify(result.record).includes(routeURL) &&
             JSON.parse(fs.readFileSync(path.join(home, 'state', 'provider-spend.json'), 'utf8'))[new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date())].Micu > 0,

@@ -54,11 +54,13 @@ scripts/promote
 
 `AGENT_ROUTE_HOME` 仅供自测覆盖配置与运行目录；设置后忽略 `stateDir`。selftest 使用隔离目录和替身，不调用真实模型。
 
-### Codex 流空闲超时
+### Codex 流空闲超时与传输方式
 
 `config.json` 的 `codexStreamIdleTimeoutMs` 当前为 `120000`，单位为毫秒，用于普通派发、续跑、重试和监控。可在 `config.local.json` 覆盖为非负整数；设为 `0` 不覆盖，合并后的配置缺少该键时也不覆盖。
 
-provider 从当前 Codex 配置目录的 `config.toml` 顶层 `model_provider` 读取；未指定时使用 `openai`。配置目录通常为 `$CODEX_HOME`，未设置时为 `~/.codex`，启用 CC Switch 时跟随当前路由的配置目录。对自定义 provider，通过本次命令的 `-c` 设置 `model_providers.<provider>.stream_idle_timeout_ms`；内置 `openai`、`ollama`、`lmstudio` 跳过覆盖并写入日志。不会修改 Codex 的 `config.toml`，流空闲超时与整个派发的 `codexTimeoutMinutes` 分别控制。
+`config.json` 的 `codexWebsockets` 当前为 `false`：派发时设置 `supports_websockets=false`，Codex 只用 HTTPS 连接 Responses API，不再经过 WebSocket 重连后回退。设为 `true` 或删除该键时沿用 Codex 自身配置。Micu 兜底路由同样只用 HTTPS。
+
+以上两项都按当前 provider 覆盖。provider 从当前 Codex 配置目录的 `config.toml` 顶层 `model_provider` 读取；未指定时使用 `openai`。配置目录通常为 `$CODEX_HOME`，未设置时为 `~/.codex`，启用 CC Switch 时跟随当前路由的配置目录。对自定义 provider，通过本次命令的 `-c` 设置 `model_providers.<provider>.<键>`；内置 `openai`、`ollama`、`lmstudio` 不允许覆盖，跳过并写入日志。不会修改 Codex 的 `config.toml`，流空闲超时与整个派发的 `codexTimeoutMinutes` 分别控制。
 
 ## 派发用法
 
