@@ -54,11 +54,13 @@ scripts/promote
 
 `AGENT_ROUTE_HOME` 仅供自测覆盖配置与运行目录；设置后忽略 `stateDir`。selftest 使用隔离目录和替身，不调用真实模型。
 
-### Codex 流空闲超时
+### Codex 流空闲超时与传输方式
 
 `config.json` 的 `codexStreamIdleTimeoutMs` 当前为 `120000`，单位为毫秒，用于普通派发、续跑、重试和监控。可在 `config.local.json` 覆盖为非负整数；设为 `0` 不覆盖，合并后的配置缺少该键时也不覆盖。
 
-provider 从当前 Codex 配置目录的 `config.toml` 顶层 `model_provider` 读取；未指定时使用 `openai`。配置目录通常为 `$CODEX_HOME`，未设置时为 `~/.codex`，启用 CC Switch 时跟随当前路由的配置目录。对自定义 provider，通过本次命令的 `-c` 设置 `model_providers.<provider>.stream_idle_timeout_ms`；内置 `openai`、`ollama`、`lmstudio` 跳过覆盖并写入日志。不会修改 Codex 的 `config.toml`，流空闲超时与整个派发的 `codexTimeoutMinutes` 分别控制。
+`config.json` 的 `codexWebsockets` 当前为 `false`：派发时设置 `supports_websockets=false`，Codex 只用 HTTPS 连接 Responses API，不再经过 WebSocket 重连后回退。设为 `true` 或删除该键时沿用 Codex 自身配置。Micu 兜底路由同样只用 HTTPS。
+
+以上两项都按当前 provider 覆盖。provider 从当前 Codex 配置目录的 `config.toml` 顶层 `model_provider` 读取；未指定时使用 `openai`。配置目录通常为 `$CODEX_HOME`，未设置时为 `~/.codex`，启用 CC Switch 时跟随当前路由的配置目录。对自定义 provider，通过本次命令的 `-c` 设置 `model_providers.<provider>.<键>`；内置 `openai`、`ollama`、`lmstudio` 不允许覆盖，跳过并写入日志。不会修改 Codex 的 `config.toml`，流空闲超时与整个派发的 `codexTimeoutMinutes` 分别控制。
 
 ## 派发用法
 
@@ -110,11 +112,11 @@ Micu 每日花费是软上限，默认 `dailyBudgetUsd: 5`。达到上限或模�
 
 全部路由不可用时，脚本计算官方额度、熔断、Micu 次日预算和 Claude 日线的最早恢复时间。最早恢复在 `claudePacing.maxAutoWaitMinutes`（默认 30 分钟）内会自动等待并重新选路；更久则输出 `LIMIT`、退出码 15，主 agent 应单独向用户确认，必要时再用 `--urgent`。`--no-claude` 不等待，直接输出 `FALLBACK` 或 `LIMIT`。
 
-可观测命令：`status` 显示额度、Claude 日线与剩余、重置券、熔断和 Micu 花费；`route <tier1|tier2> --explain` 只预演候选顺序与阻塞原因，不派发、不使用重置券；`stats [--days N]` 除模型分组外显示按路由派发次数、用券次数、Micu 当日花费和两边周额度剩余。
+可观测命令：`status` 显示额度、Claude 日线与剩余、重置券、熔断和 Micu 花费；`route <tier1|tier2> --explain` 只预演候选顺序与阻塞原因，不派发、不使用重置券；`stats [--days N]` 除模型分组外显示按路由派发次数、用券次数、Micu 当日花费和两边周额度剩余；`stats --failures [--days N] [--version SHA]` 按版本和失败类别汇总失败，忽略 status 为空的运行中或中间尝试起始记录，以同一派发的最终 attempt 记录为准，并列出最近 10 次失败及停顿、看门狗续跑统计，`--version` 按前缀筛选。
 
 Codex 续跑失败会先重试同一会话，再携带原任务和新增要求开新线程，最终失败才进入下一条路由；每次尝试写入日志与 history 的 `attempt` 字段。
 
-官方 Codex 默认启用卡住看门狗（`codexStallWatchdog.seconds: 150`、`maxResumes: 2`）。rollout 表明正在等模型且没有进行中的工具调用时，超过阈值会结束当前进程并用同一 session 续跑；Micu 不启用。设置 `enabled: false` 可关闭。
+官方 Codex 默认启用卡住看门狗（`codexStallWatchdog.seconds: 150`、`maxResumes: 2`）。rollout 表明正在等模型且没有进行中的工具调用时，超过阈值会结束当前进程并用同一 session 续跑；每次续跑后的首次等模型阶段不监视，达到续跑上限后停止监视并让 Codex 自身的流空闲超时处理；看门狗主动结束请求不计为失败，也不会触发冷却或转交，续跑后的结果按正常流程处理。Micu 不启用。设置 `enabled: false` 可关闭。
 
 ### 关键配置
 
@@ -131,11 +133,11 @@ Codex 续跑失败会先重试同一会话，再携带原任务和新增要求�
 ~/.claude/agent-route/bin/agent-route clear-cooldown
 ```
 
-`status` 查看版本、目录、额度、冷却与路由；`stats` 按 tier / 模型和最终路由汇总，`--days` 只接受正整数；`route <tier> --explain` 只读预演选路；`clear-cooldown` 清空模型冷却及当前 Codex 路由的限额记录。
+`status` 查看版本、目录、额度、冷却与路由；`stats` 按 tier / 模型和最终路由汇总，`--days` 只接受正整数；`stats --failures` 忽略 status 为空的记录，同一派发有后续 attempt 时按最终记录统计，旧记录缺少版本时显示为 `unknown`；`route <tier> --explain` 只读预演选路；`clear-cooldown` 清空模型冷却及当前 Codex 路由的限额记录。
 
 ### 日志与 footer
 
-每次派发在脚本根目录的 `logs/` 写入 `<id>.log`、`<id>.prompt.md`，需要长明细时使用 `<id>.report.md`；history 保存在实际状态目录的 `history.jsonl`。配置 `logMode: "summary"` 时，成功且无 `WARNING` 的派发只保留摘要日志，仍保留完整汇报和最多 20 行重连诊断。
+每次派发在脚本根目录的 `logs/` 写入 `<id>.log`、`<id>.prompt.md`，需要长明细时使用 `<id>.report.md`；history 保存在实际状态目录的 `history.jsonl`，每行记录启动版本的前 7 位提交号（无法确认时为 `null`）。配置 `logMode: "summary"` 时，成功且无 `WARNING` 的派发只保留摘要日志，仍保留完整汇报和最多 20 行重连诊断。
 
 终端 footer 显示实际模型、effort、耗时、token 数、状态和日志 id，并按需追加：
 
@@ -144,7 +146,7 @@ Codex 续跑失败会先重试同一会话，再携带原任务和新增要求�
 | `reconnect N` | Codex 标准错误和事件流中匹配 `Reconnecting`、`stream disconnected`、`retry` 的行数，不区分大小写；同一行多次匹配只计一次。 |
 | `capacity N` | 匹配 `at capacity` 的行数；一行可同时计入重连与容量统计。两项均为 `0` 时均不显示，否则同时显示。 |
 | `stall N/Xs` | 会话 rollout 中相邻事件间隔至少 60 秒、且对应步骤输出 token 少于 500 的停顿次数与总秒数；只统计本次执行，次数为 `0` 时隐藏，缺少 token 元数据时不推测。 |
-| `watchdog N/Xs` | 官方 rollout 看门狗触发的同 session 续跑次数与触发前累计等待秒数；没有触发时隐藏。工具调用尚未返回时不会触发。 |
+| `watchdog N/Xs` | 官方 rollout 看门狗触发的同 session 续跑次数与触发前累计等待秒数；没有触发时隐藏。每次续跑后的首次等模型阶段不计时，达到上限后停止监视；工具调用尚未返回时不会触发。 |
 
 history 对应字段为 `reconnect`、`capacity`、`stall`、`stall_seconds`、`watchdog`、`watchdog_seconds`。这些是运行诊断计数；footer 的省略表示该项为零，或本次没有可统计的停顿数据。
 

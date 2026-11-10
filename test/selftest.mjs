@@ -571,6 +571,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           samePath(record.cwd, repo) && Number.isFinite(Date.parse(record.time)) && record.elapsed >= 0,
           'history 字段值不符');
         check(record.resumed_from === null, '普通派发的 resumed_from 应为空');
+        check(typeof record.version === 'string' && /^[0-9a-f]{7}$/i.test(record.version), 'history 未记录启动版本前 7 位');
         check(result.log.includes(`session id: ${record.session}`) &&
           /^finish: .*elapsed=\d+ .*session=[0-9a-f-]{36}/m.test(result.log), '摘要缺少 session 或 finish 的 elapsed/session');
         const monitored = run('monitor', ['--monitor']);
@@ -614,6 +615,43 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(history().length === count + 2, '重复 stats 导致重复回填');
         fs.unlinkSync(path.join(home, 'logs', `${legacyId}.log`));
         check(runStats().includes('legacy-model'), '删除日志后 history 统计丢失');
+      }],
+      [9.1, '失败 stats 按版本、分类和最近记录汇总', () => {
+        const saved = fs.existsSync(historyPath) ? fs.readFileSync(historyPath, 'utf8') : '';
+        const now = new Date().toISOString();
+        const rows = [
+          { log_id: 'failure-stats-1', time: now, version: 'abcdef1', tier: 'tier1', executor: 'codex',
+            providers: { codex: { route: 'official' } }, failure_class: 'capacity', status: 'error', exit_code: 12,
+            stall: 2, stall_seconds: 30, watchdog: 1 },
+          { log_id: 'failure-stats-2', time: now, version: 'abcdef2', tier: 'tier2', executor: 'codex',
+            providers: { codex: { route: 'Micu' } }, failure_class: '官方 5h', status: 'complete', fallback: true,
+            attempt: 'route micu', exit_code: 0, stall: 3, stall_seconds: 45, watchdog: 2 },
+          { log_id: 'failure-stats-3', time: now, version: 'abcdef3', tier: 'tier1', executor: 'codex',
+            status: 'complete', exit_code: 0 },
+          { log_id: 'failure-stats-4', time: now, tier: 'tier1', executor: 'claude', status: 'partial', exit_code: 11 },
+          { log_id: 'failure-stats-running', time: now, version: 'abcdef1', tier: 'tier1', executor: 'codex',
+            failure_class: 'capacity', status: null, exit_code: null },
+          { log_id: 'failure-stats-running-attempt1', time: now, version: 'abcdef4', tier: 'tier1', executor: 'codex',
+            failure_class: null, status: 'complete', attempt: 'watchdog 1', exit_code: 0 },
+        ];
+        try {
+          fs.writeFileSync(historyPath, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+          const result = spawnSync(process.execPath, [SCRIPT_PATH, 'stats', '--failures', '--days', '1'],
+            { env, cwd: home, encoding: 'utf8', timeout: 5000 });
+          exitIs(result, 0);
+          check(/version\s+failure_class/.test(result.stdout) && /abcdef1\s+capacity\s+1/.test(result.stdout) &&
+            /abcdef2\s+官方 5h\s+1/.test(result.stdout) && /unknown\s+unclassified\s+\d+/.test(result.stdout) &&
+            /abcdef4\s+unclassified\s+1/.test(result.stdout) &&
+            !result.stdout.split('\n').some((line) => line.endsWith('failure-stats-running')) &&
+            !result.stdout.includes('abcdef3'), `失败 stats 汇总不符: ${result.stdout}`);
+          check(result.stdout.includes('recent failures') && result.stdout.includes('failure-stats-2') &&
+            result.stdout.includes('summary: stall 5/75s; watchdog 3'), '失败 stats 明细或诊断汇总不符');
+          const filtered = spawnSync(process.execPath, [SCRIPT_PATH, 'stats', '--failures', '--version', 'abcdef1'],
+            { env, cwd: home, encoding: 'utf8', timeout: 5000 });
+          exitIs(filtered, 0);
+          check(/abcdef1\s+capacity\s+1/.test(filtered.stdout) && !filtered.stdout.includes('abcdef2'),
+            '失败 stats 的 --version 未按前缀筛选');
+        } finally { fs.writeFileSync(historyPath, saved); }
       }],
       [10, '日志 id 续跑、工作目录和本次权限', () => {
         const source = run('complete', ['--write', '--cwd', repoAlias]);
@@ -2256,7 +2294,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
       const tomlPath = path.join(env.CODEX_HOME, 'config.toml');
       const originalConfig = fs.readFileSync(configPath, 'utf8');
       const originalToml = fs.existsSync(tomlPath) ? fs.readFileSync(tomlPath, 'utf8') : null;
-      const settings = { ...config, codexStreamIdleTimeoutMs: 120000 };
+      const settings = { ...config, codexStreamIdleTimeoutMs: 120000, codexWebsockets: false };
       const writeConfig = () => fs.writeFileSync(configPath, JSON.stringify(settings));
       writeConfig();
       fs.writeFileSync(tomlPath, 'model_provider = "fixture"\n[model_providers.fixture]\nname = "Fixture"\n');
@@ -2268,6 +2306,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
       }
     };
     const idleArgs = (call) => call.args.filter((arg) => arg.includes('stream_idle_timeout_ms'));
+    const wsArgs = (call) => call.args.filter((arg) => arg.includes('supports_websockets'));
     scenarios.push(
       [86, 'Codex 流超时：顶层 provider、续跑、重试、monitor 与带点 id', () => withCodexFixture(async ({ tomlPath }) => {
         const toml = "model_provider = 'fixture' # active provider\n[profiles.other]\nmodel_provider = 'inactive'\n";
@@ -2282,10 +2321,13 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const launched = invocationRows().slice(calls).filter((row) => row.command === 'exec');
         check(launched.length === 5 && launched.every((call) => idleArgs(call).join() ===
           'model_providers.fixture.stream_idle_timeout_ms=120000'), '普通/续跑/重试/monitor 未传入正确超时');
+        check(launched.every((call) => wsArgs(call).join() === 'model_providers.fixture.supports_websockets=false'),
+          '普通/续跑/重试/monitor 未关闭 WebSocket');
         check(fs.readFileSync(tomlPath, 'utf8') === toml, '派发修改了 Codex 配置');
         fs.writeFileSync(tomlPath, routeToml());
         exitIs(run('complete'), 0);
-        check(idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000}}',
+        check(idleArgs(invocationRows().at(-1)).join() ===
+          'model_providers={"up.stream"={stream_idle_timeout_ms=120000,supports_websockets=false}}',
           '带点 provider id 未作为单独 TOML 键传入');
       })],
       [87, 'Codex 流超时：默认与内置 provider 不覆盖，禁用与数值校验', () => withCodexFixture(async ({ settings, writeConfig, tomlPath }) => {
@@ -2294,7 +2336,9 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           else fs.writeFileSync(tomlPath, `model_provider = "${provider}"\n`);
           const result = run('complete');
           exitIs(result, 0);
-          check(idleArgs(invocationRows().at(-1)).length === 0 && result.log.includes(`provider ${provider ?? 'openai'} is built-in`),
+          check(idleArgs(invocationRows().at(-1)).length === 0 && wsArgs(invocationRows().at(-1)).length === 0 &&
+            result.log.includes(`codex stream idle timeout: provider ${provider ?? 'openai'} is built-in`) &&
+            result.log.includes(`codex websockets: provider ${provider ?? 'openai'} is built-in`),
             '内置 provider 被覆盖或摘要日志未保留说明');
         }
         fs.rmSync(tomlPath);
@@ -2309,6 +2353,21 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           check(idleArgs(invocationRows().at(-1)).join() === (value ? `model_providers.fixture.stream_idle_timeout_ms=${value}` : ''),
             '零、未设置或自定义超时未按配置生效');
         }
+        for (const value of [true, undefined, false]) {
+          if (value === undefined) delete settings.codexWebsockets;
+          else settings.codexWebsockets = value;
+          writeConfig();
+          exitIs(run('complete'), 0);
+          check(wsArgs(invocationRows().at(-1)).join() === (value === false ? 'model_providers.fixture.supports_websockets=false' : ''),
+            'codexWebsockets 为 true、未设置或 false 时传参不符');
+        }
+        settings.codexWebsockets = 'false';
+        writeConfig();
+        const badWs = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--cwd', repo, '--no-claude'],
+          { env, input: 'AGENT_ROUTE_SELFTEST:complete\n', encoding: 'utf8', timeout: 5000 });
+        exitIs(badWs, 2);
+        check(badWs.stderr.includes('codexWebsockets 必须是布尔值'), '非法 codexWebsockets 未给出配置诊断');
+        settings.codexWebsockets = false;
         const before = invocationRows().length;
         for (const value of [-1, 1.5, '120000']) {
           settings.codexStreamIdleTimeoutMs = value;
@@ -2372,6 +2431,17 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const command = run('watchdog-command', [], false, { timeout: 5000 });
         exitIs(command, 0);
         check(command.record.watchdog === 0 && !command.footer.includes('watchdog'), '工具调用未返回时错误触发看门狗');
+        clearCircuit();
+        const maxComplete = run('watchdog-max-complete', [], false, { timeout: 5000 });
+        exitIs(maxComplete, 0);
+        check(maxComplete.record.watchdog === 2 && maxComplete.record.status === 'complete' &&
+          !fs.existsSync(cooldownPath) && !fs.existsSync(circuitPath),
+          '达到看门狗续跑上限后未继续等待并正常完成');
+        const warmup = run('watchdog-warmup', [], false, { timeout: 5000 });
+        exitIs(warmup, 0);
+        const warmupLogs = allLogs(warmup);
+        check(warmup.record.watchdog === 2 && (warmupLogs.match(/^watchdog \d+\//gm) ?? []).length === 2,
+          '续跑后的首次等模型仍触发看门狗或后续等待未恢复监视');
         const limited = run('watchdog-capacity', [], false, { timeout: 5000 });
         exitIs(limited, 10);
         const limitedLogs = allLogs(limited);
@@ -2384,7 +2454,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const result = run('stall-events');
         exitIs(result, 0);
         check(result.record.stall === 3 && result.record.stall_seconds === 210 && appCalls().length === before &&
-          idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000}}',
+          idleArgs(invocationRows().at(-1)).join() === 'model_providers={"up.stream"={stream_idle_timeout_ms=120000,supports_websockets=false}}',
           'API 路由未统计停顿或调用了订阅额度接口');
         const stream = run('stream-events');
         exitIs(stream, 0);
@@ -2428,7 +2498,9 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           exitIs(result, 0);
           const call = invocationRows().at(-1);
           check(result.record.providers.codex.providerId === 'database-codex' && result.record.providers.codex.route === 'Micu' &&
-            call.args.includes('model_provider="agent_route_micu"') && !result.log.includes(routeKey) &&
+            call.args.includes('model_provider="agent_route_micu"') &&
+            call.args.some((arg) => arg.startsWith('model_providers.agent_route_micu=') && arg.endsWith(',supports_websockets=false}')) &&
+            !result.log.includes(routeKey) &&
             !result.log.includes(routeURL) && !JSON.stringify(result.record).includes(routeKey) &&
             !JSON.stringify(result.record).includes(routeURL) &&
             JSON.parse(fs.readFileSync(path.join(home, 'state', 'provider-spend.json'), 'utf8'))[new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Singapore' }).format(new Date())].Micu > 0,
