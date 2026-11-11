@@ -119,8 +119,9 @@
   },
   "codexResetCredits": {
     "auto": true,
-    "minWaitHours": 24,
+    "minWaitHours": 36,
     "weeklyPercentForExpiring": 80,
-    "expiringDays": 3
+    "expiringDays": 3,
+    "claudeWeeklyPercent": 60
   }
 }
