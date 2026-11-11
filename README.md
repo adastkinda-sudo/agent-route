@@ -106,6 +106,7 @@ EOF
 | `--no-claude` | 禁止自动交给 Claude；Codex 失败时输出 `FALLBACK`，额度受限时输出 `LIMIT`。 |
 | `--claude` | 直接调用 Claude，不能与 `--resume`、`--no-claude`、`--monitor` 同用。 |
 | `--urgent` | 按正常顺序选路；仅当所有路由不可用时动用 Claude 应急保留，周用量上限为 `claudePacing.urgentMaxPercent`（默认 95%）。不能与 `--claude`、`--no-claude`、`--monitor` 同用。 |
+| `--reset-credit` | 官方订阅受限（5h、周或保留线）时，跳过 `codexResetCredits` 的阈值规则，直接用最早到期的一张重置券；`auto: false` 时同样生效。未受限、没有可用券或 `forced-test` 模拟限额时不用。不能与 `--claude` 同用。 |
 | `--ignore-budget` | 本次允许使用已达兜底服务商每日软上限或缺少单价的模型，花费仍照常记账；不能与 `--claude` 同用。 |
 | `--effort LEVEL` | 覆盖本次 Codex 的 effort：`none`、`minimal`、`low`、`medium`、`high`、`xhigh`；不影响 Claude。 |
 | `--exclude PATH` | 只读核对时排除相对工作目录的路径，可重复；也支持配置 `readOnlyExclude`。日志与状态目录在工作目录内时自动排除。 |
@@ -118,6 +119,13 @@ EOF
 ### 路由顺序与限额
 
 普通派发的顺序是 **Codex 官方 → Claude → 兜底服务商**。官方 Codex 按 `tiers.<tier>.codex.models` 的顺序尝试候选模型；兜底服务商按 `codexFallback.providers` 的顺序和各自的候选模型尝试。官方 5h/周限额、保留线和熔断会跳过相应路由，额度或冷却结束后自动恢复。`status` 显示每条路由的熔断剩余时间和兜底服务商当日花费。
+
+官方重置券（`codexResetCredits`，`auto` 为 true 时生效）的用券规则：
+
+- 5h 限额：周用量达到 `weeklyPercentForExpiring`（默认 80%），且券在 `expiringDays`（默认 3 天）内到期，才用券；否则不用。
+- 周限额：距官方周额度重置超过 `minWaitHours`（默认 36 小时），且满足以下任一条件才用券：Claude 周用量超过 `claudeWeeklyPercent`（默认 60%）；读不到 Claude 用量或读数已过期；按 `claudePacing` 本次不能用 Claude；没有 Claude 候选（`--no-claude`）或 Claude 不是订阅账号；选中的券在 `expiringDays` 内到期。以上都不满足时不用券，交给 Claude。距重置不超过 `minWaitHours` 时同样不用券。
+
+每次派发最多尝试一次用券，判断在 `route.lock` 内完成，用券后重新读取额度确认已重置；未确认则转下一条路由。日志会写明用券或跳过的原因。
 
 Claude 订阅的正常派发受 `claudePacing` 每日用量线和 5h 上限约束。用量来自一次最小的 `claude -p --output-format stream-json --verbose` 调用中的 `rate_limit_event.rate_limit_info.unifiedWindows`，读取 `five_hour` 和 `seven_day` 的 utilization、resetsAt；这些字段属于 Claude Code 的 **@internal** 数据接口，版本升级可能改名、缺失或改变语义。读数超过 `staleMinutes`（默认 60 分钟）或字段不完整时，普通派发不使用 Claude，并转到兜底服务商；`--claude` 和耗尽时的 `--urgent` 只在能读取到足够的周限额信息时动用应急保留。
 
@@ -134,7 +142,7 @@ Codex 续跑失败会先重试同一会话，再携带原任务和新增要求�
 ### 关键配置
 
 - `tiers.*.codex.models` 按顺序列出官方候选；保留 `model` 单值也兼容。`codexFallback.providers[]` 用 `ccSwitchId` 指定 CC Switch 中的兜底服务商，`models` 列出各 tier 的候选，`retryOfficialMinutes`、`capacityBackoffSeconds` 和 `dailyBudgetUsd` 控制重试、退避和每日软上限。
-- `codexCircuit` 控制 capacity、服务端故障和认证故障的连续失败阈值、熔断时长及单次派发的最大切换次数；`codexResetCredits.auto` 控制是否自动使用官方额度重置券。
+- `codexCircuit` 控制 capacity、服务端故障和认证故障的连续失败阈值、熔断时长及单次派发的最大切换次数；`codexResetCredits.auto` 控制是否自动使用官方额度重置券；`minWaitHours`、`weeklyPercentForExpiring`、`expiringDays` 和 `claudeWeeklyPercent`（0–100，默认 60）是用券阈值，见上文“路由顺序与限额”。
 - `claudePacing` 控制日线起始时间、保留比例、5h 上限、最后 36 小时窗口、`urgentMaxPercent`、过期时间和自动等待上限。未知或过期的 Claude 用量读数不会阻塞 `--claude`，但普通路由会跳过 Claude。
 - `codexPricing` 提供兜底服务商花费估算的输入、缓存输入和输出单价；缺少模型单价时只有 `--ignore-budget` 会使用该模型。
 - `codexStallWatchdog` 控制官方 rollout 看门狗的开关、无事件阈值秒数和同一派发最多续跑次数。

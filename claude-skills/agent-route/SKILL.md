@@ -20,6 +20,7 @@ description: 用 agent-route 派发执行文档中标注了 tier1/tier2/tier3 �
 - Claude 正常派发受每日用量线和 5h 上限约束。用量探测来自 `claude -p --output-format stream-json --verbose` 的 `rate_limit_event.rate_limit_info.unifiedWindows`（`five_hour`、`seven_day`）；这些字段属于 Claude Code 的 **@internal** 接口，版本变化可能导致字段缺失或语义改变。读数超过 `staleMinutes`（默认 60 分钟）时普通派发跳过 Claude。
 - `--urgent` 仍按正常顺序选路，只在全部路由不可用时动用 Claude 应急保留，周用量上限默认 95%；`--claude` 直接走 Claude 并使用同一应急上限。`--ignore-budget` 越过兜底服务商的每日花费软上限和缺少单价的限制，不能与 `--claude` 同用。
 - `--resume` 继续原 Claude 任务时按普通每日用量线、余量和 5h 上限检查；不满足时输出 `LIMIT`，由我确认后再用 `--urgent` 重跑。
+- `--reset-credit` 只在用户明确要求时使用：官方受限（5h、周或保留线）时跳过用券阈值，直接用一张重置券恢复官方额度；未受限或没有可用券时不用。
 - 官方 Codex 启用 `codexStallWatchdog`（默认 150 秒、最多同 session 续跑 2 次）；rollout 等模型且没有进行中的工具调用时触发，工具调用未返回不触发，兜底服务商不启用。
 - 全部路由不可用且最早恢复在 `maxAutoWaitMinutes`（默认 30 分钟）内时自动等待后重选；超过该时间输出 `LIMIT` 块（退出码 15），把恢复时间和可用的 `--urgent` 告诉我，由主 agent 单独向用户确认。`--no-claude` 不等待，直接输出 `FALLBACK` 或 `LIMIT`。
 - 输出 `ERROR` 块时，把错误转告我，不自己派 subagent 重试。`ERROR` 提示找不到 claude 或 codex 时，先运行一次 `~/.claude/agent-route/bin/agent-route setup` 重新探测，仍失败再转告我。

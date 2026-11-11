@@ -228,7 +228,10 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     const providerLimitPath = path.join(home, 'state', 'provider-limit.json');
     const providerStates = () => fs.existsSync(providerLimitPath) ? JSON.parse(fs.readFileSync(providerLimitPath, 'utf8')).providers : {};
     const cooldownPath = path.join(home, 'state', 'cooldown.json');
-    const invocationRows = () => fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    const invocationRows = () => {
+      try { return fs.readFileSync(path.join(home, 'stub-invocations.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); }
+      catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    };
     const circuitPath = path.join(home, 'state', 'circuit.json');
     const unavailablePath = path.join(home, 'state', 'model-unavailable.json');
     const tokenUsagePath = path.join(home, 'stub-token-usage.json');
@@ -453,7 +456,8 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         try {
           for (const [value, message] of [[{ auto: 'yes' }, 'codexResetCredits.auto 必须是布尔值'],
             [{ minWaitHours: -1 }, 'codexResetCredits.minWaitHours 必须是非负数'],
-            [{ weeklyPercentForExpiring: 120 }, 'codexResetCredits.weeklyPercentForExpiring 必须是 0–100 的数值']]) {
+            [{ weeklyPercentForExpiring: 120 }, 'codexResetCredits.weeklyPercentForExpiring 必须是 0–100 的数值'],
+            [{ claudeWeeklyPercent: 120 }, 'codexResetCredits.claudeWeeklyPercent 必须是 0–100 的数值']]) {
             const invalid = JSON.parse(savedConfig);
             invalid.codexResetCredits = value;
             fs.writeFileSync(configPath, JSON.stringify(invalid));
@@ -2751,7 +2755,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           return { result, consumed: consumeRows().slice(consumed), calls: execCalls(mark), logs: allLogs(result) };
         };
         try {
-          // 周限额且离重置超过 24 小时：用最早到期的券，二次读取确认后在官方重跑，不转 Micu。
+          // 周限额且离重置超过 36 小时（--no-claude，Claude 不在候选里）：用最早到期的券，二次读取确认后在官方重跑，不转 Micu。
           let r = scenario({ primaryUsed: 50, weeklyUsed: 100, credits: twoCredits });
           exitIs(r.result, 0);
           check(r.consumed.length === 1 && r.consumed[0].creditId === twoCredits[1].id && /^[0-9a-f-]{36}$/.test(r.consumed[0].idempotencyKey) &&
@@ -2769,7 +2773,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           const none = [
             ['5h 限额、周用量 85%、券 100 小时后才到期', { primaryUsed: 100, weeklyUsed: 85, credits: credits(['dddddddd-0000-0000-0000-000000000004', 100]) }],
             ['5h 限额、周用量 50%、券将到期', { primaryUsed: 100, weeklyUsed: 50, credits: credits(['eeeeeeee-0000-0000-0000-000000000005', 10]) }],
-            ['周限额但 12 小时后重置', { primaryUsed: 50, weeklyUsed: 100, weeklyResetsAt: hours(12), credits: twoCredits }],
+            ['周限额但 30 小时后重置', { primaryUsed: 50, weeklyUsed: 100, weeklyResetsAt: hours(30), credits: twoCredits }],
             ['没有券', { primaryUsed: 100, weeklyUsed: 100 }],
             ['券已用完', { primaryUsed: 50, weeklyUsed: 100, credits: [{ id: 'ffffffff-0000-0000-0000-000000000006', status: 'redeemed', expiresInHours: 10 }] }],
             ['券已过期', { primaryUsed: 50, weeklyUsed: 100, credits: credits(['11111111-0000-0000-0000-000000000007', -1]) }],
@@ -2834,6 +2838,106 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           routeConfig.codexResetCredits = savedCredits;
           fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
           delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+          fs.rmSync(settingsFile, { force: true });
+        }
+      })],
+      [100.5, '重置券：周限额按 Claude 周用量与可接手性判断，--reset-credit 强制用券', () => withMicuRoutes(async () => {
+        useBothSubscriptions();
+        const settingsFile = path.join(home, 'stub-rate-limits.json');
+        const notifyFile = path.join(home, 'notifications.jsonl');
+        const hours = (value) => Math.floor(Date.now() / 1000) + Math.round(value * 3600);
+        const consumeRows = () => {
+          try { return fs.readFileSync(path.join(home, 'stub-app-server.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.event === 'consume'); }
+          catch { return []; }
+        };
+        const savedCredits = routeConfig.codexResetCredits;
+        const setCredits = (value) => {
+          routeConfig.codexResetCredits = { ...savedCredits, ...value };
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
+        };
+        setCredits({ auto: true });
+        const credits = (...items) => items.map(([id, expiresInHours]) => ({ id, expiresInHours }));
+        const longCredit = credits(['aaaaaaaa-0000-0000-0000-000000000001', 100]);
+        // usage：[周用量 %, 选项] 写入 Claude 用量 stub；null 表示读不到。
+        const scenario = (state, { claude = true, args = [], usage = null } = {}) => {
+          writeJSON(settingsFile, state);
+          fs.rmSync(notifyFile, { force: true });
+          fs.rmSync(path.join(home, 'state', 'claude-pacing.json'), { force: true });
+          if (usage === null) claudeUsage(null); else claudeUsage(usage[0], usage[1]);
+          const consumed = consumeRows().length;
+          const mark = invocationRows().length;
+          const result = run('route:limit:ok', args, claude);
+          return { result, consumed: consumeRows().slice(consumed), calls: execCalls(mark), logs: allLogs(result) };
+        };
+        const used = (r, why, pattern) => {
+          exitIs(r.result, 0);
+          check(r.consumed.length === 1 && r.calls.length === 2 && r.calls.every((row) => !isMicu(row)) && r.result.record.executor === 'codex' &&
+            r.result.record.reset_credit.outcome === 'reset' && r.result.record.reset_credit.confirmed === true && pattern.test(r.logs),
+          `${why}：应用券并在官方重跑: ${r.consumed.length} ${r.calls.length} ${r.logs}`);
+        };
+        const skipped = (r, why, pattern) => {
+          exitIs(r.result, 0);
+          check(r.consumed.length === 0 && r.result.record.reset_credit === undefined && r.result.record.executor === 'claude' && pattern.test(r.logs),
+            `${why}：不应用券而应转 Claude: ${r.consumed.length} ${r.result.record.executor} ${r.logs}`);
+        };
+        try {
+          const weekly = { primaryUsed: 50, weeklyUsed: 100, credits: longCredit };
+          used(scenario(weekly, { usage: null }), 'Claude 用量读不到', /claude cannot take over \(usage-stale\)/);
+          used(scenario(weekly, { usage: [70] }), 'Claude 周用量 70%', /claude weekly 70% > 60%/);
+          used(scenario(weekly, { usage: [40, { five: 99 }] }), 'Claude 周用量 40% 但 5h 超线', /claude cannot take over \(5h 99%/);
+          used(scenario({ ...weekly, credits: credits(['bbbbbbbb-0000-0000-0000-000000000002', 48]) }, { usage: [40] }), '券 2 天内到期', /credit expiring/);
+          used(scenario(weekly, { claude: false, usage: [40] }), '--no-claude', /claude cannot take over \(no claude candidate\)/);
+          skipped(scenario(weekly, { usage: [40] }), 'Claude 周用量 40% 且可接手', /reset credit: skipped \(weekly resets in \d+h, claude weekly 40% <= 60% and available\)/);
+          skipped(scenario({ ...weekly, weeklyResetsAt: hours(30) }, { usage: [70] }), '30 小时后重置', /reset credit: skipped \(weekly resets in 30h <= 36h\)/);
+          // 阈值可配置。
+          setCredits({ auto: true, claudeWeeklyPercent: 30 });
+          used(scenario(weekly, { usage: [40] }), 'claudeWeeklyPercent 调为 30', /claude weekly 40% > 30%/);
+          setCredits({ auto: true });
+
+          // --reset-credit：官方受限时跳过阈值，用最早到期的券并记录 forced。
+          let r = scenario({ primaryUsed: 100, weeklyUsed: 50, credits: longCredit }, { claude: false, args: ['--reset-credit'] });
+          used(r, '5h 限额 + 周用量 50% + 券 100 小时后到期', /reset credit: reset aaaaaaaa expires \S+ \(forced, /);
+          check(r.result.record.reset_credit.forced === true, '强制用券应在 history 记录 forced');
+          check(/强制用券/.test(fs.readFileSync(notifyFile, 'utf8')), '强制用券的通知应标出强制');
+          r = scenario({ primaryUsed: 100, weeklyUsed: 50, credits: longCredit }, { claude: false });
+          check(r.consumed.length === 0 && r.result.record.reset_credit === undefined && isMicu(r.calls[1]), '不加 --reset-credit 时同一场景不用券');
+          // 周限额 30 小时后重置、Claude 可接手：强制仍然用券，且不读取 Claude 用量。
+          r = scenario({ primaryUsed: 50, weeklyUsed: 100, weeklyResetsAt: hours(30), credits: longCredit }, { args: ['--reset-credit'], usage: [40] });
+          used(r, '强制 + 周限额 30 小时（Claude 周用量 40% 可接手）', /reset credit: reset aaaaaaaa expires \S+ \(forced, weekly limit\)/);
+          // auto:false 时强制同样生效，不加参数则不用。
+          setCredits({ auto: false });
+          r = scenario({ primaryUsed: 100, weeklyUsed: 50, credits: longCredit }, { claude: false, args: ['--reset-credit'] });
+          used(r, 'auto:false + 强制', /\(forced, /);
+          check(r.result.record.reset_credit.forced === true, 'auto:false 下强制用券应记录 forced');
+          r = scenario({ primaryUsed: 100, weeklyUsed: 50, credits: longCredit }, { claude: false });
+          check(r.consumed.length === 0 && isMicu(r.calls[1]), 'auto:false 不加 --reset-credit 不应用券');
+          setCredits({ auto: true });
+          // 官方未受限：不用券。
+          r = scenario({ primaryUsed: 10, weeklyUsed: 10, credits: longCredit }, { claude: false, args: ['--reset-credit'] });
+          check(r.consumed.length === 0 && r.result.record.reset_credit === undefined && r.logs.includes('reset credit: skipped (not limited)'),
+            `未受限时强制用券不应用券: ${r.logs}`);
+          // 没有可用券：转下一路由。
+          r = scenario({ primaryUsed: 100, weeklyUsed: 100 }, { claude: false, args: ['--reset-credit'] });
+          check(r.consumed.length === 0 && r.calls.length === 2 && isMicu(r.calls[1]) && r.logs.includes('reset credit: skipped (no available credit)'),
+            `无券时强制用券应转 Micu: ${r.logs}`);
+          // forced-test 模拟限额不用券。
+          env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT = '1';
+          writeJSON(settingsFile, { primaryUsed: 100, weeklyUsed: 100, credits: longCredit });
+          const forcedMark = invocationRows().length;
+          const forcedConsumed = consumeRows().length;
+          const forcedTest = run('complete', ['--reset-credit']);
+          delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+          exitIs(forcedTest, 0);
+          check(consumeRows().length === forcedConsumed && isMicu(execCalls(forcedMark)[0]), '强制限额开关下 --reset-credit 不应用券');
+          // 与 --claude 互斥。
+          const conflict = spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--claude', '--reset-credit', '--cwd', repo],
+            { env, cwd: home, input: 'x\n', encoding: 'utf8', timeout: 8000 });
+          exitIs(conflict, 2);
+          check(conflict.stderr.includes('--reset-credit 不能与 --claude 同用'), `--claude 与 --reset-credit 同用应报参数错误: ${conflict.stderr}`);
+        } finally {
+          delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
+          routeConfig.codexResetCredits = savedCredits;
+          fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
           fs.rmSync(settingsFile, { force: true });
         }
       })],
@@ -3153,7 +3257,10 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
           /claude pacing\[normal\]: block usage-stale/.test(allLogs(malformed)), '用量字段格式变化时普通路由未降级');
       })],
     );
+    // AGENT_ROUTE_SELFTEST_ONLY=100,100.5 只运行指定编号的用例（调试用）。
+    const only = process.env.AGENT_ROUTE_SELFTEST_ONLY?.split(',').map((item) => item.trim()).filter(Boolean);
     for (const [id, name, test] of scenarios) {
+      if (only?.length && !only.includes(String(id))) continue;
       try {
         await test();
         console.log(`PASS ${id} ${name}`);

@@ -73,7 +73,7 @@ const RULES = `执行规则：
 - 你的执行时间有上限（Claude 60 分钟、Codex 90 分钟），超时会被强制结束且没有汇报。预计超过 10 分钟的命令（全量扫描、批量迁移、长测试等）不要前台运行或循环等待：先在小样本上验证，再用 nohup 脱离运行并把输出写进日志，然后立即汇报"部分完成"，在遗留问题里写明完整命令、日志路径、预计耗时和结束后要核对的内容，由主 agent 等待结果。多个长命令不要并行争抢同一批文件。临时文件不要写进 /tmp，写在任务说明给出的目录或 --cwd 下已被 git 忽略的位置。`;
 
 const USAGE = `usage:
-  agent-route <tier1|tier2> [--resume ID] [--write] [--no-claude | --claude] [--monitor] [--full-output] [--ignore-budget] [--urgent] [--effort LEVEL] [--exclude PATH]... [--cwd DIR] [--prompt-file FILE] [--verify COMMAND]... [--fix-rounds N] [--progress-doc PATH] [--label TEXT] [--commit MSG]
+  agent-route <tier1|tier2> [--resume ID] [--write] [--no-claude | --claude] [--monitor] [--full-output] [--ignore-budget] [--urgent] [--reset-credit] [--effort LEVEL] [--exclude PATH]... [--cwd DIR] [--prompt-file FILE] [--verify COMMAND]... [--fix-rounds N] [--progress-doc PATH] [--label TEXT] [--commit MSG]
   (无 --prompt-file 时读 stdin)
   agent-route status
   agent-route clear-cooldown
@@ -92,6 +92,8 @@ Codex 订阅账号受限时自动交给 Claude；每 5 分钟查询额度，接�
 全部不可用且最早恢复时间在 maxAutoWaitMinutes 内时自动等待后重新路由；更久则输出 LIMIT（退出码 15），写明各路由恢复时间。--no-claude 不等待，直接输出 LIMIT 或 FALLBACK。
 --claude 跳过 Codex 和冷却，直接交给 Claude 执行，可动用应急保留（周用量上限 claudePacing.urgentMaxPercent）；不能与 --resume、--no-claude、--monitor 同用。
 --urgent 按正常顺序路由，只在全部不可用时动用 Claude 应急保留（同一上限）；不能与 --claude、--no-claude、--monitor 同用。
+Codex 周限额且距重置超过 codexResetCredits.minWaitHours（默认 36 小时）时，满足任一条件才自动用重置券：Claude 周用量超过 claudeWeeklyPercent（默认 60%）、Claude 用量读不到或已过期、按 claudePacing 本次不能用 Claude、没有 Claude 候选（--no-claude）或 Claude 不是订阅账号、券在 expiringDays 内到期；否则交给 Claude。5h 限额和额度保留线的用券规则不变。
+--reset-credit 在官方订阅受限（5h、周或保留线）时跳过上述阈值，直接用最早到期的一张券（auto 为 false 时同样生效；没有可用券或未受限则不用；forced-test 模拟限额不用）；不能与 --claude 同用。
 --monitor 时 Codex 的 effort 改用 config 的 monitorEffort（monitor-loop 使用），不解析汇报状态。
 --effort 覆盖本次 Codex 的 effort（${'none|minimal|low|medium|high|xhigh'}），不影响 Claude fallback。
 config 的 codexStreamIdleTimeoutMs 设置 Codex 流空闲超时（毫秒，默认 120000；0 或未设置时不覆盖）。
@@ -783,8 +785,9 @@ function selectResetCredit(resetCredits, now = Date.now()) {
 }
 
 // 3.2a 触发条件。type 以刚读取的快照为准；3.2c 保留线限额（快照未满）由调用方在 state.reserve / state.thresholds 标出。
-function resetCreditDecision(state, details, settings, now = Date.now()) {
-  if (!settings.auto) return { use: false, reason: 'auto disabled' };
+// claude = { canTakeOver, weeklyUsed, reason }：本次派发 Claude 能否接手；forced（--reset-credit）跳过阈值规则，只检查券和是否受限。
+function resetCreditDecision(state, details, settings, now = Date.now(), claude = null, forced = false) {
+  if (!forced && !settings.auto) return { use: false, reason: 'auto disabled' };
   const snapshot = details?.snapshot;
   if (!snapshot) return { use: false, reason: 'rate limits unavailable' };
   const credit = selectResetCredit(details.resetCredits, now);
@@ -793,15 +796,23 @@ function resetCreditDecision(state, details, settings, now = Date.now()) {
   const fresh = limitFromSnapshot(snapshot);
   const type = fresh.type ?? (state?.reserve ? reserveLimitFromSnapshot(snapshot, state.thresholds ?? {}, now)?.type : null);
   if (!type) return { use: false, reason: 'not limited' };
+  if (forced) return { use: true, type, credit, forced: true, reason: `forced, ${type} limit` };
   const weekly = snapshot.secondary;
+  const expiring = credit.expiresAt !== null && credit.expiresAt * 1000 - now <= settings.expiringDays * 86_400_000;
   if (type === 'weekly') {
     const resetsAt = weekly?.resets_at ?? state?.resets_at;
     const hours = resetsAt ? (resetsAt * 1000 - now) / 3_600_000 : Infinity;
-    return hours > settings.minWaitHours ? { use: true, type, credit, reason: `weekly resets in ${Math.round(hours)}h` }
-      : { use: false, reason: `weekly resets in ${Math.round(hours)}h <= ${settings.minWaitHours}h` };
+    const rounded = Number.isFinite(hours) ? `${Math.round(hours)}h` : 'unknown';
+    if (!(hours > settings.minWaitHours)) return { use: false, reason: `weekly resets in ${rounded} <= ${settings.minWaitHours}h` };
+    const takeOver = claude ?? { canTakeOver: false, weeklyUsed: null, reason: 'not evaluated' };
+    const used = takeOver.weeklyUsed;
+    const prefix = `weekly resets in ${rounded}`;
+    if (!takeOver.canTakeOver || !Number.isFinite(used)) return { use: true, type, credit, reason: `${prefix}, claude cannot take over (${takeOver.reason})` };
+    if (used > settings.claudeWeeklyPercent) return { use: true, type, credit, reason: `${prefix}, claude weekly ${used}% > ${settings.claudeWeeklyPercent}%` };
+    if (expiring) return { use: true, type, credit, reason: `${prefix}, credit expiring` };
+    return { use: false, reason: `${prefix}, claude weekly ${used}% <= ${settings.claudeWeeklyPercent}% and available` };
   }
   if (type === '5h') {
-    const expiring = credit.expiresAt !== null && credit.expiresAt * 1000 - now <= settings.expiringDays * 86_400_000;
     if (weekly && weekly.used_percent >= settings.weeklyPercentForExpiring && expiring) {
       return { use: true, type, credit, reason: `5h limit, weekly ${weekly.used_percent}%, credit expiring` };
     }
@@ -1410,17 +1421,18 @@ function validateConfig(config) {
   return config;
 }
 
-const RESET_CREDIT_DEFAULTS = { auto: true, minWaitHours: 24, weeklyPercentForExpiring: 80, expiringDays: 3 };
+const RESET_CREDIT_DEFAULTS = { auto: true, minWaitHours: 36, weeklyPercentForExpiring: 80, expiringDays: 3, claudeWeeklyPercent: 60 };
 
 function validateCodexResetCredits(config) {
   const value = config.codexResetCredits;
   if (value === undefined) return;
   if (!isConfigObject(value)) throw new Error('codexResetCredits 必须是对象');
   if (value.auto !== undefined && typeof value.auto !== 'boolean') throw new Error('codexResetCredits.auto 必须是布尔值');
-  for (const key of ['minWaitHours', 'weeklyPercentForExpiring', 'expiringDays']) {
+  for (const key of ['minWaitHours', 'weeklyPercentForExpiring', 'expiringDays', 'claudeWeeklyPercent']) {
+    const percent = key === 'weeklyPercentForExpiring' || key === 'claudeWeeklyPercent';
     if (value[key] !== undefined && (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] < 0 ||
-      (key === 'weeklyPercentForExpiring' && value[key] > 100))) {
-      throw new Error(`codexResetCredits.${key} 必须是${key === 'weeklyPercentForExpiring' ? ' 0–100 的数值' : '非负数'}`);
+      (percent && value[key] > 100))) {
+      throw new Error(`codexResetCredits.${key} 必须是${percent ? ' 0–100 的数值' : '非负数'}`);
     }
   }
 }
@@ -2391,6 +2403,7 @@ let noClaude = false;
 let forceClaude = false;
 let ignoreBudget = false;
 let urgent = false;
+let forceResetCredit = false;
 let monitor = false;
 let fullOutput = false;
 let cwdArg = null;
@@ -2411,6 +2424,7 @@ for (let i = 1; i < argv.length; i++) {
   else if (a === '--claude') forceClaude = true;
   else if (a === '--ignore-budget') ignoreBudget = true;
   else if (a === '--urgent') urgent = true;
+  else if (a === '--reset-credit') forceResetCredit = true;
   else if (a === '--monitor') monitor = true;
   else if (a === '--full-output') fullOutput = true;
   else if (['--cwd', '--prompt-file', '--effort', '--exclude', '--resume', '--verify', '--fix-rounds', '--progress-doc', '--label', '--commit'].includes(a)) {
@@ -2489,6 +2503,7 @@ if (dispatchContext.enabled && dispatchContext.codex.billingType !== 'unknown') 
 const tierCfg = config.tiers?.[tier];
 if (urgent && (forceClaude || noClaude || monitor)) die('--urgent 不能与 --claude、--no-claude 或 --monitor 同用');
 if (forceClaude && (resumeArg !== null || noClaude || monitor || ignoreBudget)) die('--claude 不能与 --resume、--no-claude、--monitor 或 --ignore-budget 同用');
+if (forceResetCredit && forceClaude) die('--reset-credit 不能与 --claude 同用（--claude 不走 Codex）');
 if (!tierCfg?.codex?.model) { process.stderr.write(`agent-route: config 中缺少 ${tier}.codex\n`); process.exit(2); }
 const officialModels = tierCfg.codex.models ?? [tierCfg.codex.model];
 let model = resolveCodexModel(tier, dispatchContext.codex, tierCfg);
@@ -3421,16 +3436,30 @@ function rebuildPromptFromResume() {
 // 3.2a：官方额度受限时先判断是否用券；用券并确认重置后返回 true，并在官方路由上重跑本次任务。
 // 其他情况（未触发、无券、结果为 nothingToReset / noCredit、重置未生效、读取失败）返回 false，由调用方转 Micu。
 // 每次派发最多尝试一次；判断、调用和确认在 route.lock 内完成。
+// Claude 能否接手本次派发：有 Claude 候选、订阅账号、普通用量线放行且读得到周用量。claudeGate 有 2 分钟缓存。
+function claudeTakeOverInfo() {
+  const none = (reason, weeklyUsed = null) => ({ canTakeOver: false, weeklyUsed, reason });
+  if (noClaude || forceClaude || !routeCandidates.some((candidate) => candidate.kind === 'claude')) return none('no claude candidate');
+  if (dispatchContext.claude?.billingType !== 'subscription') return none('claude not subscription');
+  const gate = claudeGate('normal');
+  const used = Number.isFinite(gate.used) ? gate.used : null;
+  if (!gate.allowed) return none(`${gate.reason}${used === null ? '' : `; claude weekly ${used}%`}`, used);
+  if (used === null) return none('usage-unavailable');
+  return { canTakeOver: true, weeklyUsed: used, reason: gate.reason };
+}
+
 async function tryResetCredit(state, { started }) {
   const settings = codexResetCreditsConfig(config);
   const official = activeRouteKind === 'official' && (!activeCodexContext || activeCodexContext.billingType === 'subscription');
-  if (!official || !settings.auto || resetCreditAttempted || state?.source === 'forced-test' || !state?.type) return false;
+  if (!official || (!settings.auto && !forceResetCredit) || resetCreditAttempted || state?.source === 'forced-test' || !state?.type) return false;
   resetCreditAttempted = true;
   try {
+    // Claude 判断在锁外完成（可能触发一次用量探测）；强制用券不需要。
+    const claude = forceResetCredit ? null : claudeTakeOverInfo();
     // 判断与调用在 route.lock 内完成：第二个并发派发拿到锁后重新读取额度，已被重置则直接用官方额度。
     const outcome = await withRouteLock(async () => {
       const details = await queryRateLimitDetails(config);
-      const decision = resetCreditDecision(state, details, settings);
+      const decision = resetCreditDecision(state, details, settings, Date.now(), claude, forceResetCredit);
       if (!decision.use) {
         log(`reset credit: skipped (${decision.reason})`);
         return decision.reason === 'not limited' && details?.snapshot ? { alreadyReset: details.snapshot } : null;
@@ -3443,9 +3472,9 @@ async function tryResetCredit(state, { started }) {
       if (!result.outcome) result = await consumeResetCredit(config, { idempotencyKey, creditId: credit.id });
       const success = ['reset', 'alreadyRedeemed'].includes(result.outcome);
       const confirmed = success && resetConfirmed(details.snapshot, result.snapshot, type, state.reserve ? state.thresholds : null);
-      log(`reset credit: ${result.outcome ?? `failed (${result.error})`} ${prefix} expires ${expires}`);
-      resetCreditRecord = { outcome: result.outcome ?? 'failed', credit: prefix, expires_at: expires, confirmed };
-      if (result.outcome) notify('reset credit', `${result.outcome}: ${prefix} (${decision.reason})${confirmed ? '' : '; 未确认重置，转备用路由'}`);
+      log(`reset credit: ${result.outcome ?? `failed (${result.error})`} ${prefix} expires ${expires} (${decision.reason})`);
+      resetCreditRecord = { outcome: result.outcome ?? 'failed', credit: prefix, expires_at: expires, confirmed, ...(decision.forced ? { forced: true } : {}) };
+      if (result.outcome) notify('reset credit', `${decision.forced ? '强制用券 ' : ''}${result.outcome}: ${prefix} (${decision.reason})${confirmed ? '' : '; 未确认重置，转备用路由'}`);
       return confirmed ? { snapshot: result.snapshot } : null;
     });
     if (!outcome) return false;
