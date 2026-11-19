@@ -2530,7 +2530,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         check(calls.length === 3 && calls.slice(0, 2).every((row) => !isMicu(row) && modelOf(row) === 'gpt-6.2-sol') &&
           isMicu(calls[2]) && calls[2].providerKey === routeKey && calls.slice(0, 2).every((row) => row.providerKey === null),
           'capacity 应官方重试一次后转 Micu，且密钥只给 Micu 子进程');
-        check(allLogs(first).includes('capacity retry') && /circuit: official\/gpt-6\.1-sol closed→open/.test(allLogs(first)) &&
+        check(allLogs(first).includes('capacity retry') && /circuit: official\/gpt-6\.2-sol closed→open/.test(allLogs(first)) &&
           first.record.providers.codex.route === 'Micu' && first.record.routes.length === 2 && first.record.routes[1].route === 'Micu',
           'capacity 日志或 history 路由不符');
         const entry = Object.values(circuitState())[0];
