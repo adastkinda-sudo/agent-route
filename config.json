@@ -2,7 +2,7 @@
   "tiers": {
     "tier1": {
       "codex": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "effort": "xhigh"
       },
       "claude": {
@@ -17,7 +17,7 @@
           "gpt-6-luna"
         ],
         "effort": "xhigh",
-        "apiModel": "gpt-6.1-sol"
+        "apiModel": "gpt-6.2-sol"
       },
       "claude": {
         "model": "claude-haiku-5-5",
@@ -61,12 +61,12 @@
         "models": {
           "tier1": [
             {
-              "model": "gpt-6.1-sol"
+              "model": "gpt-6.2-sol"
             }
           ],
           "tier2": [
             {
-              "model": "gpt-6.1-sol",
+              "model": "gpt-6.2-sol",
               "effort": "medium"
             }
           ]
@@ -78,7 +78,7 @@
     "dailyBudgetUsd": 5
   },
   "codexPricing": {
-    "gpt-6.1-sol": {
+    "gpt-6.2-sol": {
       "input": 2,
       "cachedInput": 0.1,
       "output": 10,
