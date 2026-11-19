@@ -250,7 +250,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
     const execCalls = (from) => invocationRows().slice(from).filter((row) => row.args[0] === 'exec');
     const modelOf = (row) => row.args[row.args.indexOf('-m') + 1];
     const isMicu = (row) => row.args.some((arg) => arg.includes('model_provider="agent_route_micu"'));
-    const withMicuRoutes = (test, { models = ['gpt-6.1-sol'] } = {}) => withRoutedFixture(async () => {
+    const withMicuRoutes = (test, { models = ['gpt-6.2-sol'] } = {}) => withRoutedFixture(async () => {
       const saved = { fallback: structuredClone(routeConfig.codexFallback), circuit: structuredClone(routeConfig.codexCircuit),
         pricing: structuredClone(routeConfig.codexPricing), models: env.AGENT_ROUTE_MICU_MODELS_JSON, force: env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT };
       const reset = () => {
@@ -259,7 +259,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
       try {
         useSubscription();
         routeConfig.codexFallback = { providers: [{ ccSwitchId: 'database-codex', label: 'Micu', priceMultiplier: 0.0833333,
-          models: { tier1: [{ model: 'gpt-6.1-sol' }], tier2: [{ model: 'gpt-6.1-sol', effort: 'medium' }] } }],
+          models: { tier1: [{ model: 'gpt-6.2-sol' }], tier2: [{ model: 'gpt-6.2-sol', effort: 'medium' }] } }],
           retryOfficialMinutes: 15, capacityBackoffSeconds: 0, dailyBudgetUsd: 5 };
         env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify(models);
         delete env.AGENT_ROUTE_FORCE_OFFICIAL_LIMIT;
@@ -2494,9 +2494,9 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         try {
           useSubscription();
           routeConfig.codexFallback = { providers: [{ ccSwitchId: 'database-codex', label: 'Micu', priceMultiplier: 0.0833333,
-            models: { tier1: [{ model: 'gpt-6.1-sol' }], tier2: [{ model: 'gpt-6.1-sol', effort: 'medium' }] } }],
+            models: { tier1: [{ model: 'gpt-6.2-sol' }], tier2: [{ model: 'gpt-6.2-sol', effort: 'medium' }] } }],
             retryOfficialMinutes: 15, capacityBackoffSeconds: 0, dailyBudgetUsd: 5 };
-          env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify(['gpt-6.1-sol']);
+          env.AGENT_ROUTE_MICU_MODELS_JSON = JSON.stringify(['gpt-6.2-sol']);
           fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
           const result = run('micu-fallback');
           exitIs(result, 0);
@@ -2527,7 +2527,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const first = run('route:capacity:ok');
         exitIs(first, 0);
         const calls = execCalls(start);
-        check(calls.length === 3 && calls.slice(0, 2).every((row) => !isMicu(row) && modelOf(row) === 'gpt-6.1-sol') &&
+        check(calls.length === 3 && calls.slice(0, 2).every((row) => !isMicu(row) && modelOf(row) === 'gpt-6.2-sol') &&
           isMicu(calls[2]) && calls[2].providerKey === routeKey && calls.slice(0, 2).every((row) => row.providerKey === null),
           'capacity 应官方重试一次后转 Micu，且密钥只给 Micu 子进程');
         check(allLogs(first).includes('capacity retry') && /circuit: official\/gpt-6\.1-sol closed→open/.test(allLogs(first)) &&
@@ -2540,10 +2540,10 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const skipped = run('route:capacity:ok');
         exitIs(skipped, 0);
         const skippedCalls = execCalls(before);
-        check(skippedCalls.length === 1 && isMicu(skippedCalls[0]) && allLogs(skipped).includes('skip route: official/gpt-6.1-sol (circuit open)'),
+        check(skippedCalls.length === 1 && isMicu(skippedCalls[0]) && allLogs(skipped).includes('skip route: official/gpt-6.2-sol (circuit open)'),
           '熔断期间应直接跳过官方');
         const status = spawnSync(process.execPath, [SCRIPT_PATH, 'status'], { env, cwd: repo, encoding: 'utf8', timeout: 8000 });
-        check(status.stdout.includes('circuit official/gpt-6.1-sol: open') && status.stdout.includes('Micu spend today:'),
+        check(status.stdout.includes('circuit official/gpt-6.2-sol: open') && status.stdout.includes('Micu spend today:'),
           'status 缺少熔断状态或 Micu 花费');
         noRouteSecrets(status.stdout + status.stderr);
         expireCircuit();
@@ -2587,7 +2587,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const micu = run('route:capacity:ok', [], false, { tier: 'tier2' });
         exitIs(micu, 0);
         calls = execCalls(mark);
-        check(calls.map(modelOf).join() === 'gpt-6.1-terra,gpt-6.1-terra,gpt-6-luna,gpt-6-luna,gpt-6.1-sol' && isMicu(calls[4]) &&
+        check(calls.map(modelOf).join() === 'gpt-6.1-terra,gpt-6.1-terra,gpt-6-luna,gpt-6-luna,gpt-6.2-sol' && isMicu(calls[4]) &&
           calls[4].args.includes('model_reasoning_effort="medium"') && micu.record.routes.map((row) => row.route).join() === 'official,official,Micu',
           'tier2 官方两个模型都 capacity 后应转 Micu sol/medium');
         clearCircuit();
@@ -2619,7 +2619,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         mark = invocationRows().length;
         const afterUnsupported = run('route:ok:ok');
         check(execCalls(mark).length === 1 && isMicu(execCalls(mark)[0]) &&
-          allLogs(afterUnsupported).includes('skip route: official/gpt-6.1-sol (model-unavailable)'), '已标记不支持的模型应被跳过');
+          allLogs(afterUnsupported).includes('skip route: official/gpt-6.2-sol (model-unavailable)'), '已标记不支持的模型应被跳过');
         fs.rmSync(unavailablePath, { force: true });
         // 路由切换上限。
         routeConfig.codexCircuit = { ...routeConfig.codexCircuit, maxRouteSwitches: 1 };
@@ -2673,17 +2673,17 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         mark = invocationRows().length;
         const over = run('route:limit:ok');
         exitIs(over, 15);
-        check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]) && allLogs(over).includes('skip route: Micu/gpt-6.1-sol (budget'),
+        check(execCalls(mark).length === 1 && !isMicu(execCalls(mark)[0]) && allLogs(over).includes('skip route: Micu/gpt-6.2-sol (budget'),
           '超预算时不应调用 Micu');
         const ignored = run('route:limit:ok', ['--ignore-budget']);
         exitIs(ignored, 0);
-        check(ignored.footer.includes('budget ignored') && allLogs(ignored).includes('budget ignored: Micu/gpt-6.1-sol') &&
+        check(ignored.footer.includes('budget ignored') && allLogs(ignored).includes('budget ignored: Micu/gpt-6.2-sol') &&
           JSON.parse(fs.readFileSync(spendFile, 'utf8'))[today].Micu > 5, '--ignore-budget 应放行、注明并照常记账');
         exitIs(spawnSync(process.execPath, [SCRIPT_PATH, 'tier1', '--claude', '--ignore-budget', '--cwd', repo],
           { env, cwd: home, input: 'x\n', encoding: 'utf8', timeout: 8000 }), 2);
         // 缺单价的模型只在 --ignore-budget 下使用。
         fs.rmSync(spendFile, { force: true });
-        delete routeConfig.codexPricing['gpt-6.1-sol'];
+        delete routeConfig.codexPricing['gpt-6.2-sol'];
         fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(routeConfig));
         exitIs(run('route:limit:ok'), 15);
         const unpriced = run('route:limit:ok', ['--ignore-budget']);
@@ -2712,7 +2712,7 @@ if (!/^(feat|fix|docs|refactor|test|build|ci|chore|perf|revert)\\([^)]+\\)!?: .+
         const mark = invocationRows().length;
         const migrated = run('route:ok:ok', [], false, { preserveCooldown: true });
         exitIs(migrated, 0);
-        check(execCalls(mark).length === 1 && isMicu(execCalls(mark)[0]) && allLogs(migrated).includes('skip route: official/gpt-6.1-sol (circuit open)'),
+        check(execCalls(mark).length === 1 && isMicu(execCalls(mark)[0]) && allLogs(migrated).includes('skip route: official/gpt-6.2-sol (circuit open)'),
           '旧 cooldown 记录应视为 Open 并转 Micu');
         writeJSON(circuitPath, { stale: { state: 'open', consecutive_failures: 2, opened_at: Date.now() / 1000, open_seconds: 600, probe: null } });
         writeJSON(unavailablePath, { stale: Date.now() + 1000 });
